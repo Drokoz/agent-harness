@@ -117,7 +117,7 @@ Tres defectos reales que encontró en main, invisibles hasta ahora:
    (`costo` NO suma a `equipo.costo_reparacion`). Llevaba roto sin que nada avisara
    porque CI lo salta y localmente se salta sin TEST_DATABASE_URL.
 
-### Fase 1 — Pipeline de intención (skills de Matt Pocock), repo piloto
+### Fase 1 — Pipeline de intención (skills de Matt Pocock), repo piloto — ✅ HECHA (2026-08-22)
 
 ```bash
 claude plugins install mattpocock-skills     # o: npx skills@latest add mattpocock/skills
@@ -146,7 +146,7 @@ Nota sobre CONTEXT.md: es la pieza más subestimada. Es lo que hace que un agent
 (pi + grok, o el modelo local) escriba código que usa tu vocabulario en vez de inventar el
 suyo. Es el multiplicador que hace viable bajar de modelo.
 
-### Fase 2 — Dispatcher local con herdr
+### Fase 2 — Dispatcher local con herdr — ✅ HECHA (2026-08-22): `harness run`
 
 Sin frameworks. Un script que hace tres cosas: calcular la frontera, lanzar, cosechar.
 
@@ -514,3 +514,37 @@ Las reglas que lo hacen seguro para dejarlo corriendo:
 
 `run` requiere adaptadores y una sesión de herdr (`HERDR_ENV=1`): un dispatcher
 sin mundo no es un dispatcher, así que con `HARNESS_OFFLINE=1` no existe.
+
+---
+
+## 11. Resultado del 2026-08-22
+
+Ocho tickets cerrados en un día sobre `agent-harness`, todos por agentes, todos verificados
+antes de mergear: #2 #3 #4 #6 #9 #11 #12 #15. El repo pasó de un script de 250 líneas sin
+tests a un paquete con contextos, frontera nativa de GitHub, vault, dispatcher, CI y 211 tests.
+Costo: **US$4.45**.
+
+**Fases 0, 1 y 2 completas.** `harness run` existe: toma la frontera, abre un worktree y un
+pane por ticket, verifica que el agente arrancó de verdad, corre el gate, abre PR, cierra el
+issue si el agente no lo hizo, y limpia pane y worktree al terminar.
+
+### Lo que costó descubrir
+
+- **El primer `herdr agent prompt` tras `agent start` se pierde siempre**, con pi y con claude.
+  herdr reporta éxito igual. Hay que verificar que el contexto suba de 0% y reintentar.
+- **Prompts multilínea no llegan** a la TUI de pi. Una sola línea.
+- **Claude Code se traba cada ~80s** aun en auto mode, y los bloqueos consecutivos escalan.
+  Resuelto sembrando `.claude/settings.json` con allowlist. `pi` no se traba nunca.
+- **Los agentes cierran su issue de forma inconsistente** — un issue que queda abierto vuelve
+  a la frontera y se re-trabaja para siempre.
+- **Los modelos inventan fechas.** Hay que correr `date`.
+- **`:nitro` y declarar modelos en `models.json` degradan las capacidades**: se trabajó medio
+  día con 128K de contexto y 16.4K de salida en vez de 262K/131K. Dos fallos que atribuí al
+  modelo eran de configuración.
+
+### Sobre el techo de Qwen
+
+Con el modelo completo, Qwen cerró el dispatcher (#6, 422 líneas + 450 de tests) **y resolvió
+un conflicto de merge entre dos refactors que se pisaban**. Con la config degradada había
+fallado en un refactor y en la vault. La conclusión "aditivo sí, refactor no" era un artefacto
+de la configuración, no una propiedad del modelo. Sigue valiendo medir, no asumir.
