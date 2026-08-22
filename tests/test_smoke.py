@@ -1,8 +1,11 @@
-"""Test de humo: el CLI `harness` carga, sus funciones puras funcionan y
-`harness status` corre de punta a punta en modo sin adaptadores (sin red).
+"""Test de humo: el CLI `harness` carga, pega las tres capas y corre de punta a
+punta en modo sin adaptadores (sin red).
 
-`bin/harness` no tiene extensión .py ni es un paquete, así que se carga
-por su ruta de archivo, no por import normal.
+La lógica se testea en test_snapshot.py y el dibujo en test_render.py; acá sólo
+se verifica el cableado adapters -> snapshot -> render.
+
+`bin/harness` no tiene extensión .py ni es un paquete, así que se carga por su
+ruta de archivo, no por import normal.
 """
 
 import contextlib
@@ -14,10 +17,13 @@ import sys
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
-from pathlib import Path
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parent.parent
+import support
+
+from harness import adapters
+
+ROOT = support.ROOT
 HARNESS = ROOT / "bin" / "harness"
 
 
@@ -47,14 +53,13 @@ class TestSmoke(unittest.TestCase):
     def test_module_carga(self):
         mod = load_harness()
         self.assertTrue(callable(getattr(mod, "main")))
-        self.assertEqual([k for k, _, _ in mod.READINESS], ["gate", "skills", "context"])
+        # el CLI es pegamento: no define lógica propia
+        for capa in ("collect", "snapshot", "render"):
+            self.assertTrue(callable(getattr(mod, capa)), capa)
 
-    def test_blockers_of(self):
-        mod = load_harness()
-        self.assertEqual(mod.blockers_of("Blocked by #3, #4"), {3, 4})
-        self.assertEqual(mod.blockers_of("Blocked by: #12"), {12})
-        self.assertEqual(mod.blockers_of("Blocked by none (can start)"), set())
-        self.assertEqual(mod.blockers_of(None), set())
+    def test_readiness_es_la_del_snapshot(self):
+        from harness.snapshot import READINESS
+        self.assertEqual([k for k, _, _ in READINESS], ["gate", "skills", "context"])
 
     def test_status_offline_no_toca_adaptadores(self):
         """En modo offline, main() no llama a gh ni herdr ni abre sockets."""
@@ -68,7 +73,7 @@ class TestSmoke(unittest.TestCase):
             return False, ""
 
         buf = io.StringIO()
-        with mock.patch.object(mod, "run", fake_run), \
+        with mock.patch.object(adapters, "run", fake_run), \
                 mock.patch("urllib.request.urlopen",
                            side_effect=AssertionError("llamada de red en modo offline")), \
                 mock.patch.dict(os.environ, {"HERDR_ENV": "1"}), \
@@ -89,3 +94,17 @@ class TestSmoke(unittest.TestCase):
                                capture_output=True, text=True, timeout=120)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("sin adaptadores", p.stdout)
+
+    def test_sin_tty_sin_colores(self):
+        """Con la salida redirigida (no es un TTY) no salen escapes ANSI."""
+        env = dict(os.environ)
+        env["HARNESS_OFFLINE"] = "1"
+        with tempfile.TemporaryDirectory() as tmp:
+            env["HOME"] = tmp
+            p = subprocess.run([str(HARNESS), "status"], env=env,
+                               capture_output=True, text=True, timeout=120)
+        self.assertNotIn("\033", p.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
