@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""harness — una sola pantalla con el estado del trabajo autónomo.
+
+    harness status        qué está pasando ahora y qué le falta a cada repo
+    harness status -q     sólo lo accionable (sin la tabla de readiness)
+
+v0 deliberadamente chico: NO es una app, es un script que imprime. La idea es vivir
+con él dos semanas y recién ahí especificar el dashboard de verdad, con datos de uso
+en vez de suposiciones. Ver ../PLAN.md §"centralizar".
+
+Lee la key de OpenRouter de ~/.pi/agent/models.json (la misma que usa pi) y los repos
+de ../repos.conf. No escribe nada en ningún lado.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures as cf
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+GITHUB_DIR = Path.home() / "Documents" / "Github"
+PI_MODELS = Path.home() / ".pi" / "agent" / "models.json"
+AGENT_LABEL = "ready-for-agent"
+TRIAGE_LABEL = "needs-triage"
+COSTO_TICKET = 0.24  # estimación §8 del PLAN; ajustar cuando haya datos reales
+
+# Lo que un repo necesita para entrar al harness, en orden de dependencia.
+READINESS = [
+    ("gate", "scripts/gate.sh", "el gate: única fuente de verdad de 'esto mergea'"),
+    ("skills", "docs/agents/issue-tracker.md", "/setup-matt-pocock-skills corrido"),
+    ("context", "CONTEXT.md", "vocabulario del dominio para agentes baratos"),
+]
+
+BOLD, DIM, RED, GRN, YEL, BLU, CYA, OFF = (
+    "\033[1m", "\033[2m", "\033[31m", "\033[32m", "\033[33m", "\033[34m", "\033[36m", "\033[0m"
+)
+if not sys.stdout.isatty():
+    BOLD = DIM = RED = GRN = YEL = BLU = CYA = OFF = ""
+
+
+def run(args, cwd=None, timeout=30):
+    """Corre un comando y devuelve (ok, stdout). Nunca levanta excepción."""
+    try:
+        p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode == 0, p.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+
+
+# --------------------------------------------------------------------- OpenRouter
+def openrouter_credits():
+    try:
+        key = json.loads(PI_MODELS.read_text())["providers"]["openrouter"]["apiKey"]
+    except (OSError, KeyError, ValueError):
+        return None
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/credits", headers={"Authorization": f"Bearer {key}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.load(r)["data"]
+    except (urllib.error.URLError, ValueError, KeyError, TimeoutError):
+        return None
+
+
+# -------------------------------------------------------------------------- herdr
+def herdr_agents():
+    if os.environ.get("HERDR_ENV") != "1":
+        return None  # no estamos dentro de herdr: no hay sesión que inspeccionar
+    ok, out = run(["herdr", "agent", "list"])
+    if not ok:
+        return []
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return []
+    agents = data.get("result", data)
+    if isinstance(agents, dict):
+        agents = agents.get("agents", [])
+    return agents if isinstance(agents, list) else []
+
+
+# --------------------------------------------------------------------------- repos
+def read_repos():
+    conf = ROOT / "repos.conf"
+    if not conf.exists():
+        return []
+    out = []
+    for line in conf.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        p = Path(line) if Path(line).is_absolute() else GITHUB_DIR / line
+        if p.is_dir():
+            out.append(p)
+    return out
+
+
+def slug_of(path):
+    ok, url = run(["git", "-C", str(path), "remote", "get-url", "origin"])
+    if not ok:
+        return None
+    m = re.search(r"github\.com[:/]+([^/]+/[^/\s]+?)(?:\.git)?$", url)
+    return m.group(1) if m else None
+
+
+def gh_json(slug, args):
+    ok, out = run(["gh", *args, "-R", slug])
+    if not ok or not out:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+BLOCKED_RE = re.compile(r"blocked by[:\s]*((?:#\d+[,\s]*)+)", re.I)
+
+
+def blockers_of(body):
+    m = BLOCKED_RE.search(body or "")
+    return {int(n) for n in re.findall(r"#(\d+)", m.group(1))} if m else set()
+
+
+def inspect(path):
+    """Todo lo que sabemos de un repo. Una llamada por dato, en paralelo afuera."""
+    r = {"path": path, "name": path.name, "slug": slug_of(path)}
+
+    ok, branch = run(["git", "-C", str(path), "branch", "--show-current"])
+    r["branch"] = branch if ok else "?"
+    ok, st = run(["git", "-C", str(path), "status", "--porcelain"])
+    r["dirty"] = len([l for l in st.splitlines() if l.strip()]) if ok else 0
+
+    r["ready"] = {key: (path / rel).exists() for key, rel, _ in READINESS}
+
+    if not r["slug"]:
+        return r
+
+    issues = gh_json(r["slug"], ["issue", "list", "--state", "open", "--limit", "200",
+                                 "--json", "number,title,labels,body"]) or []
+    open_nums = {i["number"] for i in issues}
+
+    frontier, blocked, triage = [], [], []
+    for i in issues:
+        labels = {l["name"] for l in i.get("labels", [])}
+        if TRIAGE_LABEL in labels:
+            triage.append(i)
+        if AGENT_LABEL not in labels:
+            continue
+        pending = blockers_of(i.get("body")) & open_nums
+        (blocked if pending else frontier).append(i)
+
+    r["issues_open"] = len(issues)
+    r["frontier"], r["blocked"], r["triage"] = frontier, blocked, triage
+
+    prs = gh_json(r["slug"], ["pr", "list", "--state", "open", "--limit", "50",
+                              "--json", "number,title,isDraft,headRefName"]) or []
+    r["prs"] = prs
+    return r
+
+
+# -------------------------------------------------------------------------- render
+def bar(used, total, width=24):
+    if not total:
+        return ""
+    filled = min(width, int(round(width * used / total)))
+    color = RED if used / total > 0.8 else (YEL if used / total > 0.5 else GRN)
+    return f"{color}{'█' * filled}{DIM}{'░' * (width - filled)}{OFF}"
+
+
+def main():
+    quiet = "-q" in sys.argv or "--quiet" in sys.argv
+
+    repos = read_repos()
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        fut_credits = ex.submit(openrouter_credits)
+        fut_agents = ex.submit(herdr_agents)
+        results = list(ex.map(inspect, repos))
+
+    credits, agents = fut_credits.result(), fut_agents.result()
+
+    print()
+    # ---- presupuesto
+    if credits:
+        total, used = credits["total_credits"], credits["total_usage"]
+        left = total - used
+        print(f" {BOLD}OpenRouter{OFF}  {bar(used, total)}  "
+              f"${left:.2f} de ${total:.2f}  {DIM}≈{int(left / COSTO_TICKET)} tickets{OFF}")
+    else:
+        print(f" {BOLD}OpenRouter{OFF}  {DIM}sin datos (¿key en ~/.pi/agent/models.json?){OFF}")
+
+    # ---- agentes vivos
+    if agents is None:
+        print(f" {BOLD}Agentes{OFF}     {DIM}fuera de herdr — corré esto dentro de una sesión{OFF}")
+    elif not agents:
+        print(f" {BOLD}Agentes{OFF}     {DIM}ninguno trabajando{OFF}")
+    else:
+        print(f" {BOLD}Agentes{OFF}")
+        # `name` sólo existe si el agente fue arrancado/renombrado con nombre propio;
+        # si no, el título del terminal es lo más informativo que hay.
+        for a in sorted(agents, key=lambda x: (x.get("agent_status") != "blocked",
+                                               x.get("agent_status") != "working")):
+            status = a.get("agent_status", "?")
+            color = {"working": CYA, "blocked": RED, "idle": DIM, "done": GRN}.get(status, "")
+            who = a.get("name") or a.get("terminal_title_stripped") or "—"
+            repo = Path(a.get("cwd", "")).name
+            print(f"   {color}●{OFF} {who[:34]:<34} {DIM}{a.get('agent', '?'):<7}{OFF} "
+                  f"{color}{status:<8}{OFF} {DIM}{repo} {a.get('pane_id', '')}{OFF}")
+
+    # ---- accionable por repo
+    print(f"\n {BOLD}Trabajo{OFF}")
+    algo = False
+    for r in results:
+        if not r.get("slug"):
+            continue
+        frontier, blocked = r.get("frontier", []), r.get("blocked", [])
+        prs, triage = r.get("prs", []), r.get("triage", [])
+        if not (frontier or blocked or prs or triage):
+            continue
+        algo = True
+        dirty = f" · {r['dirty']} sin commitear" if r["dirty"] else ""
+        print(f"\n   {BOLD}{r['name']}{OFF} {DIM}{r['branch']}{dirty}{OFF}")
+        for i in frontier[:5]:
+            print(f"     {GRN}▸{OFF} #{i['number']} {i['title'][:64]}")
+        if len(frontier) > 5:
+            print(f"     {DIM}… y {len(frontier) - 5} más en la frontera{OFF}")
+        for i in blocked[:3]:
+            print(f"     {DIM}⊘ #{i['number']} {i['title'][:60]} (bloqueado){OFF}")
+        for p in prs[:5]:
+            mark = f"{DIM}draft{OFF}" if p["isDraft"] else f"{YEL}review{OFF}"
+            print(f"     {mark} #{p['number']} {p['title'][:60]}")
+        if triage:
+            print(f"     {DIM}{len(triage)} sin triage{OFF}")
+    if not algo:
+        print(f"   {DIM}nada pendiente: ningún ticket ready-for-agent, ningún PR abierto{OFF}")
+
+    # ---- qué le falta a cada repo
+    if not quiet:
+        print(f"\n {BOLD}Listo para el harness{OFF}   {DIM}" +
+              "  ".join(k for k, _, _ in READINESS) + f"{OFF}")
+        for r in results:
+            marks = "   ".join(
+                f"{GRN}✓{OFF}" if r["ready"][k] else f"{RED}·{OFF}" for k, _, _ in READINESS
+            )
+            falta = [d for k, _, d in READINESS if not r["ready"][k]]
+            hint = f"  {DIM}falta: {falta[0]}{OFF}" if falta else f"  {GRN}listo{OFF}"
+            print(f"   {r['name']:<16} {marks}{hint}")
+
+    print()
+
+
+if __name__ == "__main__":
+    main()
