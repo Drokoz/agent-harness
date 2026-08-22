@@ -1,0 +1,14 @@
+[
+  {
+    "headRefName": "ticket/11",
+    "isDraft": false,
+    "number": 13,
+    "title": "Gate: intérprete 3.9 explícito y smoke hermético"
+  },
+  {
+    "headRefName": "ticket/2",
+    "isDraft": false,
+    "number": 10,
+    "title": "Gate y arnés de tests para el propio harness"
+  }
+]

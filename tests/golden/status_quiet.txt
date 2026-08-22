@@ -1,0 +1,32 @@
+
+ OpenRouter  ███████████░░░░░░░░░░░░░  $13.37 de $25.00  ≈55 tickets
+ Agentes
+   ● ◑ explorador de harness            claude  working  Github w4:p1
+   ● t3                                 claude  working  ah-t3 w4:p6
+   ● Revisión costos equipo y bodega    claude  idle     F7League w1:p1
+   ● Cosas a resolver                   claude  idle     F7League w1:p27
+   ● Crear usuarios planilleros         claude  idle     F7League w1:p11
+   ● Descarga de escudos de equipos     claude  idle     F7League w1:p28
+   ● Refactorizar flujo de visitas y fo claude  idle     ERP-IphoneUp w3:p1
+   ● Flujo de dispiece IMEI obligatorio claude  idle     ERP-IphoneUp w3:p2
+
+ Trabajo
+
+   agent-harness ticket/3 · 2 sin commitear
+     ▸ #12 CI: correr el gate en GitHub Actions
+     ▸ #11 Gate: buscar un intérprete 3.9 explícito y hacer hermético el sm
+     ▸ #9 Vault personal y vista transversal de decisiones
+     ▸ #8 Delegación remota: harness run sobre el herdr del trabajo
+     ▸ #7 Qué pasó desde la última vez que miré
+     … y 5 más en la frontera
+     review #13 Gate: intérprete 3.9 explícito y smoke hermético
+     review #10 Gate y arnés de tests para el propio harness
+
+   koku main
+     ▸ #7 Cerrar caja del dia sin doble conteo
+     ▸ #9 Exportar a CSV
+     ⊘ #8 Reporte mensual por sucursal (bloqueado)
+     draft #21 WIP: cierre de caja
+     review #22 Migrar el schema de ventas
+     1 sin triage
+
