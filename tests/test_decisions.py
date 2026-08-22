@@ -1,14 +1,21 @@
 """Vista transversal de decisiones: ADRs por repo + notas de la vault.
 
-Cubre la lógica pura (`harness.decisions`) y el disco (`adr_files`,
-`vault_decision_files`). El cableado de punta a punta vive en test_cli.py.
+Cubre la lógica pura (`harness.decisions`), el disco (`adr_files`,
+`vault_decision_files`) y el cableado de punta a punta del comando
+`harness decisions`.
 """
 
+import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from harness import adapters
+
+ROOT = Path(__file__).resolve().parent.parent
+HARNESS = ROOT / "bin" / "harness"
 from harness.decisions import (adr_identity, as_list, decisions_for, note_identity,
                                render_decisions)
 
@@ -160,3 +167,90 @@ class TestAdapters(unittest.TestCase):
     def test_vault_sin_declarar_ni_sin_carpeta(self):
         self.assertEqual(adapters.vault_decision_files(None), [])
         self.assertEqual(adapters.vault_decision_files("~/no-existe/vault"), [])
+
+
+class TestCli(unittest.TestCase):
+    """Punta a punta: el comando `harness decisions` sobre un escenario en disco."""
+
+    def _escenario(self, tmp):
+        t = Path(tmp)
+        koku = t / "koku"
+        (koku / "docs" / "adr").mkdir(parents=True)
+        (koku / "CLAUDE.md").write_text("# Memoria de Claude\n")
+        (koku / "docs" / "adr" / "0003-almacen-event-sourced.md").write_text(
+            "# Almacen event-sourced\n")
+        gro = t / "groceries-wl"
+        (gro / "docs" / "adr").mkdir(parents=True)
+        (gro / "docs" / "adr" / "0001-kiosco.md").write_text("# Kiosco\n")
+        vault = t / "vault-personal"
+        (vault / "decisiones").mkdir(parents=True)
+        (vault / "diario").mkdir(parents=True)
+        (vault / "decisiones" / "2026-08-21-banco.md").write_text("# De banco\n")
+        (vault / "diario" / "hoy.md").write_text("# Hoy\n")
+        return {
+            "default_context": "personal",
+            "contexts": {
+                "personal": {
+                    "tracker": {"kind": "github"},
+                    "repos": {"root": str(t), "paths": ["koku"]},
+                    "autonomy": "frontier",
+                    "budget": {"polarity": "remaining", "provider": "none"},
+                    "vault": str(vault),
+                    "run": {"kind": "local"},
+                },
+                "trabajo": {  # sin vault: no debe romper
+                    "tracker": {"kind": "jira", "url": "https://x.atlassian.net",
+                                "project": "GRO"},
+                    "repos": {"root": str(t), "paths": ["groceries-wl"]},
+                    "autonomy": "manual",
+                    "budget": {"polarity": "spent", "provider": "manual",
+                               "total": 100.0, "used": 10.0},
+                    "run": {"kind": "ssh", "host": "wl@localhost"},
+                },
+            },
+        }
+
+    def _correr(self, args, config):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "config.json").write_text(json.dumps(config))
+            env = dict(os.environ)
+            env.update(HOME=str(tmp), HARNESS_CONFIG_DIR=str(tmp),
+                       HARNESS_OFFLINE="1")
+            return subprocess.run([str(HARNESS), *args], env=env,
+                                  capture_output=True, text=True, timeout=60)
+
+    def test_decisions_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._correr(["decisions", "--all", "--json"], self._escenario(tmp))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        ds = json.loads(p.stdout)["decisions"]
+        self.assertEqual(
+            [(d["context"], d["source"], d["id"]) for d in ds],
+            [("personal", "repo:koku", "0003"),
+             ("personal", "vault:decisiones", "2026-08-21-banco"),
+             ("trabajo", "repo:groceries-wl", "0001")])
+        titulos = {d["id"]: d["title"] for d in ds}
+        self.assertEqual(titulos["0003"], "Almacen event-sourced")
+        self.assertEqual(titulos["2026-08-21-banco"], "De banco")
+        for d in ds:  # la memoria de Claude y el diario no entran
+            self.assertNotIn("CLAUDE", d["path"])
+            self.assertNotIn("diario", d["path"])
+
+    def test_decisions_pantalla(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._correr(["decisions"], self._escenario(tmp))  # sólo el default
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("Decisiones", p.stdout)
+        self.assertIn("koku/docs/adr", p.stdout)
+        self.assertIn("vault/decisiones", p.stdout)
+        self.assertNotIn("\033", p.stdout)
+
+    def test_decisions_sin_vault_no_rompe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._correr(["decisions", "--context", "trabajo"],
+                             self._escenario(tmp))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("0001", p.stdout)
+        self.assertIn("Kiosco", p.stdout)
+        self.assertNotIn("vault/decisiones", p.stdout)

@@ -52,6 +52,34 @@ seguía el viejo `repos.conf`.
 existe son error: el harness sale con código 2 y una línea que dice qué contexto y
 qué campo hay que arreglar.
 
+## La vault y las decisiones
+
+La vault de un contexto es un lugar para lo que se aprende y no pertenece a ningún
+proyecto: investigaciones, decisiones, reglas de negocio. Taxonomía personal (la del
+trabajo, menos lo de equipo):
+
+```
+~/vault/
+├── decisiones/      notas de decisión (las lee `harness decisions`)
+├── investigations/
+├── diario/
+├── fundamentos/
+├── guias/
+└── handoff/
+```
+
+El harness **lee** la vault y **no la administra**: no crea, no borra, no escribe
+dentro. La única carpeta que mira es `decisiones/`.
+
+`harness decisions [--context N | --all] [--json]` cruza todas las decisiones:
+los `docs/adr/*.md` de cada repo más las notas de `decisiones/` de la vault, y
+cada resultado muestra su fuente (qué repo o qué carpeta de la vault). Un contexto
+sin vault no rompe: sólo muestra sus ADRs. Todo es disco local, así que corre con
+`HARNESS_OFFLINE=1`.
+
+La memoria de Claude (`CLAUDE.md`, `~/.claude/...`) **no** entra en esta vista ni se
+fusiona con la vault: es cómo trabajar con Tomás, no lo que aprende Tomás.
+
 ## Repos anidados
 
 El caso entrevestidos: una carpeta que es un repo y además contiene un repo por

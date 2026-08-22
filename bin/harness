@@ -6,6 +6,9 @@
     harness status --all            todos juntos, para el vistazo de la mañana
     harness status -q               sólo lo accionable (sin la tabla de readiness)
     harness status --json           el snapshot completo, parseable
+    harness decisions               las decisiones de todos los contextos:
+                                    ADRs por repo + notas de la vault
+    harness decisions --json        lo mismo, parseable
 
 v0 deliberadamente chico: NO es una app, es un script que imprime. La idea es vivir
 con él dos semanas y recién ahí especificar el dashboard de verdad, con datos de uso
@@ -13,6 +16,10 @@ en vez de suposiciones. Ver ../PLAN.md §"centralizar".
 
 Este archivo es sólo el pegamento: config -> adapters -> snapshot -> render -> stdout.
 Lo que hay que testear vive en `harness/snapshot.py`, que es una función pura.
+`decisions` es el mismo pegamento contra `harness/decisions.py`: los ADRs de cada
+repo (`docs/adr/`) más las notas de `decisiones/` de la vault del contexto, con la
+fuente de cada resultado. La vault se lee, no se administra, y la memoria de Claude
+no entra: es cómo trabajar con Tomás, no lo que aprende él.
 
 Los contextos —repos, tracker, autonomía, presupuesto, vault— se declaran en
 ~/.config/harness/config.json, fuera del repo porque ahí van las credenciales. Sin
@@ -34,8 +41,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from harness.adapters import collect, load_config  # noqa: E402
+from harness.adapters import (adr_files, collect, load_config, repo_paths,
+                              vault_decision_files)  # noqa: E402
 from harness.config import ConfigError  # noqa: E402
+from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
 from harness.render import render  # noqa: E402
 from harness.snapshot import as_dict, snapshot  # noqa: E402
 
@@ -45,8 +54,9 @@ OFFLINE = os.environ.get("HARNESS_OFFLINE") == "1"
 
 def build_parser():
     p = argparse.ArgumentParser(prog="harness", description=__doc__.splitlines()[0])
-    p.add_argument("command", nargs="?", default="status", choices=["status"],
-                   help="por ahora sólo status")
+    p.add_argument("command", nargs="?", default="status",
+                   choices=["status", "decisions"],
+                   help="status (la pantalla) o decisions (las decisiones cruzadas)")
     p.add_argument("--context", metavar="NOMBRE",
                    help="un contexto en vez del de por defecto")
     p.add_argument("--all", action="store_true", dest="todos",
@@ -58,6 +68,17 @@ def build_parser():
     return p
 
 
+def decision_groups(contexts):
+    """`[(nombre, [Decision])]`: los ADRs de cada repo más las notas de la
+    vault. Todo es disco local: corre igual con o sin adaptadores."""
+    groups = []
+    for c in contexts:
+        repos = [(p.name, adr_files(p)) for p in repo_paths(c.repos)]
+        groups.append((c.name, decisions_for(c.name, repos,
+                                             vault_decision_files(c.vault))))
+    return groups
+
+
 def main(argv=None):
     """Devuelve el código de salida. 2 = la config está mal y hay que arreglarla."""
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
@@ -66,6 +87,16 @@ def main(argv=None):
     except ConfigError as e:
         sys.stderr.write(f"harness: {e}\n")
         return 2
+
+    if args.command == "decisions":
+        groups = decision_groups(contexts)
+        if args.como_json:
+            json.dump({"decisions": as_list([d for _, ds in groups for d in ds])},
+                      sys.stdout, indent=2, ensure_ascii=False, sort_keys=True)
+            sys.stdout.write("\n")
+        else:
+            sys.stdout.write(render_decisions(groups, color=sys.stdout.isatty()))
+        return 0
 
     snap = snapshot(collect(contexts, offline=OFFLINE))
     if args.como_json:
