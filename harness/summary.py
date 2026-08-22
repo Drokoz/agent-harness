@@ -1,0 +1,196 @@
+"""El resumen de la mañana: "qué pasó desde la última vez que miré" (ticket #7).
+
+La fuente es el log JSONL de eventos del dispatcher (ver `harness/dispatch.py`),
+más los PRs abiertos que trae el snapshot en vivo. La lógica pura vive acá:
+leer el log, filtrar el período, contar lo que cuenta. La marca de "última vez
+que miré" es un archivo junto al log (misma carpeta de estado); el CLI la
+actualiza cada vez que muestra el resumen, salvo cuando `--since` mira
+otro período a propósito.
+
+Acá no se decide nada de dibujo (eso es `harness.render`) ni de CLI: las
+funciones toman lo que se les pasa y devuelven lo que cuentan. `leer_eventos`
+no se rompe con líneas mal escritas ni con el log inexistente: el log vacío
+significa "no pasó nada", no un error.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, List, Optional
+
+# Costo de job: el cuerpo de la línea "costo" es exactamente "$0.0560".
+# El delta de créditos de la corrida ("creditos antes ... / delta $0.2") NO
+# se suma: mide el mismo gasto por otra vía y sumar ambos lo contaría dos veces.
+COSTO_JOB_RE = re.compile(r"^\$(\d+(?:\.\d+)?)$")
+
+
+@dataclass
+class Ticket:
+    """Un ticket cuyo trabajo quedó hecho: el dispatcher lo anota como `pr`."""
+
+    contexto: str
+    ref: str
+    detalle: str
+
+
+@dataclass
+class Trabado:
+    """Un agente que no terminó: el dispatcher lo anota como `abandono`."""
+
+    contexto: str
+    ref: str
+    motivo: str
+
+
+@dataclass
+class PrAbierto:
+    """Un PR abierto ahora, traído por el snapshot, no por el log."""
+
+    repo: str
+    number: int
+    title: str
+
+
+@dataclass
+class Resumen:
+    """Lo que pasó en un período. `estado`: ok | offline.
+
+    `desde` es el inicio del período en ISO; None = desde el principio
+    (primera vez que se mira, sin marca guardada).
+    """
+
+    estado: str
+    desde: Optional[str] = None
+    hasta: Optional[str] = None
+    tickets: List[Ticket] = field(default_factory=list)
+    trabados: List[Trabado] = field(default_factory=list)
+    prs: List[PrAbierto] = field(default_factory=list)
+    costo: float = 0.0
+
+    @property
+    def paso_algo(self):
+        return bool(self.tickets or self.trabados or self.prs or self.costo > 0)
+
+
+# --------------------------------------------------------------------- eventos
+def parse_evento(linea):
+    """Una línea JSONL del log, o None si no coopera.
+
+    El log es append-only y lo escribe el dispatcher; una línea rota (disk
+    lleno, corte a medio escribir) no puede tirar el resumen: se salta.
+    """
+    try:
+        e = json.loads(linea)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(e, dict):
+        return None
+    if parse_fecha(str(e.get("timestamp", ""))) is None:
+        return None
+    return e
+
+
+def leer_eventos(path):
+    """Todo el log, en orden, sin líneas rotas. Log inexistente = sin eventos."""
+    try:
+        raw = Path(path).expanduser().read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [e for e in (parse_evento(l) for l in raw.splitlines()) if e is not None]
+
+
+def parse_fecha(s):
+    """Una fecha ISO (con o sin hora, con o sin Z) como datetime UTC, o None.
+
+    Python 3.9: `fromisoformat` no entiende la Z, así que se convierte antes.
+    Naive = UTC: el log lo escribe en UTC.
+    """
+    if not s:
+        return None
+    s = s.strip()
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def filtrar(eventos, desde):
+    """Los eventos desde `desde` (datetime, inclusive). `desde` None = todos."""
+    if desde is None:
+        return list(eventos)
+    out = []
+    for e in eventos:
+        dt = parse_fecha(str(e.get("timestamp", "")))
+        if dt is not None and dt >= desde:
+            out.append(e)
+    return out
+
+
+def resumir(eventos):
+    """(tickets, trabados, costo) de un período ya filtrado.
+
+    `tickets` son los eventos `pr` (job terminado con gate verde y PR abierto),
+    `trabados` los `abandono`, y `costo` la suma de los costos por job.
+    """
+    tickets: List[Ticket] = []
+    trabados: List[Trabado] = []
+    costo = 0.0
+    for e in eventos:
+        tipo, ref = e.get("tipo"), e.get("ref", "?")
+        ctx, cuerpo = e.get("contexto", "?"), str(e.get("cuerpo", ""))
+        if tipo == "pr":
+            tickets.append(Ticket(contexto=ctx, ref=ref, detalle=cuerpo))
+        elif tipo == "abandono":
+            trabados.append(Trabado(contexto=ctx, ref=ref, motivo=cuerpo))
+        elif tipo == "costo":
+            m = COSTO_JOB_RE.match(cuerpo.strip())
+            if m:
+                costo += float(m.group(1))
+    return tickets, trabados, costo
+
+
+def construir(eventos, prs, estado="ok", desde=None, hasta=None):
+    """El `Resumen` de un período ya filtrado, con los PRs abiertos en vivo."""
+    tickets, trabados, costo = resumir(eventos)
+    return Resumen(estado=estado, desde=desde, hasta=hasta,
+                   tickets=tickets, trabados=trabados, prs=list(prs), costo=costo)
+
+
+# ------------------------------------------------------------------------ marca
+def leer_marca(path):
+    """La marca de "última vez que miré" como datetime UTC, o None."""
+    try:
+        texto = Path(path).expanduser().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return parse_fecha(texto)
+
+
+def guardar_marca(path, reloj: Callable[[], str]):
+    """Guarda la marca con el timestamp que devuelva `reloj` (ISO)."""
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(reloj(), encoding="utf-8")
+
+
+# ------------------------------------------------------------------------ JSON
+def as_dict(r: Resumen):
+    """El resumen para `--json`: la misma forma que el resto del snapshot."""
+    return {
+        "estado": r.estado,
+        "desde": r.desde,
+        "hasta": r.hasta,
+        "tickets": [asdict(t) for t in r.tickets],
+        "trabados": [asdict(t) for t in r.trabados],
+        "prs": [asdict(p) for p in r.prs],
+        "costo": r.costo,
+    }
