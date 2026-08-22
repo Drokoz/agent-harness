@@ -5,23 +5,34 @@ Nada acá toca la red, el disco ni un subproceso, y hay un test que lo verifica.
 """
 
 import copy
+import json
 import unittest
 from unittest import mock
 
 import support
 
-from harness.snapshot import (COSTO_TICKET, READINESS, Snapshot, blockers_of,
-                              snapshot)
+from harness.snapshot import (COSTO_TICKET, READINESS, SCHEMA_VERSION, Snapshot,
+                              as_dict, blockers_of, snapshot)
 
 
-def raw(**over):
-    base = {"offline": False, "credits": None, "agents": None, "repos": []}
+def raw(offline=False, credits=None, agents=None, repos=None, budget=None, **over):
+    """Lo crudo con un solo contexto, que es lo que mira casi todo este archivo."""
+    contexto = {"name": "personal", "tracker": "github", "autonomy": "frontier",
+                "vault": None, "run": "local", "repos": repos or [],
+                "budget": budget if budget is not None else budget_raw(credits=credits)}
+    contexto.update(over)
+    return {"offline": offline, "agents": agents, "contexts": [contexto]}
+
+
+def budget_raw(**over):
+    base = {"polarity": "remaining", "provider": "openrouter", "credits": None,
+            "total": 0.0, "used": 0.0}
     base.update(over)
     return base
 
 
 def repo_raw(**over):
-    base = {"name": "koku", "slug": "Drokoz/koku", "branch": "main",
+    base = {"name": "koku", "tracker": "github", "slug": "Drokoz/koku", "branch": "main",
             "status_porcelain": "", "exists": {k: True for k, _, _ in READINESS},
             "issues": [], "prs": []}
     base.update(over)
@@ -61,7 +72,7 @@ class TestFixtures(unittest.TestCase):
     def test_issues_reales(self):
         """La fixture REST no trae dependencias nativas: cae al parseo del body."""
         snap = snapshot(raw(repos=[repo_raw(issues=support.gh_issues())]))
-        r = snap.repos[0]
+        r = snap.contexts[0].repos[0]
         self.assertEqual(len(r.frontier), 10)
         self.assertIn(3, [i.number for i in r.frontier])
         self.assertEqual(r.frontier_source, "body")
@@ -71,7 +82,7 @@ class TestFixtures(unittest.TestCase):
         """La fixture GraphQL es la respuesta real de Drokoz/agent-harness: los
         cinco tickets con bloqueantes abiertos NO entran a la frontera."""
         snap = snapshot(raw(repos=[repo_raw(issues=support.gh_issues_native())]))
-        r = snap.repos[0]
+        r = snap.contexts[0].repos[0]
         self.assertEqual([i.number for i in r.frontier], [1, 4, 12, 15])
         self.assertEqual([i.number for i in r.blocked], [5, 6, 7, 8, 9])
         self.assertEqual(r.frontier_source, "native")
@@ -79,8 +90,8 @@ class TestFixtures(unittest.TestCase):
 
     def test_prs_reales(self):
         snap = snapshot(raw(repos=[repo_raw(prs=support.gh_prs())]))
-        self.assertEqual([p.number for p in snap.repos[0].prs], [13, 10])
-        self.assertFalse(snap.repos[0].prs[0].draft)
+        self.assertEqual([p.number for p in snap.contexts[0].repos[0].prs], [13, 10])
+        self.assertFalse(snap.contexts[0].repos[0].prs[0].draft)
 
     def test_agentes_reales(self):
         snap = snapshot(raw(agents=support.herdr_agents()))
@@ -93,31 +104,31 @@ class TestFixtures(unittest.TestCase):
 
     def test_credits_reales(self):
         snap = snapshot(raw(credits=support.openrouter_credits()))
-        self.assertEqual(snap.budget.state, "ok")
-        self.assertAlmostEqual(snap.budget.total, 25.0)
+        self.assertEqual(snap.contexts[0].budget.state, "ok")
+        self.assertAlmostEqual(snap.contexts[0].budget.total, 25.0)
 
 
 class TestFrontera(unittest.TestCase):
     def test_excluye_bloqueados(self):
         issues = [issue(1), issue(2, body="Blocked by #1")]
-        r = snapshot(raw(repos=[repo_raw(issues=issues)])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(issues=issues)])).contexts[0].repos[0]
         self.assertEqual([i.number for i in r.frontier], [1])
         self.assertEqual([i.number for i in r.blocked], [2])
 
     def test_bloqueante_cerrado_no_bloquea(self):
         """#99 no está en la lista de abiertos: el issue vuelve a la frontera."""
-        r = snapshot(raw(repos=[repo_raw(issues=[issue(2, body="Blocked by #99")])])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(issues=[issue(2, body="Blocked by #99")])])).contexts[0].repos[0]
         self.assertEqual([i.number for i in r.frontier], [2])
         self.assertEqual(r.blocked, [])
 
     def test_varios_bloqueantes_basta_uno_abierto(self):
         issues = [issue(1), issue(5, body="Blocked by #1, #99")]
-        r = snapshot(raw(repos=[repo_raw(issues=issues)])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(issues=issues)])).contexts[0].repos[0]
         self.assertEqual([i.number for i in r.blocked], [5])
 
     def test_sin_label_no_entra(self):
         issues = [issue(1, labels=()), issue(2, labels=("needs-triage",))]
-        r = snapshot(raw(repos=[repo_raw(issues=issues)])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(issues=issues)])).contexts[0].repos[0]
         self.assertEqual(r.frontier, [])
         self.assertEqual([i.number for i in r.triage], [2])
 
@@ -139,49 +150,49 @@ class TestFronteraNativa(unittest.TestCase):
 
     def test_bloqueantes_abiertos_no_entran_a_la_frontera(self):
         issues = [issue(1), self.issue(2, blocked_by=1)]
-        r = snapshot(raw(repos=[repo_raw(issues=issues)])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(issues=issues)])).contexts[0].repos[0]
         self.assertEqual([i.number for i in r.frontier], [1])
         self.assertEqual([i.number for i in r.blocked], [2])
 
     def test_cero_bloqueantes_abiertos_esta_en_la_frontera(self):
         # blockedBy ya no cuenta cerrados: 0 quiere decir disponible.
-        r = snapshot(raw(repos=[repo_raw(issues=[self.issue(2, blocked_by=0)])])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(issues=[self.issue(2, blocked_by=0)])])).contexts[0].repos[0]
         self.assertEqual([i.number for i in r.frontier], [2])
         self.assertEqual(r.blocked, [])
 
     def test_nativas_premen_al_body(self):
         """Con datos nativos el cuerpo no se mira: 'Blocked by #1' no cuenta."""
         issues = [issue(1), self.issue(2, blocked_by=0, body="Blocked by #1")]
-        r = snapshot(raw(repos=[repo_raw(issues=issues)])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(issues=issues)])).contexts[0].repos[0]
         self.assertEqual([i.number for i in r.frontier], [1, 2])
         self.assertEqual(r.blocked, [])
 
     def test_sin_datos_nativos_cae_al_body(self):
         issues = [issue(1), issue(2, body="Blocked by #1")]
-        r = snapshot(raw(repos=[repo_raw(issues=issues)])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(issues=issues)])).contexts[0].repos[0]
         self.assertEqual([i.number for i in r.frontier], [1])
         self.assertEqual([i.number for i in r.blocked], [2])
 
     def test_fuente_nativa(self):
         issues = [self.issue(1, blocked_by=0), self.issue(2, blocked_by=1)]
-        r = snapshot(raw(repos=[repo_raw(issues=issues)])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(issues=issues)])).contexts[0].repos[0]
         self.assertEqual(r.frontier_source, "native")
 
     def test_fuente_body(self):
-        r = snapshot(raw(repos=[repo_raw(issues=[issue(1)])])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(issues=[issue(1)])])).contexts[0].repos[0]
         self.assertEqual(r.frontier_source, "body")
 
     def test_mezclado_se_nota_body_y_cada_issue_usa_lo_suyo(self):
         """Si algún issue no trae nativas, la fuente se reporta como body y ese
         issue se decide por su cuerpo."""
         issues = [self.issue(1, blocked_by=0), issue(2, body="Blocked by #1")]
-        r = snapshot(raw(repos=[repo_raw(issues=issues)])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(issues=issues)])).contexts[0].repos[0]
         self.assertEqual(r.frontier_source, "body")
         self.assertEqual([i.number for i in r.frontier], [1])
         self.assertEqual([i.number for i in r.blocked], [2])
 
     def test_fuente_none_sin_issues(self):
-        r = snapshot(raw(repos=[repo_raw(issues=[])])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(issues=[])])).contexts[0].repos[0]
         self.assertIsNone(r.frontier_source)
 
 
@@ -189,7 +200,7 @@ class TestRepos(unittest.TestCase):
     def test_repo_sin_remote_no_rompe(self):
         """Sin slug no hay issues que traer, pero el repo sigue en la tabla."""
         r = snapshot(raw(repos=[repo_raw(slug=None, issues=None, prs=None,
-                                         exists={"gate": True})])).repos[0]
+                                         exists={"gate": True})])).contexts[0].repos[0]
         self.assertIsNone(r.slug)
         self.assertFalse(r.has_work)
         self.assertEqual(r.ready, {"gate": True, "skills": False, "context": False})
@@ -197,45 +208,45 @@ class TestRepos(unittest.TestCase):
         self.assertEqual(r.degraded, [])
 
     def test_branch_y_dirty(self):
-        r = snapshot(raw(repos=[repo_raw(branch=None, status_porcelain=" M a\n?? b\n\n")])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(branch=None, status_porcelain=" M a\n?? b\n\n")])).contexts[0].repos[0]
         self.assertEqual(r.branch, "?")
         self.assertEqual(r.dirty, 2)
 
     def test_dirty_cero_si_git_fallo(self):
-        r = snapshot(raw(repos=[repo_raw(status_porcelain=None)])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(status_porcelain=None)])).contexts[0].repos[0]
         self.assertEqual(r.dirty, 0)
 
     def test_offline_no_inventa_trabajo(self):
         """Sin adaptadores no se pidieron issues: no es degradación, es que no se preguntó."""
-        r = snapshot(raw(offline=True, repos=[repo_raw(issues=None, prs=None)])).repos[0]
+        r = snapshot(raw(offline=True, repos=[repo_raw(issues=None, prs=None)])).contexts[0].repos[0]
         self.assertEqual(r.degraded, [])
         self.assertFalse(r.has_work)
 
 
 class TestPresupuesto(unittest.TestCase):
     def test_calcula_bien(self):
-        b = snapshot(raw(credits={"total_credits": 25.0, "total_usage": 11.634528})).budget
+        b = snapshot(raw(credits={"total_credits": 25.0, "total_usage": 11.634528})).contexts[0].budget
         self.assertEqual(b.state, "ok")
         self.assertAlmostEqual(b.left, 13.365472)
         self.assertEqual(b.tickets, int(13.365472 / COSTO_TICKET))
         self.assertEqual(b.tickets, 55)
 
     def test_gastado_todo(self):
-        b = snapshot(raw(credits={"total_credits": 5.0, "total_usage": 5.0})).budget
+        b = snapshot(raw(credits={"total_credits": 5.0, "total_usage": 5.0})).contexts[0].budget
         self.assertEqual(b.left, 0.0)
         self.assertEqual(b.tickets, 0)
 
     def test_sin_datos(self):
-        self.assertEqual(snapshot(raw()).budget.state, "missing")
+        self.assertEqual(snapshot(raw()).contexts[0].budget.state, "missing")
 
     def test_respuesta_rara_no_rompe(self):
         for malo in ({}, {"total_credits": 1.0}, {"total_credits": "x", "total_usage": 0}):
             with self.subTest(credits=malo):
-                self.assertEqual(snapshot(raw(credits=malo)).budget.state, "missing")
+                self.assertEqual(snapshot(raw(credits=malo)).contexts[0].budget.state, "missing")
 
     def test_offline(self):
         self.assertEqual(snapshot(raw(offline=True, credits={"total_credits": 1.0,
-                                                             "total_usage": 0.0})).budget.state,
+                                                             "total_usage": 0.0})).contexts[0].budget.state,
                          "offline")
 
 
@@ -265,26 +276,124 @@ class TestDegradacion(unittest.TestCase):
                             repos=[repo_raw(name="caido", issues=None, prs=None),
                                    repo_raw(name="sano", issues=[issue(1)],
                                             prs=support.gh_prs())]))
-        caido, sano = snap.repos
+        caido, sano = snap.contexts[0].repos
         self.assertEqual(caido.degraded, ["issues", "prs"])
         self.assertEqual(caido.frontier, [])
         self.assertFalse(caido.has_work)
         self.assertEqual(sano.degraded, [])
         self.assertTrue(sano.has_work)
-        self.assertEqual(snap.budget.state, "ok")
+        self.assertEqual(snap.contexts[0].budget.state, "ok")
         self.assertEqual(snap.agents.state, "ok")
 
     def test_solo_los_issues_caidos(self):
-        r = snapshot(raw(repos=[repo_raw(issues=None, prs=support.gh_prs())])).repos[0]
+        r = snapshot(raw(repos=[repo_raw(issues=None, prs=support.gh_prs())])).contexts[0].repos[0]
         self.assertEqual(r.degraded, ["issues"])
         self.assertTrue(r.has_work)  # los PRs siguen ahí
 
     def test_todo_caido_sigue_dando_snapshot(self):
         snap = snapshot(raw(repos=[repo_raw(issues=None, prs=None, status_porcelain=None,
                                             branch=None)]))
-        self.assertEqual(snap.budget.state, "missing")
+        self.assertEqual(snap.contexts[0].budget.state, "missing")
         self.assertEqual(snap.agents.state, "outside")
-        self.assertEqual(len(snap.repos), 1)
+        self.assertEqual(len(snap.contexts[0].repos), 1)
+
+
+class TestContextos(unittest.TestCase):
+    def test_un_snapshot_por_contexto(self):
+        snap = snapshot(support.golden_raw())
+        self.assertEqual([c.name for c in snap.contexts], ["personal", "trabajo"])
+        personal, trabajo = snap.contexts
+        self.assertEqual((personal.tracker, personal.autonomy, personal.run),
+                         ("github", "frontier", "local"))
+        self.assertEqual((trabajo.tracker, trabajo.autonomy, trabajo.run),
+                         ("jira", "manual", "ssh"))
+        self.assertEqual(trabajo.vault, "~/wl-devlead-vault")
+
+    def test_los_agentes_son_de_la_maquina_no_del_contexto(self):
+        snap = snapshot(support.golden_raw())
+        self.assertEqual(snap.agents.state, "ok")
+        self.assertFalse(hasattr(snap.contexts[0], "agents"))
+
+    def test_un_solo_contexto(self):
+        snap = snapshot(support.golden_raw("trabajo"))
+        self.assertEqual([c.name for c in snap.contexts], ["trabajo"])
+
+    def test_sin_contextos_no_rompe(self):
+        snap = snapshot({"offline": False, "agents": None, "contexts": []})
+        self.assertEqual(snap.contexts, [])
+
+    def test_tracker_que_no_es_github_no_degrada(self):
+        """No es que gh se cayó: es que a Jira no se le pregunta con gh (todavía)."""
+        r = snapshot(raw(repos=[repo_raw(tracker="jira", issues=None, prs=None)],
+                         tracker="jira")).contexts[0].repos[0]
+        self.assertEqual(r.degraded, [])
+        self.assertFalse(r.has_work)
+        self.assertEqual(r.ready, {k: True for k, _, _ in READINESS})
+
+
+class TestPolaridad(unittest.TestCase):
+    """El mismo número, dos objetivos opuestos: que no se acabe / que no sobre."""
+
+    def test_personal_mira_lo_que_queda(self):
+        b = snapshot(raw(credits={"total_credits": 25.0, "total_usage": 10.0})) \
+            .contexts[0].budget
+        self.assertEqual((b.polarity, b.provider), ("remaining", "openrouter"))
+        self.assertAlmostEqual(b.left, 15.0)
+        self.assertAlmostEqual(b.ratio, 0.4)
+
+    def test_trabajo_mira_lo_que_lleva_usado(self):
+        b = snapshot(raw(budget=budget_raw(polarity="spent", provider="manual",
+                                           total=200.0, used=128.4))).contexts[0].budget
+        self.assertEqual((b.state, b.polarity), ("ok", "spent"))
+        self.assertAlmostEqual(b.used, 128.4)
+        self.assertAlmostEqual(b.ratio, 0.642)
+
+    def test_la_polaridad_sobrevive_al_presupuesto_caido(self):
+        for over in ({"provider": "openrouter", "credits": None},
+                     {"provider": "manual", "total": None}):
+            with self.subTest(**over):
+                b = snapshot(raw(budget=budget_raw(polarity="spent", **over))) \
+                    .contexts[0].budget
+                self.assertEqual(b.state, "missing")
+                self.assertEqual(b.polarity, "spent")
+
+    def test_offline_conserva_la_polaridad(self):
+        b = snapshot(raw(offline=True, budget=budget_raw(polarity="spent"))) \
+            .contexts[0].budget
+        self.assertEqual((b.state, b.polarity), ("offline", "spent"))
+
+    def test_contexto_sin_presupuesto(self):
+        b = snapshot(raw(budget=budget_raw(provider="none"))).contexts[0].budget
+        self.assertEqual(b.state, "unset")
+
+    def test_total_cero_no_divide_por_cero(self):
+        b = snapshot(raw(budget=budget_raw(provider="manual", total=0.0,
+                                           used=0.0))).contexts[0].budget
+        self.assertEqual((b.state, b.ratio), ("ok", 0.0))
+
+
+class TestJson(unittest.TestCase):
+    """`--json` emite el snapshot entero: es el contrato con la web futura."""
+
+    def test_es_serializable_y_completo(self):
+        data = as_dict(snapshot(support.golden_raw()))
+        texto = json.dumps(data)  # sin default=: nada raro adentro
+        self.assertEqual(data["version"], SCHEMA_VERSION)
+        self.assertEqual([c["name"] for c in data["contexts"]], ["personal", "trabajo"])
+        self.assertIn("frontier", texto)
+        self.assertEqual(data["contexts"][1]["budget"]["polarity"], "spent")
+        self.assertEqual(data["agents"]["state"], "ok")
+
+    def test_no_recorta_como_recorta_la_pantalla(self):
+        """La pantalla corta la lista de bloqueados a 3; el JSON los lleva todos."""
+        data = as_dict(snapshot(support.golden_raw("personal")))
+        repo = data["contexts"][0]["repos"][0]
+        self.assertEqual([i["number"] for i in repo["blocked"]], [5, 6, 7, 8, 9])
+        self.assertEqual(repo["frontier_source"], "native")
+
+    def test_ida_y_vuelta_por_json(self):
+        data = as_dict(snapshot(support.golden_raw()))
+        self.assertEqual(json.loads(json.dumps(data)), data)
 
 
 if __name__ == "__main__":
