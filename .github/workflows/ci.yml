@@ -1,0 +1,30 @@
+# CI: el gate (scripts/gate.sh) corre en GitHub, no solo en la máquina local.
+# Un PR dice verde o rojo aquí mismo; nada se salta en silencio (el único paso
+# de trabajo es el gate, y si no sale 0 el workflow es rojo).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Un push nuevo a la misma rama cancela la corrida anterior: no se gastan
+# minutos verificando dos veces lo mismo.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Python 3.9 explícito: el gate exige un intérprete 3.9 (sin él el chequeo
+      # de sintaxis no detecta código 3.10+). setup-python deja `python3.9` en el
+      # PATH, que es el primer candidato del gate.
+      - name: Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Gate
+        run: ./scripts/gate.sh
