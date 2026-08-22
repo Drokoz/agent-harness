@@ -60,3 +60,9 @@ salida, sin thinking). Sin esa lista, pi autodescubre el catálogo real del prov
 Y no usar el sufijo `:nitro`: rutea al proveedor más rápido, pero en el catálogo aparece como
 una entrada distinta y degradada. `qwen/qwen3.8-27b` da 262K/131K con thinking;
 `qwen/qwen3.8-27b:nitro` da 128K/16.4K sin thinking.
+
+## Fechas
+
+Nunca escribas una fecha de memoria: corré `date +%Y-%m-%d` y usá esa. Un modelo no sabe qué
+día es y la va a inventar — ya pasó, con una nota de la vault fechada cinco días en el futuro.
+Aplica a ADRs, notas de la vault, entradas de diario y cualquier cosa con fecha en el nombre.
