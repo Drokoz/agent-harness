@@ -474,3 +474,43 @@ Contextos y repos seguidos: `~/.config/harness/config.json`, fuera del repo porq
 contiene credenciales (ver `docs/harness/config.md`). Uso: `harness status` para el
 contexto por defecto, `--context <nombre>` para uno, `--all` para todos, `-q` para
 saltear la tabla de readiness y `--json` para el snapshot completo.
+
+## 11. `harness run` (v0, 2026-08-22)
+
+El dispatcher local de la Fase 2, ya en Python sobre el mismo esqueleto de
+`harness status`. `harness run` toma la frontera desbloqueada del contexto y la
+deja trabajando: un worktree por ticket (`<raíz>/.worktrees/<repo>-ticket-<n>`,
+rama `ticket/<n>`), un pane de herdr por agente, y un tope de paralelismo
+(`--max`, por defecto 2 —24 GB: dos, no cinco). La cola entera se drena: cuando
+uno termina, entra el siguiente.
+
+Las reglas que lo hacen seguro para dejarlo corriendo:
+
+- Un contexto con `autonomy: manual` no delega: el comando no toma nada solo.
+- Un repo sin gate no se despacha. Al terminar un agente, el dispatcher **correre
+  el gate en el worktree** —no confía en la palabra del agente—: rojo =
+  abandono, sin PR. No existe merge automático: el dispatcher no tiene el
+  comando, el merge sigue siendo del humano.
+- Un agente que queda `blocked` (aprobación o pregunta) se abandona, se anota y
+  el dispatcher sigue con el siguiente ticket.
+- El primer prompt después de `agent start` se pierde (carrera con la TUI de
+  pi) y herdr reporta éxito igual: el dispatcher verifica que el contexto del
+  agente sube de 0% (lo lee de la línea de estado de la TUI) y reintenta hasta 3
+  veces. Un trabajo que nunca arrancó no cuenta como lanzado.
+- Los prompts viajan en una sola línea: con saltos de línea herdr reporta éxito
+  pero no entrega nada.
+- Al terminar un agente se cierra su pane y se quita el worktree: un pane que
+  queda abierto para siempre hace inutilizable la pantalla después de unas
+  cuantas tandas. La rama queda: si hay commits son recuperables, y si el ticket
+  vuelve a la frontera el próximo intento la reutiliza.
+- Cosecha: por cada PR merged reciente, los issues que cerró y siguen abiertos
+  se cierran —los agentes escriben "Closes #N" de forma inconsistente, y un
+  issue abierto vuelve a la frontera y se re-trabaja para siempre.
+- Se registra el costo: el de cada agente (el `$` de la línea de estado) y el de
+  la corrida (diferencia de créditos de OpenRouter, si el contexto la sigue).
+- Todo queda en un log JSONL append-only (`~/.local/state/harness/events.jsonl`,
+  `--log` lo mueve): timestamp, contexto, **origen** (hoy siempre `harness`, para
+  que un observador futuro no invalide lo escrito), tipo, referencia y cuerpo.
+
+`run` requiere adaptadores y una sesión de herdr (`HERDR_ENV=1`): un dispatcher
+sin mundo no es un dispatcher, así que con `HARNESS_OFFLINE=1` no existe.

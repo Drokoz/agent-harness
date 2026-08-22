@@ -138,6 +138,7 @@ class Repo:
     prs: List[Pr] = field(default_factory=list)
     degraded: List[str] = field(default_factory=list)
     frontier_source: Optional[str] = None  # "native" | "body" | None
+    path: str = ""  # dónde vive en el disco (el dispatcher crea worktrees a partir de acá)
 
     @property
     def has_work(self):
@@ -279,6 +280,7 @@ def _repo(raw, offline=False):
         tracker=raw.get("tracker", "github"),
         slug=raw.get("slug"),
         branch=raw.get("branch") or "?",
+        path=raw.get("path", ""),
         dirty=dirty,
         ready=ready,
         missing=[desc for key, _, desc in READINESS if not ready[key]],
