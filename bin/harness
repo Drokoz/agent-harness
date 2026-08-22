@@ -5,6 +5,8 @@
     harness status --context work   uno solo
     harness status --all            todos juntos, para el vistazo de la mañana
     harness status -q               sólo lo accionable (sin la tabla de readiness)
+    harness status --since FECHA    el resumen desde esa fecha (YYYY-MM-DD o ISO);
+                                    no mueve la marca de "última vez que miré"
     harness status --json           el snapshot completo, parseable
     harness decisions               las decisiones de todos los contextos:
                                     ADRs por repo + notas de la vault
@@ -31,7 +33,9 @@ es cómo trabajar con Tomás, no lo que aprende él.
 Los contextos —repos, tracker, autonomía, presupuesto, vault— se declaran en
 ~/.config/harness/config.json, fuera del repo porque ahí van las credenciales. Sin
 ese archivo corre con la config de arranque (ver `harness/config.py`). `status`
-no escribe nada en ningún lado; `run` además deja el log JSONL de eventos.
+escribe una sola cosa: la marca de "última vez que miré" junto al log de
+eventos (~/.local/state/harness/, o XDG_STATE_HOME), que abre el resumen de
+la mañana (ticket #7). `run` además deja el log JSONL de eventos.
 
 Con HARNESS_OFFLINE=1 corre en modo sin adaptadores: sin llamadas de red ni de
 gh/herdr. El gate lo usa para que el humo del CLI sea hermético. `run` no existe
@@ -44,6 +48,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -57,6 +62,9 @@ from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa
 from harness.dispatch import (DispatchSpec, Dispatcher, EventLog, Job, cosechar)  # noqa: E402
 from harness.render import render  # noqa: E402
 from harness.snapshot import as_dict, snapshot  # noqa: E402
+from harness.summary import (PrAbierto, Resumen, construir, filtrar,  # noqa: E402
+                             guardar_marca, as_dict as resumen_as_dict,
+                             leer_eventos, leer_marca, parse_fecha)
 
 # Modo sin adaptadores: sin red ni dependencias externas (OpenRouter, gh, herdr).
 OFFLINE = os.environ.get("HARNESS_OFFLINE") == "1"
@@ -74,6 +82,10 @@ def build_parser():
                    help="todos los contextos juntos")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="sólo lo accionable: sin la tabla de readiness")
+    p.add_argument("--since", metavar="FECHA", default="",
+                   help="status: el resumen desde esa fecha (YYYY-MM-DD o ISO "
+                        "8601) en vez de desde la última vez que se miró; "
+                        "no mueve la marca")
     p.add_argument("--json", action="store_true", dest="como_json",
                    help="el snapshot completo en JSON, en vez de la pantalla")
     p.add_argument("--max", type=int, default=2, dest="maximo",
@@ -120,12 +132,51 @@ def main(argv=None):
         return run_main(args, contexts)
 
     snap = snapshot(collect(contexts, offline=OFFLINE))
+    if args.since and parse_fecha(args.since) is None:
+        sys.stderr.write("harness: --since inválido: se espera YYYY-MM-DD o ISO "
+                         "8601 (p.ej. 2026-08-21)\n")
+        return 2
+    resumen = resumen_de(args, snap)
     if args.como_json:
-        json.dump(as_dict(snap), sys.stdout, indent=2, ensure_ascii=False, sort_keys=True)
+        data = as_dict(snap)
+        data["resumen"] = resumen_as_dict(resumen)
+        json.dump(data, sys.stdout, indent=2, ensure_ascii=False, sort_keys=True)
         sys.stdout.write("\n")
     else:
-        sys.stdout.write(render(snap, quiet=args.quiet, color=sys.stdout.isatty()))
+        sys.stdout.write(render(snap, quiet=args.quiet, color=sys.stdout.isatty(),
+                                resumen=resumen))
     return 0
+
+
+def _ahora_str():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def resumen_de(args, snap):
+    """El resumen de la mañana: el log de eventos desde la última vez que se
+    miró (o desde `--since`), más los PRs abiertos que trae el snapshot.
+
+    La marca vive junto al log y se actualiza con cada vista; `--since` mira
+    otro período a propósito y no la mueve. Offline no hay resumen ni marca:
+    el gate no debe tener efectos de lado.
+    """
+    if OFFLINE:
+        return Resumen(estado="offline")
+    base = _estado_dir() / "harness"
+    log_path, mark_path = base / "events.jsonl", base / "last_viewed"
+    desde_dt = parse_fecha(args.since) if args.since else leer_marca(mark_path)
+    eventos = filtrar(leer_eventos(log_path), desde_dt)
+    prs = [PrAbierto(repo=r.name, number=p.number, title=p.title)
+          for ctx in snap.contexts for r in ctx.repos for p in r.prs]
+    if not args.since:
+        guardar_marca(mark_path, _ahora_str)
+    return construir(eventos, prs,
+                     desde=None if desde_dt is None else _iso_utc(desde_dt),
+                     hasta=_ahora_str())
+
+
+def _iso_utc(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _estado_dir():

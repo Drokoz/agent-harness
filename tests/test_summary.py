@@ -7,6 +7,9 @@ comportamiento de la marca y de `--since` (filtrar por fecha).
 """
 
 import json
+import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -17,6 +20,8 @@ import support  # noqa: F401  (pone la raíz en sys.path)
 from harness.summary import (PrAbierto, construir, filtrar, guardar_marca,
                              leer_eventos, leer_marca, parse_evento, parse_fecha,
                              resumir)
+
+HARNESS = support.ROOT / "bin" / "harness"
 
 
 def evento(timestamp, tipo, ref="?", contexto="personal", cuerpo=""):
@@ -182,6 +187,107 @@ class TestMarca(unittest.TestCase):
     def test_marca_inexistente_es_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(leer_marca(Path(tmp) / "last_viewed"))
+
+
+CONFIG_SIN_REPOS = json.dumps({
+    "default_context": "personal",
+    "contexts": {
+        "personal": {"tracker": {"kind": "github"},
+                     "repos": {"root": "/no/existe", "paths": []},
+                     "autonomy": "frontier",
+                     "budget": {"polarity": "remaining", "provider": "openrouter"},
+                     "run": {"kind": "local"}},
+    },
+})
+
+
+def correr_cli(state, *args):
+    """El CLI de verdad, no offline, sin red: HOME y estado en un tmpdir y
+    cero repos en la config. `state` es la XDG_STATE_HOME (dónde viven
+    events.jsonl y last_viewed)."""
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("HARNESS_OFFLINE", "HERDR_ENV", "XDG_STATE_HOME")}
+    with tempfile.TemporaryDirectory() as cfg:
+        env.update(HOME=state, XDG_STATE_HOME=state, HARNESS_CONFIG_DIR=cfg)
+        (Path(cfg) / "config.json").write_text(CONFIG_SIN_REPOS)
+        return subprocess.run([str(HARNESS), *args], env=env, capture_output=True,
+                              text=True, timeout=60)
+
+
+class TestCLI(unittest.TestCase):
+    """El cableado de `harness status` contra el log y la marca, de punta a punta."""
+
+    def _estado(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(d), True)
+        return d
+
+    def test_primer_status_muestra_el_log_y_guarda_la_marca(self):
+        state = self._estado()
+        escribir_log(state / "harness" / "events.jsonl", LOG_NORMAL)
+        p = correr_cli(state, "status")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("desde el principio", p.stdout)
+        self.assertIn("2 tickets con PR abierto (gate verde)", p.stdout)
+        self.assertIn("1 trabado(s)", p.stdout)
+        self.assertIn("gate rojo en el worktree: sin PR", p.stdout)
+        self.assertIn("costo del período: $0.77", p.stdout)
+        self.assertTrue((state / "harness" / "last_viewed").exists())
+
+    def test_segundo_status_solo_cubre_lo_nuevo(self):
+        """La marca se actualiza sola: lo que ya se vio no vuelve a contarse."""
+        state = self._estado()
+        (state / "harness").mkdir(parents=True)
+        (state / "harness" / "last_viewed").write_text("2026-08-22T06:00:00Z")
+        escribir_log(state / "harness" / "events.jsonl", LOG_NORMAL)
+        p = correr_cli(state, "status")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("no pasó nada", p.stdout)  # todo el log es anterior a la marca
+
+    def test_since_mira_otro_periodo_sin_mover_la_marca(self):
+        state = self._estado()
+        (state / "harness").mkdir(parents=True)
+        (state / "harness" / "last_viewed").write_text("2026-08-22T06:00:00Z")
+        escribir_log(state / "harness" / "events.jsonl", LOG_NORMAL)
+        p = correr_cli(state, "status", "--since", "2026-08-21")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("tickets con PR abierto", p.stdout)
+        self.assertEqual((state / "harness" / "last_viewed").read_text(),
+                         "2026-08-22T06:00:00Z")
+
+    def test_since_inválido_es_error_sin_stack(self):
+        state = self._estado()
+        p = correr_cli(state, "status", "--since", "el martes")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("--since inválido", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_json_trae_el_resumen(self):
+        state = self._estado()
+        escribir_log(state / "harness" / "events.jsonl", LOG_NORMAL)
+        p = correr_cli(state, "status", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        r = json.loads(p.stdout)["resumen"]
+        self.assertEqual([t["ref"] for t in r["tickets"]], ["ticket/3", "ticket/9"])
+        self.assertEqual([t["ref"] for t in r["trabados"]], ["ticket/11"])
+        self.assertAlmostEqual(r["costo"], 0.77)
+
+    def test_offline_no_toca_ni_log_ni_marca(self):
+        """El gate corre status offline: no debe tener efectos de lado."""
+        state = self._estado()
+        escribir_log(state / "harness" / "events.jsonl", LOG_NORMAL)
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("HERDR_ENV", "XDG_STATE_HOME")}
+        with tempfile.TemporaryDirectory() as cfg:
+            env.update(HOME=state, XDG_STATE_HOME=state, HARNESS_CONFIG_DIR=cfg,
+                       HARNESS_OFFLINE="1")
+            (Path(cfg) / "config.json").write_text(CONFIG_SIN_REPOS)
+            p = subprocess.run([str(HARNESS), "status"], env=env, capture_output=True,
+                               text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("Resumen", p.stdout)
+        self.assertNotIn("tickets con PR", p.stdout)
+        self.assertFalse((state / "harness" / "last_viewed").exists())
 
 
 if __name__ == "__main__":
