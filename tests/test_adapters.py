@@ -13,6 +13,7 @@ from unittest import mock
 import support
 
 from harness import adapters
+from harness.config import ConfigError, Repos, default_config
 
 
 def fake_run(respuestas):
@@ -146,27 +147,96 @@ class TestGhGraphqlIssues(unittest.TestCase):
         self.assertIn("after=CUR", llamadas[1])
 
 
-class TestRepos(unittest.TestCase):
-    def test_lee_repos_conf_ignorando_comentarios_y_repos_que_no_estan(self):
+class TestConfigEnDisco(unittest.TestCase):
+    def test_sin_archivo_es_la_config_de_arranque(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "existe").mkdir()
-            (root / "repos.conf").write_text(
-                "# un comentario\n"
-                "\n"
-                f"{root / 'existe'}\n"
-                f"{root / 'no-existe'}\n"
-                f"{root / 'existe'}  # con comentario al final\n"
-            )
-            repos = adapters.read_repos(root)
-        self.assertEqual([p.name for p in repos], ["existe", "existe"])
+            with mock.patch.dict("os.environ", {"HARNESS_CONFIG_DIR": tmp}):
+                self.assertEqual(adapters.load_config(), default_config())
 
-    def test_repos_conf_del_repo_apunta_a_directorios(self):
-        for p in adapters.read_repos(support.ROOT):
+    def test_config_path_respeta_la_variable(self):
+        with mock.patch.dict("os.environ", {"HARNESS_CONFIG_DIR": "/x/y"}):
+            self.assertEqual(adapters.config_path(), Path("/x/y/config.json"))
+
+    def test_config_path_por_defecto(self):
+        entorno = {k: v for k, v in __import__("os").environ.items()
+                   if k not in ("HARNESS_CONFIG_DIR", "XDG_CONFIG_HOME")}
+        with mock.patch.dict("os.environ", entorno, clear=True):
+            self.assertEqual(adapters.config_path(),
+                             Path.home() / ".config" / "harness" / "config.json")
+
+    def test_lee_la_del_usuario(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "config.json"
+            conf.write_text(json.dumps({"contexts": {"trabajo": {
+                "tracker": {"kind": "github"},
+                "repos": {"root": tmp, "paths": []},
+                "autonomy": "manual",
+                "budget": {"polarity": "spent", "provider": "manual", "total": 200.0},
+                "run": {"kind": "local"}}}}))
+            cfg = adapters.load_config(conf)
+        self.assertEqual(cfg.names, ["trabajo"])
+
+    def test_json_roto_es_un_error_legible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "config.json"
+            conf.write_text("{no soy json")
+            with self.assertRaises(ConfigError) as e:
+                adapters.load_config(conf)
+        self.assertIn("JSON inválido", str(e.exception))
+        self.assertIn(str(conf), str(e.exception))
+
+    def test_config_invalida_nombra_el_archivo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "config.json"
+            conf.write_text(json.dumps({"contexts": {"x": {}}}))
+            with self.assertRaises(ConfigError) as e:
+                adapters.load_config(conf)
+        self.assertIn('contexto "x"', str(e.exception))
+
+
+class TestRepos(unittest.TestCase):
+    def test_ignora_los_que_no_estan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "existe").mkdir()
+            repos = adapters.repo_paths(Repos(root=tmp, paths=["existe", "no-existe"]))
+        self.assertEqual([p.name for p in repos], ["existe"])
+
+    def test_path_absoluto_no_cuelga_del_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "suelto").mkdir()
+            repos = adapters.repo_paths(
+                Repos(root="/no/existe", paths=[str(Path(tmp) / "suelto")]))
+        self.assertEqual([p.name for p in repos], ["suelto"])
+
+    def test_estrella_expande_los_repos_anidados(self):
+        """El caso entrevestidos: una carpeta contenedora con un repo por subproyecto."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for sub in ("ENTREVESTIDOS-BACK", "ENTREVESTIDOS-FRONT"):
+                (Path(tmp) / "entrevestidos" / sub / ".git").mkdir(parents=True)
+            (Path(tmp) / "entrevestidos" / "docs").mkdir()  # no es un repo
+            repos = adapters.repo_paths(Repos(root=tmp, paths=["entrevestidos/*"]))
+        self.assertEqual([p.name for p in repos],
+                         ["ENTREVESTIDOS-BACK", "ENTREVESTIDOS-FRONT"])
+
+    def test_la_carpeta_contenedora_y_sus_anidados_conviven(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ev" / ".git").mkdir(parents=True)
+            (Path(tmp) / "ev" / "back" / ".git").mkdir(parents=True)
+            repos = adapters.repo_paths(Repos(root=tmp, paths=["ev", "ev/*"]))
+        self.assertEqual([p.name for p in repos], ["ev", "back"])
+
+    def test_sin_duplicados(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "koku").mkdir()
+            repos = adapters.repo_paths(Repos(root=tmp, paths=["koku", "koku"]))
+        self.assertEqual(len(repos), 1)
+
+    def test_estrella_sobre_una_carpeta_que_no_existe(self):
+        self.assertEqual(adapters.repo_paths(Repos(root="/no/existe", paths=["x/*"])), [])
+
+    def test_los_repos_de_la_config_por_defecto_son_directorios(self):
+        for p in adapters.repo_paths(default_config().contexts[0].repos):
             self.assertTrue(p.is_dir())
-
-    def test_sin_repos_conf(self):
-        self.assertEqual(adapters.read_repos(Path("/no/existe")), [])
 
     def test_collect_repo_trae_crudo(self):
         """El adaptador no interpreta: issues normalizados a la forma que lee
@@ -225,15 +295,70 @@ class TestRepos(unittest.TestCase):
         self.assertIsNone(raw["issues"])
         self.assertTrue(all(c[0] == "git" for c in run.llamadas), run.llamadas)
 
-    def test_collect_offline_no_toca_nada_externo(self):
+    def test_tracker_que_no_es_github_no_llama_a_gh(self):
+        run = fake_run({
+            "git -C /x/wl branch": (True, "main"),
+            "git -C /x/wl remote": (True, "https://github.com/wl/groceries"),
+        })
+        with mock.patch.object(adapters, "run", run):
+            raw = adapters.collect_repo(Path("/x/wl"), tracker="jira")
+        self.assertEqual(raw["tracker"], "jira")
+        self.assertIsNone(raw["issues"])
+        self.assertTrue(all(c[0] == "git" for c in run.llamadas), run.llamadas)
+
+
+class TestCollect(unittest.TestCase):
+    def test_offline_no_toca_nada_externo(self):
         with mock.patch("urllib.request.urlopen",
                         side_effect=AssertionError("red en modo offline")), \
                 mock.patch.object(adapters, "run", fake_run({})):
-            crudo = adapters.collect(support.ROOT, offline=True)
+            crudo = adapters.collect(default_config().contexts, offline=True)
         self.assertTrue(crudo["offline"])
-        self.assertIsNone(crudo["credits"])
         self.assertIsNone(crudo["agents"])
-        self.assertEqual(sorted(crudo), ["agents", "credits", "offline", "repos"])
+        self.assertEqual(sorted(crudo), ["agents", "contexts", "offline"])
+        self.assertEqual([c["name"] for c in crudo["contexts"]], ["personal"])
+        self.assertIsNone(crudo["contexts"][0]["budget"]["credits"])
+
+    def test_un_crudo_por_contexto_con_su_declaracion(self):
+        cfg = support.config_dos_contextos()
+        with mock.patch.object(adapters, "run", fake_run({})):
+            crudo = adapters.collect(cfg.contexts, offline=True)
+        personal, trabajo = crudo["contexts"]
+        self.assertEqual(personal["name"], "personal")
+        self.assertEqual((trabajo["tracker"], trabajo["autonomy"], trabajo["run"]),
+                         ("jira", "manual", "ssh"))
+        self.assertEqual(trabajo["vault"], "~/wl-devlead-vault")
+        self.assertEqual(trabajo["budget"]["polarity"], "spent")
+
+    def test_el_token_del_tracker_no_sale_en_lo_crudo(self):
+        cfg = support.config_dos_contextos()
+        with mock.patch.object(adapters, "run", fake_run({})):
+            crudo = adapters.collect(cfg.contexts, offline=True)
+        self.assertNotIn("secreto-de-jira", json.dumps(crudo))
+
+    def test_los_credits_se_piden_una_sola_vez(self):
+        cfg = support.config_dos_contextos()
+        llamadas = []
+
+        def fake_credits(offline=False):
+            llamadas.append(offline)
+            return {"total_credits": 25.0, "total_usage": 1.0}
+
+        with mock.patch.object(adapters, "openrouter_credits", fake_credits), \
+                mock.patch.object(adapters, "run", fake_run({})):
+            crudo = adapters.collect(cfg.contexts)
+        self.assertEqual(len(llamadas), 1)
+        self.assertIsNotNone(crudo["contexts"][0]["budget"]["credits"])
+        # el contexto que no usa OpenRouter no se lleva los créditos ajenos
+        self.assertIsNone(crudo["contexts"][1]["budget"]["credits"])
+
+    def test_sin_contextos_openrouter_no_se_pide_nada(self):
+        cfg = support.config_dos_contextos()
+        solo_trabajo = [c for c in cfg.contexts if c.name == "trabajo"]
+        with mock.patch.object(adapters, "openrouter_credits",
+                               mock.Mock(side_effect=AssertionError("pidió créditos"))), \
+                mock.patch.object(adapters, "run", fake_run({})):
+            adapters.collect(solo_trabajo)
 
 
 if __name__ == "__main__":

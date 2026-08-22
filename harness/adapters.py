@@ -3,6 +3,10 @@
 Cada adaptador trae datos crudos y devuelve `None` cuando no pudo traerlos.
 Ninguno levanta excepción: un adaptador caído degrada su sección del snapshot
 en vez de llevarse la pantalla. La lógica está en `harness.snapshot`.
+
+La única excepción es `load_config`: una config rota no se degrada en silencio
+—sin contextos no hay nada que mirar— así que levanta `ConfigError` y el CLI la
+imprime como una línea de error.
 """
 
 from __future__ import annotations
@@ -16,9 +20,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from harness.config import (CONFIG_ENV, CONFIG_NAME, ConfigError, default_config,
+                            parse_config)
 from harness.snapshot import READINESS
 
-GITHUB_DIR = Path.home() / "Documents" / "Github"
 PI_MODELS = Path.home() / ".pi" / "agent" / "models.json"
 CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 
@@ -69,20 +74,65 @@ def herdr_agents(offline=False):
     return agents if isinstance(agents, list) else []
 
 
+# -------------------------------------------------------------------------- config
+def config_path():
+    """Dónde vive la config. `HARNESS_CONFIG_DIR` la mueve (los tests la usan)."""
+    override = os.environ.get(CONFIG_ENV)
+    if override:
+        return Path(override).expanduser() / CONFIG_NAME
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
+    return base / "harness" / CONFIG_NAME
+
+
+def load_config(path=None):
+    """La config del usuario, o la de arranque si todavía no escribió ninguna."""
+    path = Path(path) if path else config_path()
+    try:
+        texto = path.read_text()
+    except FileNotFoundError:
+        return default_config()
+    except OSError as e:
+        raise ConfigError("{}: no se pudo leer ({})".format(path, e.strerror))
+    try:
+        data = json.loads(texto)
+    except ValueError as e:
+        raise ConfigError("{}: JSON inválido ({})".format(path, e))
+    return parse_config(data, donde=str(path))
+
+
 # --------------------------------------------------------------------------- repos
-def read_repos(root):
-    conf = root / "repos.conf"
-    if not conf.exists():
-        return []
+def repo_paths(repos):
+    """Los repos de un contexto, ya en el disco.
+
+    Un path que termina en `/*` son los repos git que cuelgan de esa carpeta (el
+    caso entrevestidos: una carpeta contenedora con un repo por subproyecto). Lo
+    que no existe se saltea, como hacía `repos.conf`: un repo que no está todavía
+    no es un error de config.
+    """
+    root = Path(repos.root).expanduser()
     out = []
-    for line in conf.read_text().splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        p = Path(line) if Path(line).is_absolute() else GITHUB_DIR / line
-        if p.is_dir():
+    for entrada in repos.paths:
+        p = Path(entrada).expanduser()
+        if not p.is_absolute():
+            p = root / entrada
+        if p.name == "*":
+            out.extend(sorted(h for h in _subdirs(p.parent) if (h / ".git").exists()))
+        elif p.is_dir():
             out.append(p)
-    return out
+    vistos, unicos = set(), []
+    for p in out:
+        if str(p) not in vistos:
+            vistos.add(str(p))
+            unicos.append(p)
+    return unicos
+
+
+def _subdirs(path):
+    try:
+        return [h for h in path.iterdir() if h.is_dir()]
+    except OSError:
+        return []
 
 
 def slug_of(path):
@@ -178,8 +228,12 @@ def gh_graphql_issues(slug):
     return normalize_issues(nodes)
 
 
-def collect_repo(path, offline=False):
-    """Todo lo crudo de un repo. Una llamada por dato, en paralelo afuera."""
+def collect_repo(path, tracker="github", offline=False):
+    """Todo lo crudo de un repo. Una llamada por dato, en paralelo afuera.
+
+    `tracker` es el del contexto: sólo a un repo de un contexto con tracker de
+    GitHub tiene sentido pedirle issues y PRs con `gh`.
+    """
     ok, branch = run(["git", "-C", str(path), "branch", "--show-current"])
     branch = branch if ok else None
     ok, porcelain = run(["git", "-C", str(path), "status", "--porcelain"])
@@ -187,6 +241,7 @@ def collect_repo(path, offline=False):
     raw = {
         "name": path.name,
         "path": str(path),
+        "tracker": tracker,
         "slug": slug_of(path),  # git es local: también corre en modo sin adaptadores
         "branch": branch,
         "status_porcelain": porcelain if ok else None,
@@ -194,7 +249,7 @@ def collect_repo(path, offline=False):
         "issues": None,
         "prs": None,
     }
-    if offline or not raw["slug"]:
+    if offline or tracker != "github" or not raw["slug"]:
         return raw
 
     # La frontera sale de las dependencias nativas de GitHub (GraphQL). Si no
@@ -209,16 +264,44 @@ def collect_repo(path, offline=False):
     return raw
 
 
-def collect(root, offline=False, workers=8):
-    """Lo crudo de todos los adaptadores, en paralelo. Entrada de `snapshot()`."""
-    repos = read_repos(root)
-    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-        fut_credits = ex.submit(openrouter_credits, offline)
-        fut_agents = ex.submit(herdr_agents, offline)
-        raw_repos = list(ex.map(lambda p: collect_repo(p, offline), repos))
+def collect_budget(spec, credits):
+    """Lo crudo del presupuesto de un contexto. Los números los saca `snapshot`."""
     return {
-        "offline": offline,
-        "credits": fut_credits.result(),
-        "agents": fut_agents.result(),
-        "repos": raw_repos,
+        "polarity": spec.polarity,
+        "provider": spec.provider,
+        "credits": credits if spec.provider == "openrouter" else None,
+        "total": spec.total,
+        "used": spec.used,
     }
+
+
+def collect(contexts, offline=False, workers=8):
+    """Lo crudo de todos los contextos, en paralelo. Entrada de `snapshot()`.
+
+    Los agentes de herdr son de la máquina, no de un contexto: se piden una sola
+    vez. Los créditos de OpenRouter también, aunque los mire más de un contexto.
+    """
+    quiere_credits = any(c.budget.provider == "openrouter" for c in contexts)
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        fut_agents = ex.submit(herdr_agents, offline)
+        fut_credits = ex.submit(openrouter_credits, offline) if quiere_credits else None
+        pendientes = [
+            (c, [ex.submit(collect_repo, p, c.tracker.kind, offline)
+                 for p in repo_paths(c.repos)])
+            for c in contexts
+        ]
+        credits = fut_credits.result() if fut_credits else None
+        crudos = [
+            {
+                "name": c.name,
+                "tracker": c.tracker.kind,
+                "autonomy": c.autonomy,
+                "vault": c.vault,
+                "run": c.run.kind,
+                "budget": collect_budget(c.budget, credits),
+                "repos": [f.result() for f in futs],
+            }
+            for c, futs in pendientes
+        ]
+        agents = fut_agents.result()
+    return {"offline": offline, "agents": agents, "contexts": crudos}
