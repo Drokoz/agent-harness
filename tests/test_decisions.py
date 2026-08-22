@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from harness import adapters
 from harness.decisions import (adr_identity, as_list, decisions_for, note_identity,
                                render_decisions)
 
@@ -116,3 +117,46 @@ class TestRender(unittest.TestCase):
         texto = render_decisions([("vacio", [])], color=False)
         self.assertNotIn("\033", texto)
         self.assertIn("sin decisiones todavía", texto)
+
+
+class TestAdapters(unittest.TestCase):
+    def test_adr_files_ordenados(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            (t / "docs" / "adr").mkdir(parents=True)
+            (t / "docs" / "adr" / "0002-b.md").write_text("x")
+            (t / "docs" / "adr" / "0001-a.md").write_text("x")
+            (t / "docs" / "adr" / "README.txt").write_text("x")
+            self.assertEqual(
+                [f.name for f in adapters.adr_files(t)],
+                ["0001-a.md", "0002-b.md"])
+
+    def test_adr_files_sin_carpeta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(adapters.adr_files(Path(tmp)), [])
+
+    def test_memoria_de_claude_no_entra(self):
+        """AC: la memoria de Claude no se toca ni se fusiona."""
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            (t / "docs" / "adr").mkdir(parents=True)
+            (t / "CLAUDE.md").write_text("# Memoria de Claude\n")
+            (t / "AGENTS.md").write_text("cosas")
+            (t / "docs" / "adr" / "0001-a.md").write_text("x")
+            self.assertEqual([f.name for f in adapters.adr_files(t)], ["0001-a.md"])
+
+    def test_vault_decision_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            (t / "decisiones").mkdir()
+            (t / "diario").mkdir()  # otra carpeta de la taxonomía: no entra
+            (t / "decisiones" / "b.md").write_text("x")
+            (t / "decisiones" / "a.md").write_text("x")
+            (t / "diario" / "c.md").write_text("x")
+            self.assertEqual(
+                [f.name for f in adapters.vault_decision_files(str(t))],
+                ["a.md", "b.md"])
+
+    def test_vault_sin_declarar_ni_sin_carpeta(self):
+        self.assertEqual(adapters.vault_decision_files(None), [])
+        self.assertEqual(adapters.vault_decision_files("~/no-existe/vault"), [])
