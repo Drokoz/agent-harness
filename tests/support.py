@@ -46,9 +46,9 @@ def openrouter_credits():
     return fixture("openrouter_credits.json")["data"]
 
 
-# Un repo inventado para que el golden ejercite lo que las fixtures no tienen:
-# un issue bloqueado por otro abierto, uno "bloqueado" por uno ya cerrado, algo
-# sin triage y un PR en draft.
+# Un repo inventado para que el golden ejercite el fallback al parseo del body
+# (sin datos nativos): un issue bloqueado por otro abierto, uno "bloqueado" por
+# uno ya cerrado, algo sin triage y un PR en draft.
 KOKU_ISSUES = [
     {"number": 7, "title": "Cerrar caja del dia sin doble conteo",
      "labels": [{"name": "ready-for-agent"}], "body": "Sin bloqueos."},
@@ -75,9 +75,11 @@ def golden_raw():
         "credits": openrouter_credits(),
         "agents": herdr_agents(),
         "repos": [
+            # agent-harness con la fixture real de GraphQL: la frontera por
+            # dependencias nativas, que es el camino de por defecto.
             {"name": "agent-harness", "slug": "Drokoz/agent-harness", "branch": "ticket/3",
              "status_porcelain": " M bin/harness\n?? harness/\n", "exists": dict(READY_TODO),
-             "issues": gh_issues(), "prs": gh_prs()},
+             "issues": gh_issues_native(), "prs": gh_prs()},
             {"name": "koku", "slug": "Drokoz/koku", "branch": "main", "status_porcelain": "",
              "exists": {"gate": True, "skills": False, "context": False},
              "issues": KOKU_ISSUES, "prs": KOKU_PRS},
