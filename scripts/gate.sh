@@ -50,8 +50,8 @@ echo "$out"
 echo "$out" | grep -Eq 'Ran [1-9][0-9]* tests?' \
   || fail "la suite no corrió ningún test (¿descubrimiento roto?)"
 
-# 3) Corrida real del CLI: `harness status` sin excepción, exit 0.
-echo "== harness status"
-./bin/harness status >/dev/null || fail "harness status no sale 0"
+# 3) Corrida real del CLI, punta a punta y sin red: modo sin adaptadores.
+echo "== harness status (offline)"
+HARNESS_OFFLINE=1 ./bin/harness status >/dev/null || fail "harness status (offline) no sale 0"
 
 echo "VERDE"
