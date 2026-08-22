@@ -9,6 +9,12 @@ roto (nada se salta en silencio). Busca un intérprete de Python 3.9 explícito
 contextos —repos, tracker, autonomía, presupuesto, vault y cómo ejecutar— se declaran
 en `~/.config/harness/config.json`: ver `docs/harness/config.md`.
 
+`harness status` abre con el resumen de la mañana (PLAN.md, ticket #7): qué pasó desde
+la última vez que se miró —tickets con PR abierto, agentes trabados, PRs abiertos y
+costo del período— calculado del log JSONL de eventos. La marca de "última vez que
+miré" vive junto al log (`~/.local/state/harness/`, o `XDG_STATE_HOME`) y se
+actualiza sola; `--since <fecha>` mira otro período sin moverla.
+
 `harness run` es el dispatcher (PLAN.md, §11): lanza la frontera desbloqueada del
 contexto, un worktree y un pane de herdr por ticket, con tope de paralelismo
 (`--max`, por defecto 2). El gate es la red: ningún PR sin `scripts/gate.sh` verde,

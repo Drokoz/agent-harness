@@ -55,6 +55,35 @@ def bar(used, total, c, polarity="remaining", width=24):
     return f"{color}{'█' * filled}{c.dim}{'░' * (width - filled)}{c.off}"
 
 
+def _resumen(r, c, out):
+    """El resumen de la mañana, arriba de todo: qué pasó desde la última
+    vez que se miró, antes de lo accionable."""
+    if r.estado == "offline":
+        out("")
+        out(f" {c.bold}Resumen{c.off}     {c.dim}{OFFLINE_HINT}{c.off}")
+        return
+    desde = f"desde {r.desde}" if r.desde else "desde el principio"
+    out("")
+    out(f" {c.bold}Resumen{c.off}     {c.dim}{desde}{c.off}")
+    if not r.paso_algo:
+        out(f"   {c.dim}no pasó nada{c.off}")
+        return
+    if r.tickets:
+        out(f"   {c.grn}✓{c.off} {len(r.tickets)} tickets con PR abierto (gate verde)")
+        for t in r.tickets:
+            out(f"     · {t.contexto} {t.ref}: {t.detalle}")
+    if r.trabados:
+        out(f"   {c.red}⊘{c.off} {len(r.trabados)} trabado(s)")
+        for t in r.trabados:
+            out(f"     · {t.contexto} {t.ref}: {t.motivo[:72]}")
+    if r.prs:
+        out(f"   {c.yel}◌{c.off} {len(r.prs)} PR abierto(s) esperando review")
+        for p in r.prs:
+            out(f"     · {p.repo} #{p.number} {p.title[:60]}")
+    if r.costo > 0:
+        out(f"   costo del período: ${r.costo:.2f}")
+
+
 def _budget(b, c, out):
     etiqueta = PROVIDERS.get(b.provider, "Presupuesto")
     label = f" {c.bold}{etiqueta}{c.off}{' ' * max(1, 12 - len(etiqueta))}"
@@ -156,12 +185,18 @@ def _readiness(repos, c, out):
         out(f"   {r.name:<22} {marks}{hint}")
 
 
-def render(snap, quiet=False, color=True):
-    """La pantalla entera, lista para escribir en stdout."""
+def render(snap, quiet=False, color=True, resumen=None):
+    """La pantalla entera, lista para escribir en stdout.
+
+    `resumen` es el resumen de la mañana (ver `harness.summary`); cuando se
+    pasa, se dibuja arriba de todo. Sin él la pantalla es la de siempre.
+    """
     c = COLOR if color else PLAIN
     lines = [""]
     out = lines.append
 
+    if resumen is not None:
+        _resumen(resumen, c, out)
     _agents(snap.agents, c, out)
     if not snap.contexts:
         out("")

@@ -10,8 +10,9 @@ import unittest
 
 import support
 
-from harness.render import render
+from harness.render import OFFLINE_HINT, render
 from harness.snapshot import Agents, Budget, Context, Snapshot, snapshot
+from harness.summary import PrAbierto, Resumen
 
 SNAP = snapshot(support.golden_raw("personal"))
 TODOS = snapshot(support.golden_raw())
@@ -44,6 +45,63 @@ class TestGolden(unittest.TestCase):
 
     def test_render_no_depende_del_orden_de_llamada(self):
         self.assertEqual(render(SNAP, color=False), render(SNAP, color=False))
+
+
+class TestResumen(unittest.TestCase):
+    """El resumen de la mañana (ticket #7): arriba de todo, con lo accionable abajo."""
+
+    def pantalla(self, resumen):
+        return render(SNAP, resumen=resumen, color=False)
+
+    def test_el_resumen_queda_arriba_de_todo(self):
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    tickets=[Ticket(contexto="personal", ref="ticket/3",
+                                    detalle="PR #19 abierto (gate verde)")])
+        salida = self.pantalla(r)
+        self.assertLess(salida.index("Resumen"), salida.index("Agentes"))
+        self.assertIn("Trabajo", salida)  # lo accionable sigue ahí, abajo
+
+    def test_log_vacio_dice_que_no_paso_nada(self):
+        salida = self.pantalla(Resumen(estado="ok", desde="2026-08-21T23:00:00Z"))
+        self.assertIn("no pasó nada", salida)
+        self.assertIn("Agentes", salida)  # el resto de la pantalla se dibuja igual
+
+    def test_sin_marca_es_desde_el_principio(self):
+        self.assertIn("desde el principio", self.pantalla(Resumen(estado="ok")))
+
+    def test_un_solo_evento(self):
+        from harness.summary import Trabado
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    trabados=[Trabado(contexto="personal", ref="ticket/11",
+                                      motivo="agente bloqueado (aprobacion o pregunta)")])
+        salida = self.pantalla(r)
+        self.assertIn("1 trabado(s)", salida)
+        self.assertIn("ticket/11", salida)
+        self.assertNotIn("tickets con PR", salida)
+        self.assertNotIn("esperando review", salida)
+
+    def test_secciones_completas(self):
+        from harness.summary import Ticket, Trabado
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    tickets=[Ticket(contexto="personal", ref="ticket/3",
+                                    detalle="PR #19 abierto (gate verde)")],
+                    trabados=[Trabado(contexto="personal", ref="ticket/11",
+                                      motivo="gate rojo en el worktree: sin PR")],
+                    prs=[PrAbierto(repo="agent-harness", number=19, title="Fix")],
+                    costo=0.77)
+        salida = self.pantalla(r)
+        self.assertIn("1 tickets con PR abierto (gate verde)", salida)
+        self.assertIn("1 trabado(s)", salida)
+        self.assertIn("gate rojo en el worktree: sin PR", salida)
+        self.assertIn("1 PR abierto(s) esperando review", salida)
+        self.assertIn("· agent-harness #19 Fix", salida)
+        self.assertIn("costo del período: $0.77", salida)
+
+    def test_offline(self):
+        salida = self.pantalla(Resumen(estado="offline"))
+        self.assertIn("Resumen", salida)
+        self.assertIn(OFFLINE_HINT, salida)
 
 
 class TestColor(unittest.TestCase):
