@@ -129,6 +129,7 @@ class Repo:
     tracker: str
     slug: Optional[str]
     branch: str
+    path: str = ""  # dónde vive en el disco (el dispatcher crea worktrees a partir de acá)
     dirty: int
     ready: Dict[str, bool]
     missing: List[str] = field(default_factory=list)
@@ -279,6 +280,7 @@ def _repo(raw, offline=False):
         tracker=raw.get("tracker", "github"),
         slug=raw.get("slug"),
         branch=raw.get("branch") or "?",
+        path=raw.get("path", ""),
         dirty=dirty,
         ready=ready,
         missing=[desc for key, _, desc in READINESS if not ready[key]],
