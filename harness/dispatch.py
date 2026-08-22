@@ -38,7 +38,7 @@ COSTO_RE = re.compile(r"\$(\d+(?:\.\d+)?)")
 def una_linea(texto):
     """Los prompts se mandan en una sola línea: con saltos de línea herdr
     reporta éxito pero no entrega nada."""
-    return re.sub(r"[\r\n]+", " ", texto).strip()
+    return re.sub(r"\s+", " ", texto).strip()
 
 
 def nombre_agente(repo, issue):
@@ -308,8 +308,8 @@ class Dispatcher:
         if status == "blocked":
             self._abandonar(job, ref, "agente bloqueado (aprobacion o pregunta pendiente)")
             return True
-        if ok:
-            self.log.write("agente", ref, "se asieto: {}".format(status or "?"))
+        if ok and status:
+            self.log.write("agente", ref, "se asieto: {}".format(status))
             return False
         error = _json_field(out, ("error", "code"))
         if error == "timeout":
