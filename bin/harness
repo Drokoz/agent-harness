@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""harness — una sola pantalla con el estado del trabajo autónomo.
+"""harness — el estado del trabajo autónomo, y el dispatcher que lo mueve.
 
     harness status                  el contexto por defecto
     harness status --context work   uno solo
@@ -10,24 +10,32 @@
                                     ADRs por repo + notas de la vault
     harness decisions --json        lo mismo, parseable
 
+    harness run                     lanza la frontera del contexto por defecto
+    harness run --max 2             tope de tickets en paralelo (24 GB: dos)
+    harness run --kind pi           pi | claude | codex | ...
+    harness run --model xai/grok    modelo nativo del agente (opcional)
+    harness run --log PATH          dónde va el log JSONL de eventos
+
 v0 deliberadamente chico: NO es una app, es un script que imprime. La idea es vivir
 con él dos semanas y recién ahí especificar el dashboard de verdad, con datos de uso
-en vez de suposiciones. Ver ../PLAN.md §"centralizar".
+en vez de suposiciones. Ver ../PLAN.md §"centralizar" y §11 para `run`.
 
-Este archivo es sólo el pegamento: config -> adapters -> snapshot -> render -> stdout.
-Lo que hay que testear vive en `harness/snapshot.py`, que es una función pura.
-`decisions` es el mismo pegamento contra `harness/decisions.py`: los ADRs de cada
-repo (`docs/adr/`) más las notas de `decisiones/` de la vault del contexto, con la
-fuente de cada resultado. La vault se lee, no se administra, y la memoria de Claude
-no entra: es cómo trabajar con Tomás, no lo que aprende él.
+Este archivo es sólo el pegamento: config -> adapters -> snapshot -> render ->
+stdout, y para `run`: config -> adapters -> dispatcher. Lo que hay que testear
+vive en `harness/snapshot.py` y `harness/dispatch.py`. `decisions` es el mismo
+pegamento contra `harness/decisions.py`: los ADRs de cada repo (`docs/adr/`) más
+las notas de `decisiones/` de la vault del contexto, con la fuente de cada
+resultado. La vault se lee, no se administra, y la memoria de Claude no entra:
+es cómo trabajar con Tomás, no lo que aprende él.
 
 Los contextos —repos, tracker, autonomía, presupuesto, vault— se declaran en
 ~/.config/harness/config.json, fuera del repo porque ahí van las credenciales. Sin
-ese archivo corre con la config de arranque (ver `harness/config.py`). No escribe
-nada en ningún lado.
+ese archivo corre con la config de arranque (ver `harness/config.py`). `status`
+no escribe nada en ningún lado; `run` además deja el log JSONL de eventos.
 
 Con HARNESS_OFFLINE=1 corre en modo sin adaptadores: sin llamadas de red ni de
-gh/herdr. El gate lo usa para que el humo del CLI sea hermético.
+gh/herdr. El gate lo usa para que el humo del CLI sea hermético. `run` no existe
+en ese modo: un dispatcher sin mundo no es un dispatcher.
 """
 
 from __future__ import annotations
@@ -41,10 +49,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from harness.adapters import (adr_files, collect, load_config, repo_paths,
-                              vault_decision_files)  # noqa: E402
+from harness import adapters  # noqa: E402
+from harness.adapters import (adr_files, collect, load_config, openrouter_credits,
+                              repo_paths, vault_decision_files)  # noqa: E402
 from harness.config import ConfigError  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
+from harness.dispatch import (DispatchSpec, Dispatcher, EventLog, Job, cosechar)  # noqa: E402
 from harness.render import render  # noqa: E402
 from harness.snapshot import as_dict, snapshot  # noqa: E402
 
@@ -55,8 +65,9 @@ OFFLINE = os.environ.get("HARNESS_OFFLINE") == "1"
 def build_parser():
     p = argparse.ArgumentParser(prog="harness", description=__doc__.splitlines()[0])
     p.add_argument("command", nargs="?", default="status",
-                   choices=["status", "decisions"],
-                   help="status (la pantalla) o decisions (las decisiones cruzadas)")
+                   choices=["status", "decisions", "run"],
+                   help="status (la pantalla), decisions (las decisiones) o "
+                        "run (el dispatcher de la frontera)")
     p.add_argument("--context", metavar="NOMBRE",
                    help="un contexto en vez del de por defecto")
     p.add_argument("--all", action="store_true", dest="todos",
@@ -65,6 +76,14 @@ def build_parser():
                    help="sólo lo accionable: sin la tabla de readiness")
     p.add_argument("--json", action="store_true", dest="como_json",
                    help="el snapshot completo en JSON, en vez de la pantalla")
+    p.add_argument("--max", type=int, default=2, dest="maximo",
+                   help="run: tickets en paralelo (por defecto 2)")
+    p.add_argument("--kind", default="pi",
+                   help="run: kind de agente de herdr (por defecto pi)")
+    p.add_argument("--model", default="",
+                   help="run: modelo nativo del agente (opcional)")
+    p.add_argument("--log", default="",
+                   help="run: dónde va el log JSONL de eventos")
     return p
 
 
@@ -80,7 +99,7 @@ def decision_groups(contexts):
 
 
 def main(argv=None):
-    """Devuelve el código de salida. 2 = la config está mal y hay que arreglarla."""
+    """Devuelve el código de salida. 2 = la config está mal o el modo no sirve."""
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     try:
         contexts = load_config().select(args.context, todos=args.todos)
@@ -97,6 +116,8 @@ def main(argv=None):
         else:
             sys.stdout.write(render_decisions(groups, color=sys.stdout.isatty()))
         return 0
+    if args.command == "run":
+        return run_main(args, contexts)
 
     snap = snapshot(collect(contexts, offline=OFFLINE))
     if args.como_json:
@@ -104,6 +125,65 @@ def main(argv=None):
         sys.stdout.write("\n")
     else:
         sys.stdout.write(render(snap, quiet=args.quiet, color=sys.stdout.isatty()))
+    return 0
+
+
+def _estado_dir():
+    xdg = os.environ.get("XDG_STATE_HOME")
+    return Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+
+
+def _creditos_usado():
+    """Cuánto se llevó usado OpenRouter, para medir el costo de la corrida."""
+    data = openrouter_credits()
+    try:
+        return float(data["total_usage"])
+    except (TypeError, KeyError, ValueError):
+        return None
+
+
+def run_main(args, contexts):
+    """`harness run`: la frontera desbloqueada, en worktrees y panes aislados,
+    con tope de paralelismo, todo anotado en el log JSONL de eventos."""
+    log_path = (Path(args.log).expanduser() if args.log
+                else _estado_dir() / "harness" / "events.jsonl")
+    for ctx in contexts:
+        # Un contexto manual no delega: este comando no toma nada solo.
+        if ctx.autonomy == "manual":
+            sys.stdout.write('harness: contexto "{}": autonomía manual, '
+                             'este comando no toma nada solo\n'.format(ctx.name))
+            continue
+        if OFFLINE or os.environ.get("HERDR_ENV") != "1":
+            sys.stderr.write("harness: run necesita adaptadores y una sesión de "
+                             "herdr (sin HARNESS_OFFLINE, con HERDR_ENV=1)\n")
+            return 2
+        snap = snapshot(collect([ctx]))
+        log = EventLog(log_path, ctx.name)
+        jobs = []
+        for r in snap.contexts[0].repos:
+            if not r.slug:
+                continue
+            cosechar(r.slug, adapters.run, log)
+            # Sin gate no hay nada que esté "verde": no se despacha el repo.
+            if not r.ready.get("gate"):
+                continue
+            for i in r.frontier:
+                jobs.append(Job(repo=r.name, repo_path=r.path, slug=r.slug,
+                                issue=i.number))
+        if not jobs:
+            sys.stdout.write('harness: "{}": nada en la frontera\n'.format(ctx.name))
+            continue
+        spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
+                            kind=args.kind, model=args.model)
+        disp = Dispatcher(spec, log, run_cmd=adapters.run,
+                          credits=_creditos_usado
+                          if ctx.budget.provider == "openrouter" else None)
+        resultados = disp.dispatch(jobs)
+        for j in resultados:
+            estado = "OK       " if j.estado == "hecho" else "ABANDONADO"
+            detalle = j.motivo if j.estado != "hecho" else "PR abierto (gate verde)"
+            sys.stdout.write("  {} #{}/{} {}\n".format(estado, j.issue, j.repo, detalle))
+        sys.stdout.write("harness: log de eventos {}\n".format(log.path))
     return 0
 
 

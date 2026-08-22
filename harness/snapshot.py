@@ -129,7 +129,6 @@ class Repo:
     tracker: str
     slug: Optional[str]
     branch: str
-    path: str = ""  # dónde vive en el disco (el dispatcher crea worktrees a partir de acá)
     dirty: int
     ready: Dict[str, bool]
     missing: List[str] = field(default_factory=list)
@@ -139,6 +138,7 @@ class Repo:
     prs: List[Pr] = field(default_factory=list)
     degraded: List[str] = field(default_factory=list)
     frontier_source: Optional[str] = None  # "native" | "body" | None
+    path: str = ""  # dónde vive en el disco (el dispatcher crea worktrees a partir de acá)
 
     @property
     def has_work(self):
