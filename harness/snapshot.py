@@ -138,6 +138,7 @@ class Repo:
     prs: List[Pr] = field(default_factory=list)
     degraded: List[str] = field(default_factory=list)
     frontier_source: Optional[str] = None  # "native" | "body" | None
+    closed_count: Optional[int] = None  # issues cerrados: sin esto sólo se sabe cuánto queda
     path: str = ""  # dónde vive en el disco (el dispatcher crea worktrees a partir de acá)
 
     @property
@@ -290,6 +291,7 @@ def _repo(raw, offline=False):
         # ni PRs que traer: el repo sigue existiendo y sigue contando en readiness.
         return repo
 
+    repo.closed_count = raw.get("closed_count")
     issues, prs = raw.get("issues"), raw.get("prs")
     if issues is None:
         repo.degraded.append("issues")

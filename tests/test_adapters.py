@@ -99,8 +99,9 @@ class TestGhGraphqlIssues(unittest.TestCase):
         fixture = json.dumps(support.fixture("gh_issue_graphql.json"))
         run = fake_run({"gh api graphql": (True, fixture)})
         with mock.patch.object(adapters, "run", run):
-            issues = adapters.gh_graphql_issues("Drokoz/agent-harness")
+            issues, cerrados = adapters.gh_graphql_issues("Drokoz/agent-harness")
         por_num = {i["number"]: i for i in issues}
+        self.assertIsInstance(cerrados, (int, type(None)))
         self.assertEqual(sorted(por_num), [1, 4, 5, 6, 7, 8, 9, 12, 15])
         self.assertEqual(por_num[8]["blocked_by"], 2)   # dos bloqueantes abiertos
         self.assertEqual(por_num[12]["blocked_by"], 0)  # bloqueante cerrado: no cuenta
@@ -108,22 +109,22 @@ class TestGhGraphqlIssues(unittest.TestCase):
 
     def test_gh_caido_es_none(self):
         with mock.patch.object(adapters, "run", fake_run({})):
-            self.assertIsNone(adapters.gh_graphql_issues("o/r"))
+            self.assertEqual(adapters.gh_graphql_issues("o/r"), (None, None))
 
     def test_respuesta_con_errors_es_none(self):
         malo = json.dumps({"data": {"repository": None}, "errors": [{"message": "boom"}]})
         with mock.patch.object(adapters, "run", fake_run({"gh api graphql": (True, malo)})):
-            self.assertIsNone(adapters.gh_graphql_issues("o/r"))
+            self.assertEqual(adapters.gh_graphql_issues("o/r"), (None, None))
 
     def test_json_roto_es_none(self):
         with mock.patch.object(adapters, "run",
                                fake_run({"gh api graphql": (True, "no soy json")})):
-            self.assertIsNone(adapters.gh_graphql_issues("o/r"))
+            self.assertEqual(adapters.gh_graphql_issues("o/r"), (None, None))
 
     def test_sin_slug_es_none(self):
         with mock.patch.object(adapters, "run",
                                mock.Mock(side_effect=AssertionError("llamó a gh"))):
-            self.assertIsNone(adapters.gh_graphql_issues("sin-barra"))
+            self.assertEqual(adapters.gh_graphql_issues("sin-barra"), (None, None))
 
     def test_pagina_hasta_dos_paginas(self):
         p1 = {"data": {"repository": {"issues": {
@@ -139,12 +140,33 @@ class TestGhGraphqlIssues(unittest.TestCase):
             return True, json.dumps(p1 if len(llamadas) == 1 else p2)
 
         with mock.patch.object(adapters, "run", _run):
-            issues = adapters.gh_graphql_issues("o/r")
+            issues, _ = adapters.gh_graphql_issues("o/r")
         self.assertEqual([i["number"] for i in issues], [1, 2])
         self.assertEqual(issues[1]["blocked_by"], 3)
         self.assertEqual(len(llamadas), 2)
         self.assertNotIn("after=", llamadas[0])
         self.assertIn("after=CUR", llamadas[1])
+
+    def test_cerrados_se_leen_una_vez_y_sobreviven_a_la_paginacion(self):
+        """El totalCount viene en la primera página; la segunda no lo repite y no
+        debe borrarlo — si se pisara, un repo paginado reportaría 0 cerrados."""
+        p1 = {"data": {"repository": {
+            "cerrados": {"totalCount": 42},
+            "issues": {"nodes": [{"number": 1}],
+                       "pageInfo": {"hasNextPage": True, "endCursor": "CUR"}}}}}
+        p2 = {"data": {"repository": {
+            "issues": {"nodes": [{"number": 2}],
+                       "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
+        n = []
+
+        def _run(args, cwd=None, timeout=30):
+            n.append(1)
+            return True, json.dumps(p1 if len(n) == 1 else p2)
+
+        with mock.patch.object(adapters, "run", _run):
+            issues, cerrados = adapters.gh_graphql_issues("o/r")
+        self.assertEqual(cerrados, 42)
+        self.assertEqual([i["number"] for i in issues], [1, 2])
 
 
 class TestConfigEnDisco(unittest.TestCase):

@@ -73,7 +73,7 @@ OFFLINE = os.environ.get("HARNESS_OFFLINE") == "1"
 def build_parser():
     p = argparse.ArgumentParser(prog="harness", description=__doc__.splitlines()[0])
     p.add_argument("command", nargs="?", default="status",
-                   choices=["status", "decisions", "run"],
+                   choices=["status", "decisions", "run", "report"],
                    help="status (la pantalla), decisions (las decisiones) o "
                         "run (el dispatcher de la frontera)")
     p.add_argument("--context", metavar="NOMBRE",
@@ -137,6 +137,15 @@ def main(argv=None):
                          "8601 (p.ej. 2026-08-21)\n")
         return 2
     resumen = resumen_de(args, snap)
+    if args.command == "report":
+        # El reporte consume el MISMO dict que emite --json: es el contrato que el
+        # spec fijó entre el núcleo y cualquier frontend. Si mañana la web se escribe
+        # en otro lenguaje, consume esto y no las internas.
+        from harness.report import render_html
+        data = as_dict(snap)
+        data["resumen"] = resumen_as_dict(resumen)
+        sys.stdout.write(render_html(data))
+        return 0
     if args.como_json:
         data = as_dict(snap)
         data["resumen"] = resumen_as_dict(resumen)

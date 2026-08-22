@@ -182,6 +182,7 @@ def gh_json(slug, args):
 ISSUES_GQL = """
 query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
+    cerrados: issues(states: [CLOSED]) { totalCount }
     issues(states: [OPEN], first: 100, after: $after) {
       nodes {
         number
@@ -222,12 +223,16 @@ def normalize_issues(nodes):
 
 
 def gh_graphql_issues(slug):
-    """Issues abiertos con dependencias nativas, vía GraphQL. None si gh no
-    contesta o la consulta falla: el llamador usa el fallback REST."""
+    """Issues abiertos con dependencias nativas y el conteo de cerrados, vía GraphQL.
+
+    Devuelve (issues, cerrados). `(None, None)` si gh no contesta o la consulta
+    falla: el llamador usa el fallback REST. El conteo de cerrados va en la misma
+    consulta a propósito — sacarlo por REST agregaría una llamada por repo y
+    rompería el invariante de que los issues abiertos no salen del REST."""
     owner, sep, name = slug.partition("/")
     if not sep or not owner or not name:
-        return None
-    nodes, after = [], None
+        return None, None
+    nodes, after, cerrados = [], None, None
     for _ in range(2):
         args = ["api", "graphql", "-f", "query=" + ISSUES_GQL,
                 "-F", "owner=" + owner, "-F", "name=" + name]
@@ -235,20 +240,23 @@ def gh_graphql_issues(slug):
             args += ["-F", "after=" + after]
         ok, out = run(["gh", *args])
         if not ok:
-            return None
+            return None, None
         try:
             data = json.loads(out)
         except ValueError:
-            return None
+            return None, None
         if data.get("errors"):
-            return None
-        issues = (data.get("data") or {}).get("repository", {}).get("issues") or {}
+            return None, None
+        repo_node = (data.get("data") or {}).get("repository") or {}
+        if cerrados is None:
+            cerrados = (repo_node.get("cerrados") or {}).get("totalCount")
+        issues = repo_node.get("issues") or {}
         nodes.extend(issues.get("nodes") or [])
         info = issues.get("pageInfo") or {}
         after = info.get("endCursor") if info.get("hasNextPage") else None
         if not after:
             break
-    return normalize_issues(nodes)
+    return normalize_issues(nodes), cerrados
 
 
 def collect_repo(path, tracker="github", offline=False):
@@ -277,7 +285,7 @@ def collect_repo(path, tracker="github", offline=False):
 
     # La frontera sale de las dependencias nativas de GitHub (GraphQL). Si no
     # están disponibles, cae al REST y `snapshot` parsea el body como fallback.
-    raw["issues"] = gh_graphql_issues(raw["slug"])
+    raw["issues"], raw["closed_count"] = gh_graphql_issues(raw["slug"])
     if raw["issues"] is None:
         rest = gh_json(raw["slug"], ["issue", "list", "--state", "open", "--limit", "200",
                                      "--json", "number,title,labels,body"])
