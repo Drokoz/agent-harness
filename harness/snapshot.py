@@ -22,6 +22,12 @@ La forma de `raw` (ver `harness.adapters.collect`):
           "branch": str | None,
           "status_porcelain": str | None,  # salida cruda de git status --porcelain
           "exists": {clave_de_READINESS: bool},
+          # Issue: {"number": int, "title": str, "body": str,
+          #         "labels": [{"name": str}],
+          #         "blocked_by": int | None}  # bloqueantes abiertos según las
+          #                                     # dependencias nativas de GitHub;
+          #                                     # None = sin datos nativos,
+          #                                     # se parsea el body (fallback)
           "issues": [ {...} ] | None,      # None = gh no contestó
           "prs": [ {...} ] | None,
         },
@@ -102,6 +108,7 @@ class Repo:
     triage: List[Issue] = field(default_factory=list)
     prs: List[Pr] = field(default_factory=list)
     degraded: List[str] = field(default_factory=list)
+    frontier_source: Optional[str] = None  # "native" | "body" | None
 
     @property
     def has_work(self):
@@ -167,8 +174,10 @@ def _agents(raw, offline):
 def _issues(raw):
     """Parte los issues en frontera, bloqueados y sin triage.
 
-    Un issue está bloqueado sólo si alguno de sus bloqueantes sigue abierto: un
-    "Blocked by #99" que ya se cerró no lo saca de la frontera.
+    Un issue está bloqueado sólo si le quedan bloqueantes abiertos. La fuente de
+    verdad son las dependencias nativas de GitHub (`blocked_by`: bloqueantes
+    abiertos, lo que ve la UI); el parseo del body (`blockers_of`) queda como
+    fallback para los issues sin datos nativos.
     """
     open_nums = {i["number"] for i in raw}
     frontier, blocked, triage = [], [], []
@@ -179,9 +188,23 @@ def _issues(raw):
             triage.append(issue)
         if AGENT_LABEL not in labels:
             continue
-        pendientes = blockers_of(i.get("body")) & open_nums
-        (blocked if pendientes else frontier).append(issue)
+        blocked_by = i.get("blocked_by")
+        if blocked_by is not None:
+            es_bloqueado = int(blocked_by) > 0
+        else:
+            es_bloqueado = bool(blockers_of(i.get("body")) & open_nums)
+        (blocked if es_bloqueado else frontier).append(issue)
     return frontier, blocked, triage
+
+
+def _issues_source(issues):
+    """De dónde salió la frontera de este repo: dependencias nativas o parseo
+    del body. None cuando no hay issues que clasificar."""
+    if not issues:
+        return None
+    if all(i.get("blocked_by") is not None for i in issues):
+        return "native"
+    return "body"
 
 
 def _repo(raw, offline=False):
@@ -207,6 +230,7 @@ def _repo(raw, offline=False):
         repo.degraded.append("issues")
     else:
         repo.frontier, repo.blocked, repo.triage = _issues(issues)
+        repo.frontier_source = _issues_source(issues)
     if prs is None:
         repo.degraded.append("prs")
     else:

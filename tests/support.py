@@ -15,6 +15,8 @@ GOLDEN = ROOT / "tests" / "golden"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from harness.adapters import normalize_issues  # noqa: E402
+
 
 def fixture(name):
     """Una salida cruda capturada del mundo real. Ver tests/fixtures/README.md."""
@@ -23,6 +25,13 @@ def fixture(name):
 
 def gh_issues():
     return fixture("gh_issue_list.json")
+
+
+def gh_issues_native():
+    """Issues con dependencias nativas: la respuesta real de GraphQL, normalizada
+    igual que la trae el adaptador."""
+    nodes = fixture("gh_issue_graphql.json")["data"]["repository"]["issues"]["nodes"]
+    return normalize_issues(nodes)
 
 
 def gh_prs():
