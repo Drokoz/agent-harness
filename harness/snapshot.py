@@ -9,27 +9,45 @@ que los tests necesitan mirar.
 Un adaptador caído llega como `None` y degrada su sección: esa parte queda vacía
 y marcada en `degraded`, el resto del snapshot se calcula igual.
 
+El snapshot es por contexto: cada uno trae su presupuesto, sus repos y su frontera.
+Los agentes de herdr son de la máquina, así que viven arriba de los contextos.
+
 La forma de `raw` (ver `harness.adapters.collect`):
 
     {
       "offline": bool,
-      "credits": {"total_credits": float, "total_usage": float} | None,
       "agents": [ {...} ] | None,          # None = no hay sesión de herdr
-      "repos": [
+      "contexts": [
         {
           "name": str,
-          "slug": str | None,              # None = repo sin remote de GitHub
-          "branch": str | None,
-          "status_porcelain": str | None,  # salida cruda de git status --porcelain
-          "exists": {clave_de_READINESS: bool},
-          # Issue: {"number": int, "title": str, "body": str,
-          #         "labels": [{"name": str}],
-          #         "blocked_by": int | None}  # bloqueantes abiertos según las
-          #                                     # dependencias nativas de GitHub;
-          #                                     # None = sin datos nativos,
-          #                                     # se parsea el body (fallback)
-          "issues": [ {...} ] | None,      # None = gh no contestó
-          "prs": [ {...} ] | None,
+          "tracker": "github" | "jira",
+          "autonomy": "frontier" | "manual",
+          "vault": str | None,
+          "run": "local" | "ssh",
+          "budget": {
+            "polarity": "remaining" | "spent",
+            "provider": "openrouter" | "manual" | "none",
+            "credits": {"total_credits": float, "total_usage": float} | None,
+            "total": float, "used": float,   # sólo con provider "manual"
+          },
+          "repos": [
+            {
+              "name": str,
+              "tracker": str,
+              "slug": str | None,              # None = repo sin remote de GitHub
+              "branch": str | None,
+              "status_porcelain": str | None,  # salida cruda de git status --porcelain
+              "exists": {clave_de_READINESS: bool},
+              # Issue: {"number": int, "title": str, "body": str,
+              #         "labels": [{"name": str}],
+              #         "blocked_by": int | None}  # bloqueantes abiertos según las
+              #                                     # dependencias nativas de GitHub;
+              #                                     # None = sin datos nativos,
+              #                                     # se parsea el body (fallback)
+              "issues": [ {...} ] | None,      # None = gh no contestó
+              "prs": [ {...} ] | None,
+            },
+          ],
         },
       ],
     }
@@ -38,9 +56,11 @@ La forma de `raw` (ver `harness.adapters.collect`):
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import PurePosixPath
 from typing import Dict, List, Optional
+
+SCHEMA_VERSION = 1
 
 AGENT_LABEL = "ready-for-agent"
 TRIAGE_LABEL = "needs-triage"
@@ -56,13 +76,21 @@ READINESS = [
 
 @dataclass
 class Budget:
-    """Presupuesto de OpenRouter. `state`: offline | ok | missing."""
+    """El presupuesto de un contexto. `state`: offline | ok | missing | unset.
+
+    `polarity` es para qué lado se mira, y son objetivos opuestos: en personal
+    `remaining` (que no se acabe), en trabajo `spent` (que no sobre). El número
+    es el mismo; lo que cambia es qué significa que esté alto.
+    """
 
     state: str
+    polarity: str = "remaining"
+    provider: str = "none"
     total: float = 0.0
     used: float = 0.0
     left: float = 0.0
     tickets: int = 0
+    ratio: float = 0.0
 
 
 @dataclass
@@ -98,6 +126,7 @@ class Pr:
 @dataclass
 class Repo:
     name: str
+    tracker: str
     slug: Optional[str]
     branch: str
     dirty: int
@@ -117,11 +146,23 @@ class Repo:
 
 
 @dataclass
+class Context:
+    """Un contexto ya resuelto: lo que declaró la config más lo que trajo el mundo."""
+
+    name: str
+    tracker: str
+    autonomy: str
+    run: str
+    vault: Optional[str]
+    budget: Budget
+    repos: List[Repo] = field(default_factory=list)
+
+
+@dataclass
 class Snapshot:
     offline: bool
-    budget: Budget
     agents: Agents
-    repos: List[Repo] = field(default_factory=list)
+    contexts: List[Context] = field(default_factory=list)
 
 
 BLOCKED_RE = re.compile(r"blocked by[:\s]*((?:#\d+[,\s]*)+)", re.I)
@@ -133,17 +174,38 @@ def blockers_of(body):
     return {int(n) for n in re.findall(r"#(\d+)", m.group(1))} if m else set()
 
 
-def _budget(credits, offline):
+def _budget(raw, offline):
+    raw = raw or {}
+    polarity = raw.get("polarity", "remaining")
+    provider = raw.get("provider", "none")
+    base = dict(polarity=polarity, provider=provider)
     if offline:
-        return Budget(state="offline")
-    try:
-        total = float(credits["total_credits"])
-        used = float(credits["total_usage"])
-    except (TypeError, KeyError, ValueError):
-        return Budget(state="missing")
+        return Budget(state="offline", **base)
+    if provider == "none":
+        return Budget(state="unset", **base)
+    if provider == "openrouter":
+        credits = raw.get("credits")
+        try:
+            total = float(credits["total_credits"])
+            used = float(credits["total_usage"])
+        except (TypeError, KeyError, ValueError):
+            return Budget(state="missing", **base)
+    else:
+        try:
+            total = float(raw.get("total"))
+            used = float(raw.get("used") or 0.0)
+        except (TypeError, ValueError):
+            return Budget(state="missing", **base)
     left = total - used
-    tickets = int(left / COSTO_TICKET) if COSTO_TICKET else 0
-    return Budget(state="ok", total=total, used=used, left=left, tickets=tickets)
+    return Budget(
+        state="ok",
+        total=total,
+        used=used,
+        left=left,
+        tickets=int(left / COSTO_TICKET) if COSTO_TICKET else 0,
+        ratio=(used / total) if total else 0.0,
+        **base
+    )
 
 
 def _agents(raw, offline):
@@ -214,15 +276,16 @@ def _repo(raw, offline=False):
 
     repo = Repo(
         name=raw.get("name", "?"),
+        tracker=raw.get("tracker", "github"),
         slug=raw.get("slug"),
         branch=raw.get("branch") or "?",
         dirty=dirty,
         ready=ready,
         missing=[desc for key, _, desc in READINESS if not ready[key]],
     )
-    if offline or not repo.slug:
-        # Sin remote de GitHub —o sin adaptadores— no hay issues ni PRs que traer:
-        # el repo sigue existiendo y sigue contando para la tabla de readiness.
+    if offline or repo.tracker != "github" or not repo.slug:
+        # Sin remote de GitHub, con otro tracker, o sin adaptadores, no hay issues
+        # ni PRs que traer: el repo sigue existiendo y sigue contando en readiness.
         return repo
 
     issues, prs = raw.get("issues"), raw.get("prs")
@@ -241,12 +304,32 @@ def _repo(raw, offline=False):
     return repo
 
 
+def _context(raw, offline):
+    return Context(
+        name=raw.get("name", "?"),
+        tracker=raw.get("tracker", "github"),
+        autonomy=raw.get("autonomy", "?"),
+        run=raw.get("run", "?"),
+        vault=raw.get("vault"),
+        budget=_budget(raw.get("budget"), offline),
+        repos=[_repo(r, offline) for r in raw.get("repos", [])],
+    )
+
+
 def snapshot(raw):
     """Todo el estado, en una estructura que sólo hay que dibujar."""
     offline = bool(raw.get("offline"))
     return Snapshot(
         offline=offline,
-        budget=_budget(raw.get("credits"), offline),
         agents=_agents(raw.get("agents"), offline),
-        repos=[_repo(r, offline) for r in raw.get("repos", [])],
+        contexts=[_context(c, offline) for c in raw.get("contexts", [])],
     )
+
+
+def as_dict(snap):
+    """El snapshot como JSON: el contrato con cualquier cosa que no sea la terminal.
+
+    `version` está para que un consumidor sepa contra qué forma se escribió; sube
+    cuando un campo cambia de significado o desaparece.
+    """
+    return dict(version=SCHEMA_VERSION, **asdict(snap))

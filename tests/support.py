@@ -15,7 +15,9 @@ GOLDEN = ROOT / "tests" / "golden"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# Después de tocar sys.path: si no, `harness` todavía no es importable.
 from harness.adapters import normalize_issues  # noqa: E402
+from harness.config import parse_config  # noqa: E402
 
 
 def fixture(name):
@@ -67,24 +69,90 @@ KOKU_PRS = [
 
 READY_TODO = {"gate": True, "skills": True, "context": True}
 
+# Los dos contextos del PLAN, con las dos polaridades de presupuesto y los dos
+# trackers. El token está para que los tests puedan verificar que no se filtra.
+DOS_CONTEXTOS = {
+    "default_context": "personal",
+    "contexts": {
+        "personal": {
+            "tracker": {"kind": "github"},
+            "repos": {"root": "~/Documents/Github", "paths": ["agent-harness", "koku"]},
+            "autonomy": "frontier",
+            "budget": {"polarity": "remaining", "provider": "openrouter"},
+            "vault": "~/notas",
+            "run": {"kind": "local"},
+        },
+        "trabajo": {
+            "tracker": {"kind": "jira", "url": "https://wl.atlassian.net",
+                        "project": "GRO", "token": "secreto-de-jira"},
+            "repos": {"root": "~/work", "paths": ["groceries-wl"]},
+            "autonomy": "manual",
+            "budget": {"polarity": "spent", "provider": "manual",
+                       "total": 200.0, "used": 128.4},
+            "vault": "~/wl-devlead-vault",
+            "run": {"kind": "ssh", "host": "wl@localhost"},
+        },
+    },
+}
 
-def golden_raw():
-    """El escenario fijo del golden: lo crudo, tal como lo devuelven los adaptadores."""
+
+def config_dos_contextos():
+    return parse_config(DOS_CONTEXTOS)
+
+
+def raw_personal():
+    """El contexto personal del golden, tal como lo devuelven los adaptadores."""
     return {
-        "offline": False,
-        "credits": openrouter_credits(),
-        "agents": herdr_agents(),
+        "name": "personal",
+        "tracker": "github",
+        "autonomy": "frontier",
+        "vault": "~/notas",
+        "run": "local",
+        "budget": {"polarity": "remaining", "provider": "openrouter",
+                   "credits": openrouter_credits(), "total": 0.0, "used": 0.0},
         "repos": [
             # agent-harness con la fixture real de GraphQL: la frontera por
             # dependencias nativas, que es el camino de por defecto.
-            {"name": "agent-harness", "slug": "Drokoz/agent-harness", "branch": "ticket/3",
-             "status_porcelain": " M bin/harness\n?? harness/\n", "exists": dict(READY_TODO),
-             "issues": gh_issues_native(), "prs": gh_prs()},
-            {"name": "koku", "slug": "Drokoz/koku", "branch": "main", "status_porcelain": "",
+            {"name": "agent-harness", "tracker": "github", "slug": "Drokoz/agent-harness",
+             "branch": "ticket/3", "status_porcelain": " M bin/harness\n?? harness/\n",
+             "exists": dict(READY_TODO), "issues": gh_issues_native(), "prs": gh_prs()},
+            {"name": "koku", "tracker": "github", "slug": "Drokoz/koku", "branch": "main",
+             "status_porcelain": "",
              "exists": {"gate": True, "skills": False, "context": False},
              "issues": KOKU_ISSUES, "prs": KOKU_PRS},
-            {"name": "sin-remote", "slug": None, "branch": "main", "status_porcelain": "",
+            {"name": "sin-remote", "tracker": "github", "slug": None, "branch": "main",
+             "status_porcelain": "",
              "exists": {"gate": False, "skills": False, "context": False},
              "issues": None, "prs": None},
         ],
+    }
+
+
+def raw_trabajo():
+    """El contexto trabajo: tracker Jira (todavía sin adaptador) y presupuesto a gastar."""
+    return {
+        "name": "trabajo",
+        "tracker": "jira",
+        "autonomy": "manual",
+        "vault": "~/wl-devlead-vault",
+        "run": "ssh",
+        "budget": {"polarity": "spent", "provider": "manual", "credits": None,
+                   "total": 200.0, "used": 128.4},
+        "repos": [
+            {"name": "groceries-wl", "tracker": "jira", "slug": "wl/groceries",
+             "branch": "develop", "status_porcelain": " M pom.xml\n",
+             "exists": {"gate": True, "skills": False, "context": True},
+             "issues": None, "prs": None},
+        ],
+    }
+
+
+def golden_raw(*nombres):
+    """El escenario fijo del golden: lo crudo, tal como sale de `adapters.collect`."""
+    disponibles = {"personal": raw_personal, "trabajo": raw_trabajo}
+    nombres = nombres or ("personal", "trabajo")
+    return {
+        "offline": False,
+        "agents": herdr_agents(),
+        "contexts": [disponibles[n]() for n in nombres],
     }

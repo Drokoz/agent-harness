@@ -38,3 +38,12 @@
    koku                   ✓   ·   ·  falta: /setup-matt-pocock-skills corrido
    sin-remote             ·   ·   ·  falta: el gate: única fuente de verdad de 'esto mergea'
 
+ ▸ trabajo  jira · manual · ssh · vault ~/wl-devlead-vault
+ Presupuesto ███████████████░░░░░░░░░  $128.40 de $200.00 usados  64% del presupuesto
+
+ Trabajo
+   tracker jira: todavía sin adaptador, no hay tickets que mostrar
+
+ Listo para el harness   gate  skills  context
+   groceries-wl           ✓   ·   ✓  falta: /setup-matt-pocock-skills corrido
+
