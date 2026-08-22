@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """harness — una sola pantalla con el estado del trabajo autónomo.
 
-    harness status        qué está pasando ahora y qué le falta a cada repo
-    harness status -q     sólo lo accionable (sin la tabla de readiness)
+    harness status                  el contexto por defecto
+    harness status --context work   uno solo
+    harness status --all            todos juntos, para el vistazo de la mañana
+    harness status -q               sólo lo accionable (sin la tabla de readiness)
+    harness status --json           el snapshot completo, parseable
 
 v0 deliberadamente chico: NO es una app, es un script que imprime. La idea es vivir
 con él dos semanas y recién ahí especificar el dashboard de verdad, con datos de uso
 en vez de suposiciones. Ver ../PLAN.md §"centralizar".
 
-Este archivo es sólo el pegamento: adapters -> snapshot -> render -> stdout.
+Este archivo es sólo el pegamento: config -> adapters -> snapshot -> render -> stdout.
 Lo que hay que testear vive en `harness/snapshot.py`, que es una función pura.
 
-Lee la key de OpenRouter de ~/.pi/agent/models.json (la misma que usa pi) y los repos
-de ../repos.conf. No escribe nada en ningún lado.
+Los contextos —repos, tracker, autonomía, presupuesto, vault— se declaran en
+~/.config/harness/config.json, fuera del repo porque ahí van las credenciales. Sin
+ese archivo corre con la config de arranque (ver `harness/config.py`). No escribe
+nada en ningún lado.
 
 Con HARNESS_OFFLINE=1 corre en modo sin adaptadores: sin llamadas de red ni de
 gh/herdr. El gate lo usa para que el humo del CLI sea hermético.
@@ -20,6 +25,8 @@ gh/herdr. El gate lo usa para que el humo del CLI sea hermético.
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -27,19 +34,47 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from harness.adapters import collect  # noqa: E402
+from harness.adapters import collect, load_config  # noqa: E402
+from harness.config import ConfigError  # noqa: E402
 from harness.render import render  # noqa: E402
-from harness.snapshot import snapshot  # noqa: E402
+from harness.snapshot import as_dict, snapshot  # noqa: E402
 
 # Modo sin adaptadores: sin red ni dependencias externas (OpenRouter, gh, herdr).
 OFFLINE = os.environ.get("HARNESS_OFFLINE") == "1"
 
 
-def main():
-    quiet = "-q" in sys.argv or "--quiet" in sys.argv
-    snap = snapshot(collect(ROOT, offline=OFFLINE))
-    sys.stdout.write(render(snap, quiet=quiet, color=sys.stdout.isatty()))
+def build_parser():
+    p = argparse.ArgumentParser(prog="harness", description=__doc__.splitlines()[0])
+    p.add_argument("command", nargs="?", default="status", choices=["status"],
+                   help="por ahora sólo status")
+    p.add_argument("--context", metavar="NOMBRE",
+                   help="un contexto en vez del de por defecto")
+    p.add_argument("--all", action="store_true", dest="todos",
+                   help="todos los contextos juntos")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="sólo lo accionable: sin la tabla de readiness")
+    p.add_argument("--json", action="store_true", dest="como_json",
+                   help="el snapshot completo en JSON, en vez de la pantalla")
+    return p
+
+
+def main(argv=None):
+    """Devuelve el código de salida. 2 = la config está mal y hay que arreglarla."""
+    args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        contexts = load_config().select(args.context, todos=args.todos)
+    except ConfigError as e:
+        sys.stderr.write(f"harness: {e}\n")
+        return 2
+
+    snap = snapshot(collect(contexts, offline=OFFLINE))
+    if args.como_json:
+        json.dump(as_dict(snap), sys.stdout, indent=2, ensure_ascii=False, sort_keys=True)
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(render(snap, quiet=args.quiet, color=sys.stdout.isatty()))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

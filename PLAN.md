@@ -470,5 +470,7 @@ Muestra:
 - **Listo para el harness**: qué le falta a cada repo (gate → skills → CONTEXT.md).
   Esta es la tabla que responde "qué necesito en cada proyecto".
 
-Repos seguidos: `repos.conf`. Uso: `harness status`, o `-q` para saltear la tabla
-de readiness.
+Contextos y repos seguidos: `~/.config/harness/config.json`, fuera del repo porque
+contiene credenciales (ver `docs/harness/config.md`). Uso: `harness status` para el
+contexto por defecto, `--context <nombre>` para uno, `--all` para todos, `-q` para
+saltear la tabla de readiness y `--json` para el snapshot completo.
