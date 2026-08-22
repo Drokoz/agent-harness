@@ -50,3 +50,13 @@ commits, PRs, issues, ADRs — stay in Spanish, for consistency with what alread
 **Say it anyway when it changes a decision.** Brevity is not omission. A caveat the reader
 needs, a defect you found, a limit you hit: those are cheap and always worth the tokens.
 Silence about a real problem costs far more than the words would have.
+
+## Modelos en pi
+
+No declarar modelos explícitamente en `~/.pi/agent/models.json`: un provider con lista de
+`models` hace que pi les asigne specs por defecto conservadoras (128K de contexto, 16.4K de
+salida, sin thinking). Sin esa lista, pi autodescubre el catálogo real del provider.
+
+Y no usar el sufijo `:nitro`: rutea al proveedor más rápido, pero en el catálogo aparece como
+una entrada distinta y degradada. `qwen/qwen3.8-27b` da 262K/131K con thinking;
+`qwen/qwen3.8-27b:nitro` da 128K/16.4K sin thinking.
