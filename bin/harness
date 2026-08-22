@@ -10,6 +10,9 @@ en vez de suposiciones. Ver ../PLAN.md §"centralizar".
 
 Lee la key de OpenRouter de ~/.pi/agent/models.json (la misma que usa pi) y los repos
 de ../repos.conf. No escribe nada en ningún lado.
+
+Con HARNESS_OFFLINE=1 corre en modo sin adaptadores: sin llamadas de red ni de
+gh/herdr. El gate lo usa para que el humo del CLI sea hermético.
 """
 
 from __future__ import annotations
@@ -30,6 +33,8 @@ PI_MODELS = Path.home() / ".pi" / "agent" / "models.json"
 AGENT_LABEL = "ready-for-agent"
 TRIAGE_LABEL = "needs-triage"
 COSTO_TICKET = 0.24  # estimación §8 del PLAN; ajustar cuando haya datos reales
+# Modo sin adaptadores: sin red ni dependencias externas (OpenRouter, gh, herdr).
+OFFLINE = os.environ.get("HARNESS_OFFLINE") == "1"
 
 # Lo que un repo necesita para entrar al harness, en orden de dependencia.
 READINESS = [
@@ -56,6 +61,8 @@ def run(args, cwd=None, timeout=30):
 
 # --------------------------------------------------------------------- OpenRouter
 def openrouter_credits():
+    if OFFLINE:
+        return None
     try:
         key = json.loads(PI_MODELS.read_text())["providers"]["openrouter"]["apiKey"]
     except (OSError, KeyError, ValueError):
@@ -72,6 +79,8 @@ def openrouter_credits():
 
 # -------------------------------------------------------------------------- herdr
 def herdr_agents():
+    if OFFLINE:
+        return None
     if os.environ.get("HERDR_ENV") != "1":
         return None  # no estamos dentro de herdr: no hay sesión que inspeccionar
     ok, out = run(["herdr", "agent", "list"])
@@ -140,7 +149,7 @@ def inspect(path):
 
     r["ready"] = {key: (path / rel).exists() for key, rel, _ in READINESS}
 
-    if not r["slug"]:
+    if OFFLINE or not r["slug"]:
         return r
 
     issues = gh_json(r["slug"], ["issue", "list", "--state", "open", "--limit", "200",
@@ -188,7 +197,9 @@ def main():
 
     print()
     # ---- presupuesto
-    if credits:
+    if OFFLINE:
+        print(f" {BOLD}OpenRouter{OFF}  {DIM}sin adaptadores (HARNESS_OFFLINE=1){OFF}")
+    elif credits:
         total, used = credits["total_credits"], credits["total_usage"]
         left = total - used
         print(f" {BOLD}OpenRouter{OFF}  {bar(used, total)}  "
@@ -197,7 +208,9 @@ def main():
         print(f" {BOLD}OpenRouter{OFF}  {DIM}sin datos (¿key en ~/.pi/agent/models.json?){OFF}")
 
     # ---- agentes vivos
-    if agents is None:
+    if OFFLINE:
+        print(f" {BOLD}Agentes{OFF}     {DIM}sin adaptadores (HARNESS_OFFLINE=1){OFF}")
+    elif agents is None:
         print(f" {BOLD}Agentes{OFF}     {DIM}fuera de herdr — corré esto dentro de una sesión{OFF}")
     elif not agents:
         print(f" {BOLD}Agentes{OFF}     {DIM}ninguno trabajando{OFF}")
