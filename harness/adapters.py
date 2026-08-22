@@ -143,6 +143,29 @@ def slug_of(path):
     return m.group(1) if m else None
 
 
+def _markdown_files(dirpath):
+    """Los .md de una carpeta, ordenados. Carpeta inexistente → []: no todo
+    repo documenta decisiones y una vault vacía no es un error de config."""
+    try:
+        return sorted(f for f in dirpath.iterdir()
+                      if f.is_file() and f.suffix == ".md")
+    except OSError:
+        return []
+
+
+def adr_files(repo_path):
+    """Los ADRs de un repo (`docs/adr/*.md`), ya en el disco y ordenados."""
+    return _markdown_files(Path(repo_path) / "docs" / "adr")
+
+
+def vault_decision_files(vault):
+    """Las notas de `vault/decisiones/`. Vault sin declarar, sin carpeta o
+    vacía → []: un contexto sin vault no rompe, sólo no aporta notas."""
+    if not vault:
+        return []
+    return _markdown_files(Path(vault).expanduser() / "decisiones")
+
+
 def gh_json(slug, args):
     ok, out = run(["gh", *args, "-R", slug])
     if not ok or not out:
