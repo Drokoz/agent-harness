@@ -475,6 +475,14 @@ contiene credenciales (ver `docs/harness/config.md`). Uso: `harness status` para
 contexto por defecto, `--context <nombre>` para uno, `--all` para todos, `-q` para
 saltear la tabla de readiness y `--json` para el snapshot completo.
 
+La pantalla abre con el **resumen de la mañana** (ticket #7, 2026-08-22): qué pasó desde
+la última vez que se miró —tickets con PR abierto (gate verde), agentes que se
+trabaron, PRs abiertos esperando review y costo del período—, calculado del log JSONL
+de eventos de `run` y de los PRs en vivo. La marca de "última vez que miré" es un
+archivo junto al log y se actualiza sola con cada `status`; `--since <fecha>` mira otro
+período sin moverla. Con el log vacío dice "no pasó nada". Lo accionable (agentes,
+trabajo, readiness) queda abajo.
+
 ## 11. `harness run` (v0, 2026-08-22)
 
 El dispatcher local de la Fase 2, ya en Python sobre el mismo esqueleto de
