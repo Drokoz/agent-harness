@@ -103,6 +103,81 @@ def gh_json(slug, args):
         return None
 
 
+# Issues abiertos con sus dependencias nativas: `blockedBy` es la cantidad de
+# bloqueantes ABIERTOS, la misma que ve la UI de GitHub. Dos páginas de 100:
+# mismo techo que el `--limit 200` del REST de antes.
+ISSUES_GQL = """
+query($owner: String!, $name: String!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    issues(states: [OPEN], first: 100, after: $after) {
+      nodes {
+        number
+        title
+        body
+        labels(first: 20) { nodes { name } }
+        issueDependenciesSummary { blockedBy }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+""".strip()
+
+
+def normalize_issue(node):
+    """Un issue (nodo GraphQL o salida de `gh issue list`) a la forma que lee
+    `snapshot`: `blocked_by` son los bloqueantes abiertos según las dependencias
+    nativas; None cuando no hay datos nativos y hay que parsear el body."""
+    summary = node.get("issueDependenciesSummary") or {}
+    blocked = summary.get("blockedBy")
+    if isinstance(blocked, bool) or not isinstance(blocked, int):
+        blocked = None
+    labels = node.get("labels") or {}
+    label_nodes = labels.get("nodes") if isinstance(labels, dict) else labels
+    label_nodes = label_nodes or []
+    return {
+        "number": node["number"],
+        "title": node.get("title") or "",
+        "body": node.get("body") or "",
+        "labels": [{"name": l["name"]} for l in label_nodes],
+        "blocked_by": blocked,
+    }
+
+
+def normalize_issues(nodes):
+    return [normalize_issue(n) for n in nodes]
+
+
+def gh_graphql_issues(slug):
+    """Issues abiertos con dependencias nativas, vía GraphQL. None si gh no
+    contesta o la consulta falla: el llamador usa el fallback REST."""
+    owner, sep, name = slug.partition("/")
+    if not sep or not owner or not name:
+        return None
+    nodes, after = [], None
+    for _ in range(2):
+        args = ["api", "graphql", "-f", "query=" + ISSUES_GQL,
+                "-F", "owner=" + owner, "-F", "name=" + name]
+        if after:
+            args += ["-F", "after=" + after]
+        ok, out = run(["gh", *args])
+        if not ok:
+            return None
+        try:
+            data = json.loads(out)
+        except ValueError:
+            return None
+        if data.get("errors"):
+            return None
+        issues = (data.get("data") or {}).get("repository", {}).get("issues") or {}
+        nodes.extend(issues.get("nodes") or [])
+        info = issues.get("pageInfo") or {}
+        after = info.get("endCursor") if info.get("hasNextPage") else None
+        if not after:
+            break
+    return normalize_issues(nodes)
+
+
 def collect_repo(path, offline=False):
     """Todo lo crudo de un repo. Una llamada por dato, en paralelo afuera."""
     ok, branch = run(["git", "-C", str(path), "branch", "--show-current"])
@@ -122,8 +197,13 @@ def collect_repo(path, offline=False):
     if offline or not raw["slug"]:
         return raw
 
-    raw["issues"] = gh_json(raw["slug"], ["issue", "list", "--state", "open", "--limit", "200",
-                                          "--json", "number,title,labels,body"])
+    # La frontera sale de las dependencias nativas de GitHub (GraphQL). Si no
+    # están disponibles, cae al REST y `snapshot` parsea el body como fallback.
+    raw["issues"] = gh_graphql_issues(raw["slug"])
+    if raw["issues"] is None:
+        rest = gh_json(raw["slug"], ["issue", "list", "--state", "open", "--limit", "200",
+                                     "--json", "number,title,labels,body"])
+        raw["issues"] = normalize_issues(rest) if rest is not None else None
     raw["prs"] = gh_json(raw["slug"], ["pr", "list", "--state", "open", "--limit", "50",
                                        "--json", "number,title,isDraft,headRefName"])
     return raw

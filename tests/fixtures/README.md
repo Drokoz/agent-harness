@@ -7,6 +7,7 @@ tests de snapshot lo acusan.
 | archivo | comando |
 | --- | --- |
 | `gh_issue_list.json` | `gh issue list --state open --limit 200 --json number,title,labels,body -R Drokoz/agent-harness` |
+| `gh_issue_graphql.json` | `gh api graphql` con la consulta `ISSUES_GQL` de `harness/adapters.py` (issues abiertos + `issueDependenciesSummary.blockedBy`), owner=Drokoz name=agent-harness |
 | `gh_pr_list.json` | `gh pr list --state all --limit 3 --json number,title,isDraft,headRefName -R Drokoz/agent-harness` |
 | `herdr_agent_list.json` | `herdr agent list` |
 | `openrouter_credits.json` | `GET https://openrouter.ai/api/v1/credits` |

@@ -81,7 +81,10 @@ def _work(repos, c, out):
         algo = True
         dirty = f" · {r.dirty} sin commitear" if r.dirty else ""
         out("")
-        out(f"   {c.bold}{r.name}{c.off} {c.dim}{r.branch}{dirty}{c.off}")
+        # De dónde salió la frontera de este repo: se ve, no se adivina.
+        src = {"native": " (frontera: dependencias nativas)",
+               "body": " (frontera: parseo del body)"}.get(r.frontier_source, "")
+        out(f"   {c.bold}{r.name}{c.off} {c.dim}{r.branch}{dirty}{src}{c.off}")
         for i in r.frontier[:MAX_FRONTIER]:
             out(f"     {c.grn}▸{c.off} #{i.number} {i.title[:64]}")
         if len(r.frontier) > MAX_FRONTIER:

@@ -59,10 +59,22 @@ class TestFixtures(unittest.TestCase):
     """Las fixtures son salidas reales: si gh o herdr cambian de forma, esto cae."""
 
     def test_issues_reales(self):
+        """La fixture REST no trae dependencias nativas: cae al parseo del body."""
         snap = snapshot(raw(repos=[repo_raw(issues=support.gh_issues())]))
         r = snap.repos[0]
         self.assertEqual(len(r.frontier), 10)
         self.assertIn(3, [i.number for i in r.frontier])
+        self.assertEqual(r.frontier_source, "body")
+        self.assertEqual(r.degraded, [])
+
+    def test_issues_reales_con_dependencias_nativas(self):
+        """La fixture GraphQL es la respuesta real de Drokoz/agent-harness: los
+        cinco tickets con bloqueantes abiertos NO entran a la frontera."""
+        snap = snapshot(raw(repos=[repo_raw(issues=support.gh_issues_native())]))
+        r = snap.repos[0]
+        self.assertEqual([i.number for i in r.frontier], [1, 4, 12, 15])
+        self.assertEqual([i.number for i in r.blocked], [5, 6, 7, 8, 9])
+        self.assertEqual(r.frontier_source, "native")
         self.assertEqual(r.degraded, [])
 
     def test_prs_reales(self):
@@ -114,6 +126,63 @@ class TestFrontera(unittest.TestCase):
         self.assertEqual(blockers_of("Blocked by: #12"), {12})
         self.assertEqual(blockers_of("Blocked by none (can start)"), set())
         self.assertEqual(blockers_of(None), set())
+
+
+class TestFronteraNativa(unittest.TestCase):
+    """La frontera sale de issueDependenciesSummary.blockedBy (bloqueantes
+    abiertos, lo que ve la UI de GitHub), no del regex del body."""
+
+    def issue(self, number, blocked_by, body=""):
+        i = issue(number, body=body)
+        i["blocked_by"] = blocked_by
+        return i
+
+    def test_bloqueantes_abiertos_no_entran_a_la_frontera(self):
+        issues = [issue(1), self.issue(2, blocked_by=1)]
+        r = snapshot(raw(repos=[repo_raw(issues=issues)])).repos[0]
+        self.assertEqual([i.number for i in r.frontier], [1])
+        self.assertEqual([i.number for i in r.blocked], [2])
+
+    def test_cero_bloqueantes_abiertos_esta_en_la_frontera(self):
+        # blockedBy ya no cuenta cerrados: 0 quiere decir disponible.
+        r = snapshot(raw(repos=[repo_raw(issues=[self.issue(2, blocked_by=0)])])).repos[0]
+        self.assertEqual([i.number for i in r.frontier], [2])
+        self.assertEqual(r.blocked, [])
+
+    def test_nativas_premen_al_body(self):
+        """Con datos nativos el cuerpo no se mira: 'Blocked by #1' no cuenta."""
+        issues = [issue(1), self.issue(2, blocked_by=0, body="Blocked by #1")]
+        r = snapshot(raw(repos=[repo_raw(issues=issues)])).repos[0]
+        self.assertEqual([i.number for i in r.frontier], [1, 2])
+        self.assertEqual(r.blocked, [])
+
+    def test_sin_datos_nativos_cae_al_body(self):
+        issues = [issue(1), issue(2, body="Blocked by #1")]
+        r = snapshot(raw(repos=[repo_raw(issues=issues)])).repos[0]
+        self.assertEqual([i.number for i in r.frontier], [1])
+        self.assertEqual([i.number for i in r.blocked], [2])
+
+    def test_fuente_nativa(self):
+        issues = [self.issue(1, blocked_by=0), self.issue(2, blocked_by=1)]
+        r = snapshot(raw(repos=[repo_raw(issues=issues)])).repos[0]
+        self.assertEqual(r.frontier_source, "native")
+
+    def test_fuente_body(self):
+        r = snapshot(raw(repos=[repo_raw(issues=[issue(1)])])).repos[0]
+        self.assertEqual(r.frontier_source, "body")
+
+    def test_mezclado_se_nota_body_y_cada_issue_usa_lo_suyo(self):
+        """Si algún issue no trae nativas, la fuente se reporta como body y ese
+        issue se decide por su cuerpo."""
+        issues = [self.issue(1, blocked_by=0), issue(2, body="Blocked by #1")]
+        r = snapshot(raw(repos=[repo_raw(issues=issues)])).repos[0]
+        self.assertEqual(r.frontier_source, "body")
+        self.assertEqual([i.number for i in r.frontier], [1])
+        self.assertEqual([i.number for i in r.blocked], [2])
+
+    def test_fuente_none_sin_issues(self):
+        r = snapshot(raw(repos=[repo_raw(issues=[])])).repos[0]
+        self.assertIsNone(r.frontier_source)
 
 
 class TestRepos(unittest.TestCase):
