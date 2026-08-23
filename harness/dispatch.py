@@ -221,11 +221,17 @@ class Dispatcher:
             self.run_cmd(["git", "-C", job.repo_path, "worktree", "remove",
                           "--force", job.worktree])
         args = ["git", "-C", job.repo_path, "worktree", "add"]
-        ok, _ = self.run_cmd(["git", "-C", job.repo_path, "rev-parse",
-                              "--verify", "--quiet", "refs/heads/" + job.branch])
-        if not ok:
-            args.append("-b")
-        ok, out = self.run_cmd(args + [job.worktree, job.branch], timeout=120)
+        existe, _ = self.run_cmd(["git", "-C", job.repo_path, "rev-parse",
+                                  "--verify", "--quiet", "refs/heads/" + job.branch])
+        if existe:
+            # La rama ya está (un intento anterior la dejó): se reutiliza.
+            args += [job.worktree, job.branch]
+        else:
+            # `worktree add -b <rama> <path>`. El nombre de la rama va pegado a
+            # -b: si va el path, git lo toma como nombre de rama y falla con
+            # "is not a valid branch name".
+            args += ["-b", job.branch, job.worktree]
+        ok, out = self.run_cmd(args, timeout=120)
         if not ok:
             self.log.write("worktree", ref, "fallo: " + out.strip()[-200:])
         return ok

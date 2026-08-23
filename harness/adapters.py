@@ -32,7 +32,11 @@ def run(args, cwd=None, timeout=30):
     """Corre un comando y devuelve (ok, stdout). Nunca levanta excepción."""
     try:
         p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-        return p.returncode == 0, p.stdout.strip()
+        if p.returncode == 0:
+            return True, p.stdout.strip()
+        # Cuando falla, el motivo casi siempre está en stderr (git, gh y herdr
+        # escriben ahí). Devolver sólo stdout deja el log diciendo "fallo: ".
+        return False, (p.stderr.strip() or p.stdout.strip())
     except (OSError, subprocess.SubprocessError):
         return False, ""
 
