@@ -592,3 +592,52 @@ class TestElAgenteQueTermina(unittest.TestCase):
         m = Mundo(wait_out='{"result":{"agent":{"agent_status":"done"}}}')
         res, _ = despachar(m, [job()])
         self.assertNotIn("bloqueado", res[0].motivo)
+
+
+class TestElWorktreeQuedaUsable(unittest.TestCase):
+    """Un worktree recién creado no puede correr el gate todavía.
+
+    `git worktree add` trae lo versionado y nada más: no hay `node_modules` y no
+    hay `.env.local` (está en .gitignore, como corresponde). El gate arranca por
+    los tests, jest no existe, y muere en un segundo con un rojo que no tiene
+    nada que ver con el código del ticket.
+
+    Pasó con #70, #71 y #73 en la tanda del 2026-08-23: tres tickets abandonados
+    por deuda de infraestructura, no por su trabajo.
+    """
+
+    def test_instala_segun_el_lockfile(self):
+        self.assertEqual(dispatch.comando_de_instalacion(["yarn.lock"])[0], "yarn")
+        self.assertEqual(dispatch.comando_de_instalacion(["pnpm-lock.yaml"])[0], "pnpm")
+        self.assertEqual(dispatch.comando_de_instalacion(["package-lock.json"])[0], "npm")
+
+    def test_sin_lockfile_no_instala_nada(self):
+        """Un repo de Go no tiene nada que instalar: no inventar un comando."""
+        self.assertIsNone(dispatch.comando_de_instalacion(["go.mod"]))
+
+    def test_el_lockfile_manda_sobre_package_json(self):
+        """Con los dos presentes gana el lockfile, que es lo que fija versiones."""
+        cmd = dispatch.comando_de_instalacion(["package.json", "yarn.lock"])
+        self.assertEqual(cmd[0], "yarn")
+
+    def test_copia_los_env_que_git_no_trae(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            origen, destino = Path(tmp) / "repo", Path(tmp) / "wt"
+            origen.mkdir(), destino.mkdir()
+            (origen / ".env.local").write_text("SECRETO=1")
+            (origen / ".env.template").write_text("SECRETO=")
+            (origen / "package.json").write_text("{}")
+            copiados = dispatch.copiar_entorno(origen, destino)
+            self.assertEqual((destino / ".env.local").read_text(), "SECRETO=1")
+            self.assertIn(".env.local", copiados)
+            self.assertFalse((destino / "package.json").exists(),
+                             "sólo los .env, no el repo entero")
+
+    def test_no_pisa_un_env_que_el_worktree_ya_tenga(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            origen, destino = Path(tmp) / "repo", Path(tmp) / "wt"
+            origen.mkdir(), destino.mkdir()
+            (origen / ".env.local").write_text("del repo")
+            (destino / ".env.local").write_text("versionado")
+            dispatch.copiar_entorno(origen, destino)
+            self.assertEqual((destino / ".env.local").read_text(), "versionado")
