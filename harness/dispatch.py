@@ -82,6 +82,51 @@ def nombre_agente(repo, issue):
     return ("{}-{}".format(base[:24], issue))[:32]
 
 
+# Lockfile -> con qué se instala. El orden importa: gana el primero que esté,
+# y el lockfile manda sobre package.json porque es el que fija versiones.
+INSTALADORES = (
+    ("pnpm-lock.yaml", ["pnpm", "install", "--frozen-lockfile"]),
+    ("yarn.lock", ["yarn", "install", "--immutable"]),
+    ("package-lock.json", ["npm", "ci"]),
+)
+
+
+def comando_de_instalacion(archivos):
+    """Con qué instalar las dependencias de este repo, o None si no hay nada.
+
+    Un repo de Go no tiene lockfile de node y no hay que inventarle un comando:
+    devolver None es la respuesta correcta, no un fallback a npm.
+    """
+    presentes = set(archivos)
+    for lock, cmd in INSTALADORES:
+        if lock in presentes:
+            return list(cmd)
+    return None
+
+
+def copiar_entorno(repo_path, worktree):
+    """Lleva al worktree los `.env` que git no versiona.
+
+    Están en .gitignore con razón —traen credenciales—, así que `worktree add`
+    no los trae y el gate corre sin configuración. Se copian los que el worktree
+    no tenga ya: si el repo versiona un `.env` de ejemplo, ese gana.
+    """
+    copiados = []
+    origen, destino = Path(repo_path), Path(worktree)
+    for f in sorted(origen.glob(".env*")):
+        if not f.is_file() or f.name.endswith((".template", ".example", ".bak")):
+            continue
+        objetivo = destino / f.name
+        if objetivo.exists():
+            continue
+        try:
+            objetivo.write_bytes(f.read_bytes())
+            copiados.append(f.name)
+        except OSError:
+            pass
+    return copiados
+
+
 def worktree_path(repo_path, issue):
     """El worktree aislado de un ticket. La unidad de aislamiento es el
     worktree (PLAN.md): dos tickets en paralelo no se pisan."""
@@ -174,6 +219,7 @@ class DispatchSpec:
     model: str = ""
     wait_ms: int = 3_600_000      # espera máxima por agente (una noche)
     gate_timeout: int = 1800      # segundos para gate.sh dentro del worktree
+    install_timeout: int = 900    # segundos para instalar dependencias
     start_retries: int = 4        # reintentos de agent start (pane sin shell)
     start_wait_s: float = 2.0     # espera entre reintentos de arranque
     verify_retries: int = 3       # reintentos si el primer prompt se pierde
@@ -393,9 +439,29 @@ class Dispatcher:
             self._abandonar(job, ref, "fallo al esperar al agente: " + out.strip()[:200])
         return True
 
+    def _preparar(self, job, ref):
+        """Deja el worktree en condiciones de correr el gate.
+
+        `git worktree add` trae lo versionado y nada más. Sin esto el gate se
+        pone rojo por falta de dependencias y el ticket se abandona por una
+        razón que no tiene nada que ver con su código.
+        """
+        copiados = copiar_entorno(job.repo_path, job.worktree)
+        if copiados:
+            self.log.write("worktree", ref, "entorno: " + ", ".join(copiados))
+        wt = Path(job.worktree)
+        cmd = comando_de_instalacion([f.name for f in wt.iterdir()]
+                                     if wt.exists() else [])
+        if not cmd or (wt / "node_modules").exists():
+            return
+        ok, out = self.run_cmd(cmd, cwd=job.worktree, timeout=self.spec.install_timeout)
+        self.log.write("worktree", ref, "instalar con {}: {}".format(
+            cmd[0], "ok" if ok else "fallo: " + out.strip()[-160:]))
+
     def _gate_verde(self, job, ref):
         """El gate se corre en el worktree, por el dispatcher: no confía en
         la palabra del agente. Rojo = abandono, y no hay PR."""
+        self._preparar(job, ref)
         ok, out = self.run_cmd(["./scripts/gate.sh"], cwd=job.worktree,
                                timeout=self.spec.gate_timeout)
         if ok:
