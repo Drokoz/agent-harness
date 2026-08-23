@@ -571,3 +571,24 @@ class TestElPromptSeEntrega(unittest.TestCase):
                     (True, '{"result":{"agent":{"agent_status":"working"}}}'))
         res, _ = despachar(m, [job()])
         self.assertNotIn("primer prompt perdido", res[0].motivo)
+
+
+class TestElAgenteQueTermina(unittest.TestCase):
+    """Claude se asienta en `done`, no en `idle`.
+
+    El dispatcher esperaba `--until idle --until blocked`, así que un agente
+    que ya había terminado —PR abierto y todo— no matcheaba ningún estado y el
+    wait se quedaba colgado hasta el timeout: una hora de reloj por ticket
+    terminado, con la corrida entera detrás haciendo cola.
+    """
+
+    def test_espera_tambien_por_done(self):
+        m = Mundo()
+        despachar(m, [job()])
+        (w,) = m.llamo("herdr", "agent", "wait")
+        self.assertIn("done", w[0], "un agente que termina en done no lo espera nadie")
+
+    def test_done_no_es_estar_bloqueado(self):
+        m = Mundo(wait_out='{"result":{"agent":{"agent_status":"done"}}}')
+        res, _ = despachar(m, [job()])
+        self.assertNotIn("bloqueado", res[0].motivo)
