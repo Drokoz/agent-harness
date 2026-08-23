@@ -526,3 +526,48 @@ class TestElAgenteArranca(unittest.TestCase):
                     (True, '{"result":{"agent":{"agent_status":"working"}}}'))
         res, _ = despachar(m, [job()])
         self.assertNotIn("primer prompt perdido", res[0].motivo)
+
+
+class TestElPromptSeEntrega(unittest.TestCase):
+    """El prompt nunca se enviaba, y nadie se enteraba.
+
+    `herdr agent prompt --timeout N` sin `--wait` es un error de uso —herdr
+    contesta "--timeout requires --wait"— y el dispatcher descartaba el
+    resultado. O sea: cero prompts entregados en toda la vida del dispatcher.
+    Lo que fallaba después (la verificación) era el síntoma.
+    """
+
+    def test_el_prompt_se_manda_esperando_a_que_el_agente_arranque(self):
+        m = Mundo()
+        despachar(m, [job()])
+        (p,) = m.llamo("herdr", "agent", "prompt")
+        args = p[0]
+        self.assertIn("--wait", args,
+                      "--timeout sin --wait es un error de uso: herdr no manda nada")
+        self.assertIn("--until", args)
+        self.assertIn("working", args)
+
+    def test_si_herdr_dice_que_se_atasco_se_reintenta(self):
+        # Sin barra de pi: el veredicto tiene que salir de herdr, no del pane.
+        m = Mundo(pane_out="ni un porcentaje a la vista\n")
+        intentos = []
+
+        def prompt(args):
+            intentos.append(1)
+            if len(intentos) < 2:
+                return (False, '{"error":{"code":"agent_prompt_stalled"}}')
+            return (True, '{"result":{"agent":{"agent_status":"working"}}}')
+
+        m.responder(lambda a: a[:3] == ["herdr", "agent", "prompt"], prompt)
+        res, _ = despachar(m, [job()])
+        self.assertEqual(len(intentos), 2)
+        self.assertNotIn("primer prompt perdido", res[0].motivo)
+
+    def test_el_veredicto_es_de_herdr_y_no_de_leer_la_pantalla(self):
+        """La TUI de pi era la única que publicaba el contexto en porcentaje.
+        Preguntarle a herdr sirve para cualquier agente."""
+        m = Mundo(pane_out="ni un porcentaje a la vista\n")
+        m.responder(lambda a: a[:3] == ["herdr", "agent", "prompt"],
+                    (True, '{"result":{"agent":{"agent_status":"working"}}}'))
+        res, _ = despachar(m, [job()])
+        self.assertNotIn("primer prompt perdido", res[0].motivo)
