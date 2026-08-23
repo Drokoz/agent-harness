@@ -548,7 +548,8 @@ class TestElPromptSeEntrega(unittest.TestCase):
         self.assertIn("working", args)
 
     def test_si_herdr_dice_que_se_atasco_se_reintenta(self):
-        m = Mundo()
+        # Sin barra de pi: el veredicto tiene que salir de herdr, no del pane.
+        m = Mundo(pane_out="ni un porcentaje a la vista\n")
         intentos = []
 
         def prompt(args):

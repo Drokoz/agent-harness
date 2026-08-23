@@ -325,14 +325,22 @@ class Dispatcher:
         contarse como lanzado."""
         prompt = prompt_de(job.issue)
         for intento in range(1, self.spec.verify_retries + 1):
-            self.run_cmd(["herdr", "agent", "prompt", job.agent, prompt,
-                          "--timeout", "60000"], timeout=90)
-            self.log.write("prompt", ref, "intento {}".format(intento))
+            # `--wait --until working` es lo que hace que herdr entregue el
+            # prompt y confirme que llegó. Sin `--wait`, `--timeout` es un
+            # error de uso y no se manda nada.
+            ok, out = self.run_cmd(
+                ["herdr", "agent", "prompt", job.agent, prompt,
+                 "--wait", "--until", "working",
+                 "--timeout", str(int(self.spec.verify_wait_s * 1000))],
+                timeout=int(self.spec.verify_wait_s) + 60)
+            estado = _json_field(out, ("result", "agent", "agent_status"))
+            self.log.write("prompt", ref, "intento {}: {}".format(
+                intento, estado or _json_field(out, ("error", "code")) or "sin respuesta"))
+            if ok and estado in ("working", "blocked"):
+                return True
             if self._llego(job):
                 return True
-            plazo = time.monotonic() + self.spec.verify_wait_s
-            while time.monotonic() < plazo and not self._llego(job):
-                self.dormir(self.spec.verify_poll_s)
+            self.dormir(self.spec.verify_poll_s)
         return False
 
     def _llego(self, job):
