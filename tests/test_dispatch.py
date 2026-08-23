@@ -641,3 +641,47 @@ class TestElWorktreeQuedaUsable(unittest.TestCase):
             (destino / ".env.local").write_text("versionado")
             dispatch.copiar_entorno(origen, destino)
             self.assertEqual((destino / ".env.local").read_text(), "versionado")
+
+
+class TestElOrdenDelPreparado(unittest.TestCase):
+    """Instalar va ANTES de copiar los .env, y no al revés.
+
+    El `.env` de ENTREVESTIDOS-BACK fija `NODE_ENV=production`. Copiado antes
+    del install, yarn omite las devDependencies —donde vive jest— y los tests
+    del repo no pueden correr: `jest: command not found`.
+
+    El worktree de un agente siempre es un entorno de desarrollo, sin importar
+    lo que diga el .env de producción del repo.
+    """
+
+    def test_instala_antes_de_copiar_el_entorno(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, wt = Path(tmp) / "repo", Path(tmp) / "wt"
+            repo.mkdir(), wt.mkdir()
+            (repo / ".env").write_text("NODE_ENV=production")
+            (wt / "yarn.lock").write_text("")
+            (wt / "package.json").write_text("{}")
+
+            orden = []
+            m = Mundo()
+            m.responder(lambda a: a[0] in ("yarn", "pnpm", "npm"),
+                        lambda a: (orden.append("instalar"), (True, ""))[1])
+
+            d = Dispatcher(spec(), log_en(tmp), m.cmd, dormir=m.dormir)
+            j = Job(repo="r", repo_path=str(repo), slug="o/r", issue=7)
+            j.worktree = str(wt)
+
+            original = dispatch.copiar_entorno
+
+            def espiar(a, b):
+                orden.append("copiar_entorno")
+                return original(a, b)
+
+            dispatch.copiar_entorno = espiar
+            try:
+                d._preparar(j, "ticket/7")
+            finally:
+                dispatch.copiar_entorno = original
+
+            self.assertEqual(orden, ["instalar", "copiar_entorno"],
+                             "el .env de producción no puede estar puesto al instalar")
