@@ -274,6 +274,25 @@ class TestCicloDeVida(unittest.TestCase):
         (add,) = m.llamo("git", "worktree", "add")
         self.assertNotIn("-b", add[0])
 
+    def test_rama_nueva_pone_el_nombre_despues_de_menos_b(self):
+        """`worktree add -b <rama> <path>`, en ese orden.
+
+        Si `-b` queda pegado antes del path, git lee el path como nombre de
+        rama y la rama como path, y falla con "is not a valid branch name".
+        Pasó en producción el 2026-08-23: la corrida entera —quince tickets—
+        murió acá, y como `run` se comía el stderr el log sólo decía "fallo:".
+        """
+        m = Mundo()
+        m.responder(lambda a: "rev-parse" in a, (False, ""))  # la rama no existe
+        despachar(m, [job()])
+        (add,) = m.llamo("git", "worktree", "add")
+        args = add[0]
+        i = args.index("-b")
+        self.assertEqual(args[i + 1], "ticket/7",
+                         "después de -b va el nombre de la rama, no el path")
+        self.assertTrue(args[i + 2].endswith("ticket-7"),
+                        "el path del worktree va al final")
+
 
 class TestPromptPerdido(unittest.TestCase):
     def test_reintenta_hasta_que_el_contexto_sube(self):

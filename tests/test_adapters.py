@@ -5,6 +5,7 @@ reemplaza por una función que devuelve lo que devolvería el comando.
 """
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -385,3 +386,24 @@ class TestCollect(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRunCapturaElError(unittest.TestCase):
+    """`run` tiene que devolver el stderr cuando el comando falla.
+
+    Git escribe sus errores en stderr. Devolver sólo stdout deja el motivo del
+    fallo en la nada: el 2026-08-23 el dispatcher abandonó quince tickets y el
+    log decía literalmente "fallo: ", sin una palabra de por qué.
+    """
+
+    def test_el_motivo_del_fallo_no_se_pierde(self):
+        ok, out = adapters.run(
+            [sys.executable, "-c",
+             "import sys; sys.stderr.write('esto explica el fallo'); sys.exit(1)"])
+        self.assertFalse(ok)
+        self.assertIn("esto explica el fallo", out)
+
+    def test_cuando_sale_bien_devuelve_el_stdout_limpio(self):
+        ok, out = adapters.run([sys.executable, "-c", "print('la salida')"])
+        self.assertTrue(ok)
+        self.assertEqual(out, "la salida")
