@@ -116,3 +116,33 @@ class TestReport(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLoCerradoSeLee(unittest.TestCase):
+    """Los tickets del resumen no traen repo/number/title.
+
+    El dispatcher los anota como {ref, detalle} —"ticket/69", "PR #87 abierto
+    (gate verde)"— y el reporte los dibujaba buscando claves que no existen, así
+    que la lista de "Cerrados" salía con viñetas vacías y un "#" suelto.
+    """
+
+    def test_dibuja_ref_y_detalle_cuando_no_hay_repo_ni_titulo(self):
+        s = snap()
+        s["resumen"]["tickets"] = [
+            {"contexto": "noche", "ref": "ticket/69",
+             "detalle": "PR #87 abierto (gate verde)"}]
+        h = render_html(s)
+        self.assertIn("ticket/69", h)
+        self.assertIn("PR #87 abierto", h)
+
+    def test_sigue_dibujando_repo_y_titulo_cuando_si_estan(self):
+        h = render_html(snap())
+        self.assertIn("agent-harness #2", h)
+        self.assertIn("Gate", h)
+
+    def test_no_deja_un_numeral_suelto_sin_numero(self):
+        s = snap()
+        s["resumen"]["tickets"] = [{"ref": "ticket/69", "detalle": "algo"}]
+        h = render_html(s)
+        self.assertNotIn('">  #</span>', h)
+        self.assertNotIn('"> #</span>', h)
