@@ -68,6 +68,26 @@ def _presupuesto(b):
             f'{_barra(ratio, tono)}<p class="muted">{_esc(sub)}</p></div>')
 
 
+def _ref(item):
+    """Cómo se nombra una línea del resumen.
+
+    Los PRs vienen con repo y número; los tickets que anota el dispatcher vienen
+    con `ref` ("ticket/69") y nada más. Antes se pedían siempre repo y number, y
+    los tickets salían como un "#" suelto al lado de una viñeta vacía.
+    """
+    repo, num = item.get("repo"), item.get("number")
+    if repo and num is not None:
+        return "{} #{}".format(repo, num)
+    if num is not None:
+        return "#{}".format(num)
+    return item.get("ref") or ""
+
+
+def _texto(item):
+    """El título si lo hay; si no, lo que el dispatcher dejó dicho."""
+    return item.get("title") or item.get("detalle") or ""
+
+
 def _resumen(r):
     if not r or r.get("estado") != "ok":
         return '<p class="muted">Sin log todavía: nada que resumir.</p>'
@@ -88,8 +108,8 @@ def _resumen(r):
             continue
         filas = "".join(
             f'<li><span class="mark is-{marca}"></span>'
-            f'<span class="ref">{_esc(i.get("repo",""))} #{_esc(i.get("number",""))}</span> '
-            f'{_esc((i.get("title") or "")[:88])}</li>' for i in items[:8])
+            f'<span class="ref">{_esc(_ref(i))}</span> '
+            f'{_esc(_texto(i)[:88])}</li>' for i in items[:8])
         extra = (f'<li class="muted">… y {len(items)-8} más</li>' if len(items) > 8 else "")
         detalle += f'<h3>{_esc(titulo)}</h3><ul class="list">{filas}{extra}</ul>'
 
