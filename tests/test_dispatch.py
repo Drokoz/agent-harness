@@ -467,3 +467,62 @@ class TestCliRun(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestElAgenteArranca(unittest.TestCase):
+    """Los tres motivos por los que la corrida del 2026-08-23 no despachó nada.
+
+    Cada uno mataba tickets distintos y ninguno tenía test.
+    """
+
+    def test_confia_el_worktree_antes_de_arrancar_claude(self):
+        """Claude Code pregunta "¿confiás en esta carpeta?" en cada directorio
+        nuevo, y un worktree siempre lo es. El agente queda `blocked` en el
+        diálogo sin haber escrito una línea."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "claude.json"
+            cfg.write_text(json.dumps({"projects": {"/otro": {"x": 1}}}))
+            dispatch.confiar_en("/repos/.worktrees/koku-ticket-7", cfg)
+            d = json.loads(cfg.read_text())
+            self.assertTrue(
+                d["projects"]["/repos/.worktrees/koku-ticket-7"]["hasTrustDialogAccepted"])
+            self.assertEqual(d["projects"]["/otro"], {"x": 1},
+                             "no se tocan los otros proyectos")
+
+    def test_confiar_es_idempotente_y_no_pisa_lo_que_ya_hay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "claude.json"
+            cfg.write_text(json.dumps(
+                {"projects": {"/w": {"hasTrustDialogAccepted": True, "otra": 2}}}))
+            dispatch.confiar_en("/w", cfg)
+            d = json.loads(cfg.read_text())
+            self.assertEqual(d["projects"]["/w"]["otra"], 2)
+
+    def test_reintenta_cuando_el_pane_todavia_no_tiene_shell(self):
+        """`pane split` vuelve antes de que el shell esté listo, y
+        `agent start` muere con agent_pane_busy. Es una carrera, no un
+        error definitivo: se reintenta."""
+        m = Mundo()
+        intentos = []
+
+        def start(args):
+            intentos.append(1)
+            if len(intentos) < 2:
+                return (False, '{"error":{"code":"agent_pane_busy",'
+                               '"message":"pane w9:p1 is not an available shell"}}')
+            return (True, "")
+
+        m.responder(lambda a: a[:3] == ["herdr", "agent", "start"], start)
+        res, _ = despachar(m, [job()])
+        self.assertGreaterEqual(len(intentos), 2, "no reintentó el arranque")
+        self.assertNotEqual(res[0].motivo, "no arranco el agente")
+
+    def test_el_prompt_llego_tambien_sin_la_barra_de_estado_de_pi(self):
+        """La evidencia de que el prompt llegó era el contexto de la TUI de pi
+        ("11.4%/262k"). Claude no imprime nada parecido, así que todo agente
+        claude se declaraba perdido. herdr ya sabe el estado del agente."""
+        m = Mundo(pane_out="una pantalla de claude, sin porcentajes de pi\n")
+        m.responder(lambda a: a[:3] == ["herdr", "agent", "get"],
+                    (True, '{"result":{"agent":{"agent_status":"working"}}}'))
+        res, _ = despachar(m, [job()])
+        self.assertNotIn("primer prompt perdido", res[0].motivo)
