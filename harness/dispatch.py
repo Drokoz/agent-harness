@@ -370,8 +370,13 @@ class Dispatcher:
         sigue con el siguiente; no se queda esperando a un humano que no va
         a estar."""
         wait_s = self.spec.wait_ms // 1000 + 120
+        # `done` va en la lista porque es donde se asienta claude cuando
+        # termina. Sin él, un agente que ya dejó el PR abierto no matchea
+        # ningún estado y el wait cuelga hasta el timeout —una hora de reloj
+        # por ticket terminado, con la corrida entera haciendo cola detrás.
         ok, out = self.run_cmd(["herdr", "agent", "wait", job.agent,
                                 "--until", "idle", "--until", "blocked",
+                                "--until", "done",
                                 "--timeout", str(self.spec.wait_ms)],
                                timeout=wait_s)
         status = _json_field(out, ("result", "agent", "agent_status"))
