@@ -556,3 +556,71 @@ Con el modelo completo, Qwen cerró el dispatcher (#6, 422 líneas + 450 de test
 un conflicto de merge entre dos refactors que se pisaban**. Con la config degradada había
 fallado en un refactor y en la vault. La conclusión "aditivo sí, refactor no" era un artefacto
 de la configuración, no una propiedad del modelo. Sigue valiendo medir, no asumir.
+
+---
+
+## 12. La primera corrida real (2026-08-23)
+
+Quince tickets despachados de noche sobre F7League y los dos repos de
+entrevestidos. **Diez cerrados, cuatro abandonados, y siete bugs del dispatcher
+descubiertos en el camino** — todos con test antes del arreglo.
+
+### Los siete bugs, en el orden en que se tapaban unos a otros
+
+1. **`worktree add -b <path> <rama>`**, con los argumentos invertidos. Git leía el
+   path como nombre de rama. Sólo se dispara con ramas nuevas, o sea con todo
+   ticket que se toma por primera vez. Mató la primera corrida entera: quince de
+   quince.
+2. **`adapters.run` devolvía sólo stdout.** Git escribe sus errores en stderr, así
+   que el log decía `fallo: ` y nada más. Éste es el que hizo que el primero
+   tardara en verse, y la lección vale más que el fix: *un mecanismo que descarta
+   el motivo del fallo convierte cualquier bug en un misterio.*
+3. **El diálogo de confianza de Claude Code.** Un worktree es siempre un
+   directorio nuevo, así que el agente quedaba `blocked` ahí sin escribir una
+   línea. Se resuelve registrando el worktree en `~/.claude.json` antes de
+   arrancar.
+4. **`agent_pane_busy`.** `pane split` vuelve antes de que el shell esté listo. Es
+   una carrera, no un veredicto: se reintenta.
+5. **El prompt nunca se enviaba.** `herdr agent prompt --timeout N` sin `--wait` es
+   un error de uso —herdr contesta `--timeout requires --wait`— y el dispatcher
+   descartaba el resultado. **Cero prompts entregados en toda la vida del
+   dispatcher.** Todo lo demás era síntoma.
+6. **`agent wait` no esperaba por `done`,** que es donde se asienta claude al
+   terminar. Un agente que ya había dejado el PR abierto colgaba hasta el timeout:
+   una hora de reloj por ticket, con la corrida haciendo cola.
+7. **El worktree no quedaba usable:** sin `node_modules` y sin `.env`. Y al
+   arreglarlo introduje el séptimo — copiar el `.env` *antes* de instalar hace que
+   `NODE_ENV=production` deje al worktree sin devDependencies, o sea sin runner de
+   tests.
+
+### Lo que esto enseñó sobre los gates
+
+Los tres repos tenían un gate en verde que no significaba lo que parecía:
+
+- **FRONT**: verde por la caché de `.next`. En checkout limpio, fallaba.
+- **BACK**: verde con devDependencies instaladas. Railway instala sólo producción
+  y no compilaba.
+- **F7League**: verde sin correr un solo test SQL, en un repo que pone la lógica de
+  negocio en la base a propósito.
+
+**El patrón es el mismo en los tres: el gate medía su propia máquina en vez de la
+de producción.** Y los tres se descubrieron por la misma vía — no leyendo el gate,
+sino corriéndolo donde el gate no había corrido nunca. Un worktree limpio resultó
+ser el mejor detector de gates mentirosos que teníamos.
+
+### Lo que sí funcionó
+
+- **La frontera con dependencias nativas.** Ningún agente tomó un ticket bloqueado,
+  y los bloqueados se destrabaron solos al cerrarse su predecesor.
+- **El gate como condición para abrir PR.** Ningún PR llegó a revisión con el gate
+  rojo; los que fallaron se abandonaron sin ensuciar el tracker.
+- **El merge humano.** Dos de los diez PRs no debían mergearse —uno necesitaba una
+  migración en producción, el otro conflictuaba de verdad— y sólo se ve leyendo.
+- **Los agentes encontraron cosas que los tickets no decían**: el W.O. que trababa
+  una cancha para siempre, que en el backend no había ningún tope de fotos, que la
+  metadata vive repartida entre producto y variante.
+
+### Costo
+
+**US$0 de OpenRouter.** Todo corrió con claude. Las corridas fallidas murieron
+antes de gastar: el dispatcher falla temprano por diseño.
