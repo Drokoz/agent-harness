@@ -446,17 +446,23 @@ class Dispatcher:
         pone rojo por falta de dependencias y el ticket se abandona por una
         razón que no tiene nada que ver con su código.
         """
+        wt = Path(job.worktree)
+        # Instalar PRIMERO, con el worktree todavía sin .env. El de
+        # ENTREVESTIDOS-BACK fija NODE_ENV=production, y con eso puesto yarn
+        # omite las devDependencies —donde vive el runner de tests— y el gate se
+        # queda sin poder correrlos. El worktree de un agente siempre es un
+        # entorno de desarrollo, diga lo que diga el .env de producción.
+        cmd = comando_de_instalacion([f.name for f in wt.iterdir()]
+                                     if wt.exists() else [])
+        if cmd and not (wt / "node_modules").exists():
+            ok, out = self.run_cmd(cmd, cwd=job.worktree,
+                                   timeout=self.spec.install_timeout)
+            self.log.write("worktree", ref, "instalar con {}: {}".format(
+                cmd[0], "ok" if ok else "fallo: " + out.strip()[-160:]))
+
         copiados = copiar_entorno(job.repo_path, job.worktree)
         if copiados:
             self.log.write("worktree", ref, "entorno: " + ", ".join(copiados))
-        wt = Path(job.worktree)
-        cmd = comando_de_instalacion([f.name for f in wt.iterdir()]
-                                     if wt.exists() else [])
-        if not cmd or (wt / "node_modules").exists():
-            return
-        ok, out = self.run_cmd(cmd, cwd=job.worktree, timeout=self.spec.install_timeout)
-        self.log.write("worktree", ref, "instalar con {}: {}".format(
-            cmd[0], "ok" if ok else "fallo: " + out.strip()[-160:]))
 
     def _gate_verde(self, job, ref):
         """El gate se corre en el worktree, por el dispatcher: no confía en
