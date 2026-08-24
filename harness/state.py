@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, Optional
 
 from harness.summary import COSTO_JOB_RE, parse_fecha
@@ -150,6 +151,66 @@ def de_ticket(eventos, repo, issue):
                         ultimo_runner=ultimo_runner,
                         duracion_min=duracion,
                         costo=costo)
+
+
+@dataclass
+class Peldano:
+    """Un intento (`run_id`) de un ticket escalado: el runner, lo que gastó
+    en dólares (líneas `costo`) y la ventana de tiempo del intento.
+
+    `cuota` (tokens ponderados de Claude) queda en None acá: `state` es
+    puro sobre el log y no sabe de `harness.quota` (sesiones locales); el
+    CLI cruza `inicio`/`fin` contra `quota.cuota_por_ventana` y lo llena
+    (#47, ver `bin/harness`).
+    """
+
+    attempt: int
+    run_id: str
+    runner: Optional[str] = None
+    motivo: Optional[str] = None
+    costo: float = 0.0
+    inicio: Optional[datetime] = None
+    fin: Optional[datetime] = None
+    cuota: Optional[float] = None
+
+
+def pasos(eventos, repo, issue):
+    """Los peldaños de este ticket, uno por corrida (`run_id`), en el orden
+    en que aparecen en el log. Cada uno trae su runner, su costo en
+    dólares acumulado y la ventana de tiempo de sus eventos —lo que hace
+    falta para repartir la cuota entre peldaños (ver `Peldano`)."""
+    por_run: Dict[str, dict] = {}
+    orden = []
+    for e in eventos:
+        if not _es_de(e, repo, issue):
+            continue
+        run = e.get("run_id") or _SIN_RUN
+        if run not in por_run:
+            por_run[run] = {"attempt": e.get("attempt") or 1, "runner": None,
+                            "motivo": None, "costo": 0.0, "inicio": None, "fin": None}
+            orden.append(run)
+        acc = por_run[run]
+        if e.get("attempt") is not None:
+            acc["attempt"] = e["attempt"]
+        tipo, cuerpo = e.get("tipo"), str(e.get("cuerpo", ""))
+        if tipo == "agente":
+            mkt = KIND_RE.search(cuerpo)
+            if mkt:
+                acc["runner"] = mkt.group(1)
+        elif tipo == "abandono":
+            acc["motivo"] = cuerpo
+        elif tipo == "costo":
+            m = COSTO_JOB_RE.match(cuerpo.strip())
+            if m:
+                acc["costo"] += float(m.group(1))
+        dt = parse_fecha(str(e.get("timestamp", "")))
+        if dt is not None:
+            acc["inicio"] = dt if acc["inicio"] is None else min(acc["inicio"], dt)
+            acc["fin"] = dt if acc["fin"] is None else max(acc["fin"], dt)
+    return [Peldano(attempt=por_run[r]["attempt"], run_id=r, runner=por_run[r]["runner"],
+                    motivo=por_run[r]["motivo"], costo=por_run[r]["costo"],
+                    inicio=por_run[r]["inicio"], fin=por_run[r]["fin"])
+           for r in sorted(orden, key=lambda r: (por_run[r]["attempt"], r))]
 
 
 def intentos_que_escalan(eventos, repo, issue):

@@ -135,6 +135,72 @@ class TestResumen(unittest.TestCase):
         self.assertIn("Resumen", salida)
         self.assertIn(OFFLINE_HINT, salida)
 
+    def test_cuota_de_la_semana(self):
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    cuota_semana=1000.0, cuota_semana_harness=600.0)
+        salida = self.pantalla(r)
+        self.assertIn("cuota de la semana", salida)
+        self.assertIn("1,000", salida)
+        self.assertIn("600", salida)
+        self.assertIn("harness", salida)
+
+    def test_sin_datos_de_cuota_no_muestra_la_linea(self):
+        """AC #47: sin cuota la pantalla no se rompe, sigue como siempre."""
+        salida = self.pantalla(Resumen(estado="ok", desde="2026-08-21T23:00:00Z"))
+        self.assertNotIn("cuota de la semana", salida)
+
+    def test_costo_por_ticket_en_las_dos_monedas(self):
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    cuota_semana=1.0, cuota_semana_harness=1.0, tickets=[
+                        Ticket(contexto="personal", ref="ticket/3",
+                              detalle="PR #19 abierto (gate verde)",
+                              costo=0.42, cuota=12345.0)])
+        salida = self.pantalla(r)
+        self.assertIn("$0.42", salida)
+        self.assertIn("12,345", salida)
+
+    def test_sin_cuota_no_muestra_tokens_por_ticket(self):
+        """Sin datos de cuota (offline), el ticket se ve como siempre: sólo
+        el detalle, sin inventar una cifra de tokens."""
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z", tickets=[
+            Ticket(contexto="personal", ref="ticket/3",
+                  detalle="PR #19 abierto (gate verde)")])
+        salida = self.pantalla(r)
+        self.assertNotIn("tok", salida)
+
+    def test_peldanos_de_un_ticket_escalado(self):
+        from harness.summary import Ticket
+        peldanos = [{"attempt": 1, "runner": "pi", "motivo": "gate rojo",
+                    "costo": 0.05, "cuota": 0.0},
+                   {"attempt": 2, "runner": "claude", "motivo": None,
+                    "costo": 0.0, "cuota": 8200.0}]
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    cuota_semana=1.0, cuota_semana_harness=1.0, tickets=[
+                        Ticket(contexto="personal", ref="ticket/3",
+                              detalle="PR #19 abierto (gate verde)",
+                              costo=0.05, cuota=8200.0, peldanos=peldanos)])
+        salida = self.pantalla(r)
+        self.assertIn("peldaño 1", salida)
+        self.assertIn("pi", salida)
+        self.assertIn("$0.05", salida)
+        self.assertIn("peldaño 2", salida)
+        self.assertIn("claude", salida)
+        self.assertIn("8,200", salida)
+
+    def test_un_solo_peldano_no_desglosa(self):
+        from harness.summary import Ticket
+        peldanos = [{"attempt": 1, "runner": "pi", "motivo": None,
+                    "costo": 0.05, "cuota": 0.0}]
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    cuota_semana=1.0, cuota_semana_harness=1.0, tickets=[
+                        Ticket(contexto="personal", ref="ticket/3",
+                              detalle="PR #19 abierto (gate verde)",
+                              costo=0.05, cuota=0.0, peldanos=peldanos)])
+        salida = self.pantalla(r)
+        self.assertNotIn("peldaño", salida)
+
     def test_mergeado_y_cerrado_son_grupos_distintos(self):
         """Un PR mergeado y uno cerrado sin mergear son resultados opuestos:
         no pueden compartir línea (ticket #55)."""

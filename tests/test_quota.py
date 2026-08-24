@@ -24,9 +24,9 @@ from pathlib import Path
 import support  # noqa: F401  (pone la raíz en sys.path)
 
 from harness.quota import (PESOS, agregar, as_dict, atribuir, codificar_path,
-                           decodificar_uso, leer_sesiones, parsear_linea,
-                           pico_5h, ponderar, render_quota, resumen_evento,
-                           semana_inicio)
+                           cuota_por_ventana, decodificar_uso, leer_sesiones,
+                           parsear_linea, pico_5h, ponderar, puntos_de_ticket,
+                           render_quota, resumen_evento, semana_de, semana_inicio)
 
 HARNESS = support.ROOT / "bin" / "harness"
 SESIONES = support.FIXTURES / "claude_sessions"
@@ -286,7 +286,8 @@ class TestAgregar(unittest.TestCase):
         self.assertEqual(p["f7league [harness]"],
                          {"harness": True, "input": 600, "cache_creation": 1200,
                           "cache_read": 1800, "output": 2900, "thinking": 250,
-                          "total": 6500, "tickets": {"256": 6500}})
+                          "total": 6500, "tickets": {"256": 6500},
+                          "tickets_ponderado": {"256": 16780.0}})
         self.assertEqual(p["koku"]["harness"], False)
         self.assertEqual(p["koku"]["total"], 1200)
         self.assertEqual(p["otro-lugar"]["total"], 300)
@@ -294,6 +295,32 @@ class TestAgregar(unittest.TestCase):
     def test_harness_vs_resto(self):
         self.assertEqual(self.agg["harness"]["total"], 6500)
         self.assertEqual(self.agg["resto"]["total"], 1500)
+
+    def test_por_semana_cuota(self):
+        """Como `por_semana`, pero ponderado y partido harness/resto: lo que
+        necesita el resumen de la mañana para "cuota de la semana, cuánto es
+        del harness" (ticket #47)."""
+        self.assertEqual(self.agg["por_semana_cuota"], {
+            "2026-08-14T17:00:00-04:00": {"harness": 0.0, "resto": 1190.0},
+            "2026-08-21T17:00:00-04:00": {"harness": 7140.0, "resto": 2380.0},
+            "2026-08-28T17:00:00-04:00": {"harness": 9640.0, "resto": 0.0},
+        })
+        total = sum(v["harness"] + v["resto"]
+                   for v in self.agg["por_semana_cuota"].values())
+        self.assertAlmostEqual(total, self.agg["ponderado"])
+
+    def test_por_dia(self):
+        """La evolución por noche que pide el reporte HTML (ticket #47):
+        fecha calendario en America/Santiago, ponderado, harness/resto."""
+        self.assertEqual(self.agg["por_dia"], {
+            "2026-08-21": {"harness": 0.0, "resto": 2856.0},
+            "2026-08-22": {"harness": 0.0, "resto": 714.0},
+            "2026-08-25": {"harness": 7140.0, "resto": 0.0},
+            "2026-08-28": {"harness": 9640.0, "resto": 0.0},
+        })
+
+    def test_por_dia_vacio_sin_registros(self):
+        self.assertEqual(agregar([], RAIZ)["por_dia"], {})
 
     def test_as_dict_es_serializable(self):
         texto = json.dumps(as_dict(self.agg), sort_keys=True)
@@ -303,6 +330,64 @@ class TestAgregar(unittest.TestCase):
         self.assertEqual(data["pico_5h"]["fable"],
                          [300, "2026-08-22T10:00:00+00:00",
                           "2026-08-22T15:00:00+00:00"])
+
+
+class TestSemanaDe(unittest.TestCase):
+    def setUp(self):
+        self.agg = agregar(leer_sesiones(SESIONES), RAIZ)
+
+    def test_semana_con_mensajes(self):
+        self.assertEqual(semana_de(self.agg, dt("2026-08-25T00:00:00")),
+                         (7140.0, 2380.0))
+
+    def test_semana_sin_mensajes_es_cero(self):
+        self.assertEqual(semana_de(self.agg, dt("2027-01-01T00:00:00")),
+                         (0.0, 0.0))
+
+
+class TestPuntosDeTicket(unittest.TestCase):
+    """Más fino que `agregar` (que sólo suma): un punto por mensaje, para
+    repartir la cuota entre los peldaños de la escalada (ver
+    `harness.state.pasos`, ticket #47)."""
+
+    def setUp(self):
+        self.regs = leer_sesiones(SESIONES)
+
+    def test_los_tres_mensajes_del_ticket(self):
+        pts = puntos_de_ticket(self.regs, RAIZ, "f7league", 256)
+        self.assertEqual([p for _, p in pts], [2380.0, 4760.0, 9640.0])
+        self.assertEqual([t for t, _ in pts],
+                         [dt("2026-08-25T10:00:00"), dt("2026-08-25T12:00:00"),
+                          dt("2026-08-28T22:00:00")])
+
+    def test_proyecto_o_ticket_que_no_matchea_da_vacio(self):
+        self.assertEqual(puntos_de_ticket(self.regs, RAIZ, "f7league", 999), [])
+        self.assertEqual(puntos_de_ticket(self.regs, RAIZ, "otro-proyecto", 256), [])
+
+    def test_un_repo_normal_no_tiene_ticket_nunca(self):
+        self.assertEqual(puntos_de_ticket(self.regs, RAIZ, "koku", 256), [])
+
+
+class TestCuotaPorVentana(unittest.TestCase):
+    def test_suma_lo_que_cae_adentro(self):
+        pts = [(dt("2026-08-25T10:00:00"), 100.0), (dt("2026-08-25T12:00:00"), 200.0),
+               (dt("2026-08-28T22:00:00"), 400.0)]
+        self.assertEqual(cuota_por_ventana(pts, dt("2026-08-25T09:00:00"),
+                                           dt("2026-08-25T13:00:00")), 300.0)
+
+    def test_bordes_inclusive(self):
+        pts = [(dt("2026-08-25T10:00:00"), 100.0)]
+        self.assertEqual(cuota_por_ventana(pts, dt("2026-08-25T10:00:00"),
+                                           dt("2026-08-25T10:00:00")), 100.0)
+
+    def test_sin_borde_no_filtra_por_ese_lado(self):
+        pts = [(dt("2026-08-21T00:00:00"), 10.0), (dt("2026-08-29T00:00:00"), 20.0)]
+        self.assertEqual(cuota_por_ventana(pts, dt("2026-08-25T00:00:00"), None), 20.0)
+        self.assertEqual(cuota_por_ventana(pts, None, dt("2026-08-25T00:00:00")), 10.0)
+        self.assertEqual(cuota_por_ventana(pts, None, None), 30.0)
+
+    def test_vacio(self):
+        self.assertEqual(cuota_por_ventana([], dt("2026-08-25T00:00:00"), None), 0.0)
 
 
 class TestRender(unittest.TestCase):

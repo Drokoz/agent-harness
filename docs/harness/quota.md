@@ -100,6 +100,23 @@ para Tomás o para la próxima corrida de agentes.
 `harness quota --json` devuelve el agregado crudo: `total` (con sus cuatro
 componentes intactos), `ponderado` (el mismo total pesado por `PESOS`),
 `por_modelo` (con `mensajes`), `pico_5h` (total + inicio y fin de la
-ventana), `por_semana` (clave = inicio de semana en ISO con offset SCL),
-`por_proyecto` (claves `[harness]` para los worktrees), `harness`, `resto`,
-`archivos`, `mensajes`.
+ventana), `por_semana` (clave = inicio de semana en ISO con offset SCL, por
+modelo, crudo), `por_semana_cuota` (la misma semana pero ponderada y
+partida `harness`/`resto`), `por_dia` (ponderado, partido `harness`/`resto`,
+clave = fecha calendario en America/Santiago — la "noche" del harness),
+`por_proyecto` (claves `[harness]` para los worktrees, con `tickets` crudo
+y `tickets_ponderado`), `harness`, `resto`, `archivos`, `mensajes`.
+
+## La cuota en `status` y `report` (#47)
+
+`harness status` y `harness report` leen la misma fuente (sin `--projects`:
+siempre `~/.claude/projects`) y cruzan el resultado contra el log de
+eventos para mostrar, del resumen de la mañana: la semana de cuota vigente
+(total y cuánto es del harness), el costo de cada ticket en las dos
+monedas —dólares de OpenRouter y tokens de Claude ponderados— y, si el
+ticket escaló (#38), el desglose por peldaño. `report` además dibuja la
+evolución por noche (`por_dia`) en su propia sección. En modo offline
+(`HARNESS_OFFLINE=1`) no se calcula nada de esto: la pantalla lo nota y
+sigue, no se rompe. La función pura que hace el cruce es
+`harness.summary.con_cuota`; el cableado (leer sesiones, `state.pasos`,
+`quota.puntos_de_ticket`/`cuota_por_ventana`) vive en `bin/harness`.

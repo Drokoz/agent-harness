@@ -60,6 +60,10 @@ def bar(used, total, c, polarity="remaining", width=24):
     return f"{color}{'█' * filled}{c.dim}{'░' * (width - filled)}{c.off}"
 
 
+def _tok(n):
+    return f"{round(n or 0):,}"
+
+
 def _resumen(r, c, out):
     """El resumen de la mañana, arriba de todo: qué pasó desde la última
     vez que se miró, antes de lo accionable."""
@@ -70,6 +74,12 @@ def _resumen(r, c, out):
     desde = f"desde {r.desde}" if r.desde else "desde el principio"
     out("")
     out(f" {c.bold}Resumen{c.off}     {c.dim}{desde}{c.off}")
+    # La cuota de la semana no es del período (ver Resumen.cuota_semana): se
+    # muestra aunque no haya pasado nada más, y no se muestra si no se pudo
+    # calcular (offline, #47) en vez de fingir un dato.
+    if r.cuota_semana is not None:
+        out(f"   cuota de la semana: {_tok(r.cuota_semana)} tokens "
+            f"({_tok(r.cuota_semana_harness)} del harness)")
     if not r.paso_algo:
         out(f"   {c.dim}no pasó nada{c.off}")
         return
@@ -85,6 +95,39 @@ def _resumen(r, c, out):
             out(f"     · {p.repo} #{p.number} {p.title[:60]}")
     if r.costo > 0:
         out(f"   costo del período: ${r.costo:.2f}")
+
+
+def _gasto_ticket(t, c):
+    """El costo de un ticket en las dos monedas (#47): dólares de
+    OpenRouter y tokens de Claude ponderados, cuando hay algo que
+    mostrar. Vacío si el ticket no gastó nada en ninguna de las dos —
+    o si no se cruzó contra la cuota (offline: `cuota` queda en 0.0)."""
+    partes = []
+    if t.costo > 0:
+        partes.append(f"${t.costo:.2f}")
+    if t.cuota > 0:
+        partes.append(f"{_tok(t.cuota)} tok")
+    if not partes:
+        return ""
+    return f"  {c.dim}" + " · ".join(partes) + c.off
+
+
+def _peldanos(t, c, out):
+    """El desglose por peldaño de un ticket escalado (#38, #47): sólo tiene
+    sentido mostrarlo cuando hubo más de un intento — uno solo no "escaló",
+    y repetir el mismo número no agrega nada."""
+    if len(t.peldanos) <= 1:
+        return
+    for p in t.peldanos:
+        partes = []
+        if p.get("costo"):
+            partes.append(f"${p['costo']:.2f}")
+        if p.get("cuota"):
+            partes.append(f"{_tok(p['cuota'])} tok")
+        gasto = " · ".join(partes) if partes else "sin medir"
+        motivo = f" — {p['motivo'][:50]}" if p.get("motivo") else ""
+        out(f"       {c.dim}peldaño {p['attempt']} ({p.get('runner') or '?'}): "
+            f"{gasto}{motivo}{c.off}")
 
 
 def _tickets(tickets, c, out):
@@ -104,7 +147,8 @@ def _tickets(tickets, c, out):
         out(f"   {color}{icono}{c.off} {len(del_estado)} {etiqueta}")
         for t in del_estado:
             marca = "" if t.en_vivo else f" {c.dim}(según el log, sin confirmar){c.off}"
-            out(f"     · {t.contexto} {t.ref}: {t.detalle}{marca}")
+            out(f"     · {t.contexto} {t.ref}: {t.detalle}{marca}{_gasto_ticket(t, c)}")
+            _peldanos(t, c, out)
 
 
 def _budget(b, c, out):

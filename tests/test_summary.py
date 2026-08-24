@@ -17,9 +17,9 @@ from pathlib import Path
 
 import support  # noqa: F401  (pone la raíz en sys.path)
 
-from harness.summary import (PrAbierto, Ticket, construir, filtrar, guardar_marca,
-                             leer_eventos, leer_marca, parse_evento, parse_fecha,
-                             reconciliar, resumir)
+from harness.summary import (PrAbierto, Resumen, Ticket, con_cuota, construir,
+                             filtrar, guardar_marca, leer_eventos, leer_marca,
+                             parse_evento, parse_fecha, reconciliar, resumir)
 
 HARNESS = support.ROOT / "bin" / "harness"
 
@@ -249,6 +249,73 @@ class TestConstruir(unittest.TestCase):
         self.assertTrue(por_numero[20].en_vivo)
 
 
+class TestConCuota(unittest.TestCase):
+    """`con_cuota` (#47): cruza el resumen del período con la cuota
+    (harness.quota) y los peldaños de cada ticket (harness.state) — datos
+    que `construir` no puede calcular solo, así que entran por parámetro."""
+
+    def _resumen(self):
+        return Resumen(estado="ok", desde="2026-08-21T23:00:00Z", tickets=[
+            Ticket(contexto="personal", ref="ticket/3",
+                  detalle="PR #19 abierto (gate verde)",
+                  repo="agent-harness", numero=19),
+            Ticket(contexto="personal", ref="ticket/9",
+                  detalle="PR #20 abierto (gate verde)",
+                  repo="agent-harness", numero=20),
+        ])
+
+    def test_semana_de_cuota(self):
+        r = con_cuota(self._resumen(), cuota_semana=1000.0,
+                      cuota_semana_harness=600.0)
+        self.assertEqual(r.cuota_semana, 1000.0)
+        self.assertEqual(r.cuota_semana_harness, 600.0)
+
+    def test_sin_cuota_queda_en_none(self):
+        r = con_cuota(self._resumen())
+        self.assertIsNone(r.cuota_semana)
+        self.assertIsNone(r.cuota_semana_harness)
+
+    def test_costo_y_cuota_por_ticket(self):
+        """La clave es (repo, ref), no (repo, numero): `numero` es el PR
+        (19, 20 acá), y lo que hace falta para cruzar contra el historial y
+        la cuota es el issue, que sólo `ref` ("ticket/3") trae."""
+        r = con_cuota(self._resumen(),
+                      costos_por_ticket={("agent-harness", "ticket/3"): 0.42},
+                      cuotas_por_ticket={("agent-harness", "ticket/3"): 12345.0})
+        por_ref = {t.ref: t for t in r.tickets}
+        self.assertEqual(por_ref["ticket/3"].costo, 0.42)
+        self.assertEqual(por_ref["ticket/3"].cuota, 12345.0)
+        # El otro ticket, sin entrada en los dicts, se queda con lo que traía.
+        self.assertEqual(por_ref["ticket/9"].costo, 0.0)
+        self.assertEqual(por_ref["ticket/9"].cuota, 0.0)
+
+    def test_peldanos_por_ticket(self):
+        peldanos = [{"attempt": 1, "runner": "pi", "motivo": "gate rojo",
+                    "costo": 0.05, "cuota": None},
+                   {"attempt": 2, "runner": "claude", "motivo": None,
+                    "costo": 0.0, "cuota": 8200.0}]
+        r = con_cuota(self._resumen(),
+                      peldanos_por_ticket={("agent-harness", "ticket/3"): peldanos})
+        por_ref = {t.ref: t for t in r.tickets}
+        self.assertEqual(por_ref["ticket/3"].peldanos, peldanos)
+        self.assertEqual(por_ref["ticket/9"].peldanos, [])
+
+    def test_no_toca_el_original(self):
+        """`con_cuota` devuelve un `Resumen` nuevo: el que se le pasó no
+        se muta (mismo criterio que el resto del módulo, ver `reconciliar`)."""
+        original = self._resumen()
+        con_cuota(original, cuota_semana=1000.0,
+                 costos_por_ticket={("agent-harness", "ticket/3"): 0.42})
+        self.assertIsNone(original.cuota_semana)
+        self.assertEqual(original.tickets[0].costo, 0.0)
+
+    def test_ticket_sin_entrada_no_matchea(self):
+        r = Resumen(estado="ok", tickets=[
+            Ticket(contexto="personal", ref="ticket/3", detalle="PR abierto")])
+        out = con_cuota(r, costos_por_ticket={("otro-repo", "ticket/9"): 99.0})
+        self.assertEqual(out.tickets[0].costo, 0.0)
+
+
 class TestMarca(unittest.TestCase):
     def test_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -285,6 +352,138 @@ def correr_cli(state, *args):
         (Path(cfg) / "config.json").write_text(CONFIG_SIN_REPOS)
         return subprocess.run([str(HARNESS), *args], env=env, capture_output=True,
                               text=True, timeout=60)
+
+
+def evento_run(timestamp, tipo, ref, cuerpo, run_id, ticket=None, attempt=1):
+    """Una línea del esquema nuevo (con `run_id`/`attempt`): hace falta para
+    fabricar una escalada de verdad —dos peldaños, dos `run_id`— en los
+    tests de integración de cuota (#47)."""
+    return json.dumps({"timestamp": timestamp, "contexto": "personal",
+                       "origen": "harness", "run_id": run_id, "ticket": ticket,
+                       "attempt": attempt, "tipo": tipo, "ref": ref,
+                       "cuerpo": cuerpo, "clase": None}, ensure_ascii=False)
+
+
+CONFIG_CUOTA = json.dumps({
+    "default_context": "personal",
+    "contexts": {
+        "personal": {"tracker": {"kind": "github"},
+                     "repos": {"root": "/u/docs", "paths": []},
+                     "autonomy": "frontier",
+                     "budget": {"polarity": "remaining", "provider": "none"},
+                     "run": {"kind": "local"}},
+    },
+})
+
+# El ticket 256 de f7league escaló (#38): un primer intento con pi que
+# murió (gate rojo, $0.05) y uno con claude que cerró sin costo en
+# dólares -gastó cuota, no OpenRouter. Las sesiones de Claude de ese
+# ticket son las de tests/fixtures/claude_sessions (mismo fixture que
+# tests/test_quota.py): 3 mensajes de opus-5, 16.780 tokens ponderados.
+LOG_ESCALADA = [
+    evento_run("2026-08-25T09:00:00Z", "worktree", "ticket/256",
+              "/u/docs/.worktrees/f7league-ticket-256", run_id="r1",
+              ticket="f7league#256", attempt=1),
+    evento_run("2026-08-25T09:01:00Z", "agente", "ticket/256",
+              "f7league-256 (kind pi, pane w1:p1)", run_id="r1",
+              ticket="f7league#256", attempt=1),
+    evento_run("2026-08-25T09:05:00Z", "abandono", "ticket/256",
+              "gate rojo en el worktree: sin PR", run_id="r1",
+              ticket="f7league#256", attempt=1),
+    evento_run("2026-08-25T09:06:00Z", "costo", "ticket/256", "$0.05",
+              run_id="r1", ticket="f7league#256", attempt=1),
+    evento_run("2026-08-25T09:30:00Z", "worktree", "ticket/256",
+              "/u/docs/.worktrees/f7league-ticket-256", run_id="r2",
+              ticket="f7league#256", attempt=2),
+    evento_run("2026-08-25T09:31:00Z", "agente", "ticket/256",
+              "f7league-256 (kind claude, pane w1:p2)", run_id="r2",
+              ticket="f7league#256", attempt=2),
+    evento_run("2026-08-28T22:30:00Z", "pr", "ticket/256",
+              "PR #99 abierto (gate verde)", run_id="r2",
+              ticket="f7league#256", attempt=2),
+]
+
+
+def _instalar_sesiones(home):
+    """Copia el fixture de sesiones de Claude (tests/fixtures/claude_sessions)
+    a `<home>/.claude/projects`, para que `harness status`/`report` (que
+    leen `~/.claude/projects` de verdad) las encuentren."""
+    shutil.copytree(support.FIXTURES / "claude_sessions",
+                    Path(home) / ".claude" / "projects")
+
+
+class TestCuotaEnStatusYReport(unittest.TestCase):
+    """El cableado de la cuota (#47) en `harness status` y `harness
+    report`: la semana, el costo por ticket en las dos monedas, y los
+    peldaños de un ticket escalado. Todo pasa por `bin/harness`, así que
+    esto es lo único que ejercita esa parte del cableado — el resto está
+    en test_quota.py, test_state.py y acá arriba (`TestConCuota`)."""
+
+    def _estado(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(d), True)
+        return d
+
+    def _correr(self, *args):
+        state = self._estado()
+        _instalar_sesiones(state)
+        escribir_log(state / "harness" / "events.jsonl", LOG_ESCALADA)
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("HARNESS_OFFLINE", "HERDR_ENV", "XDG_STATE_HOME")}
+        with tempfile.TemporaryDirectory() as cfg:
+            env.update(HOME=str(state), XDG_STATE_HOME=str(state), HARNESS_CONFIG_DIR=cfg)
+            (Path(cfg) / "config.json").write_text(CONFIG_CUOTA)
+            return subprocess.run([str(HARNESS), *args], env=env,
+                                  capture_output=True, text=True, timeout=120)
+
+    def test_status_muestra_costo_por_ticket_en_las_dos_monedas(self):
+        p = self._correr("status")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("cuota de la semana", p.stdout)
+        self.assertIn("$0.05", p.stdout)
+        self.assertIn("16,780", p.stdout)
+
+    def test_status_muestra_los_dos_peldanos(self):
+        p = self._correr("status")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("peldaño 1 (pi)", p.stdout)
+        self.assertIn("peldaño 2 (claude)", p.stdout)
+
+    def test_json_trae_la_cuota_del_ticket(self):
+        p = self._correr("status", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        data = json.loads(p.stdout)
+        t = data["resumen"]["tickets"][0]
+        self.assertAlmostEqual(t["costo"], 0.05)
+        self.assertAlmostEqual(t["cuota"], 16780.0)
+        self.assertEqual(len(t["peldanos"]), 2)
+        self.assertIsNotNone(data["resumen"]["cuota_semana"])
+
+    def test_report_muestra_la_cuota_y_la_evolucion_por_noche(self):
+        p = self._correr("report")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("Cuota de la semana", p.stdout)
+        self.assertIn("16,780 tok", p.stdout)
+        self.assertIn("2026-08-25", p.stdout)  # evolución por noche
+        self.assertIn("peldaño 1", p.stdout)
+        self.assertIn("peldaño 2", p.stdout)
+
+    def test_offline_no_calcula_cuota(self):
+        """Sin adaptadores no hay de dónde leer sesiones: la pantalla no
+        se rompe, simplemente no muestra la cuota (#47)."""
+        state = self._estado()
+        _instalar_sesiones(state)
+        escribir_log(state / "harness" / "events.jsonl", LOG_ESCALADA)
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("HERDR_ENV", "XDG_STATE_HOME")}
+        with tempfile.TemporaryDirectory() as cfg:
+            env.update(HOME=str(state), XDG_STATE_HOME=str(state),
+                       HARNESS_CONFIG_DIR=cfg, HARNESS_OFFLINE="1")
+            (Path(cfg) / "config.json").write_text(CONFIG_CUOTA)
+            p = subprocess.run([str(HARNESS), "status"], env=env,
+                               capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("cuota de la semana", p.stdout)
 
 
 class TestCLI(unittest.TestCase):
