@@ -211,7 +211,9 @@ class EventLog:
     instancia del log es una corrida: dos tandas sobre el mismo archivo se
     distinguen), `ticket` ("repo#issue"; None en las líneas que no son de
     un ticket) y `attempt` (el intento global del ticket, que el
-    dispatcher numera leyendo el historial antes de despachar).
+    dispatcher numera leyendo el historial antes de despachar). Las
+    líneas `abandono` llevan además `clase` (#37): `infra`, `modelo` o
+    `humano`; None en cualquier otro tipo de línea.
 
     `origen` existe y hoy siempre vale `harness`: es la marca de quién
     escribió la línea, para que un observador futuro no invalide lo escrito.
@@ -224,7 +226,7 @@ class EventLog:
         self.reloj = reloj or _ahora
         self.run_id = run_id or uuid.uuid4().hex[:12]
 
-    def write(self, tipo, ref, cuerpo, ticket=None, attempt=None):
+    def write(self, tipo, ref, cuerpo, ticket=None, attempt=None, clase=None):
         linea = {
             "timestamp": self.reloj(),
             "contexto": self.contexto,
@@ -235,6 +237,7 @@ class EventLog:
             "tipo": tipo,
             "ref": ref,
             "cuerpo": cuerpo,
+            "clase": clase,
         }
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(linea, ensure_ascii=False) + "\n")
@@ -256,6 +259,7 @@ class Job:
     agent: str = ""
     estado: str = "pendiente"   # pendiente | hecho | abandonado
     motivo: str = ""
+    clase_abandono: str = ""   # infra | modelo | humano (#37); "" si no abandono
     costo: float = 0.0
     attempt: int = 1  # el intento global: lo numera el dispatcher con el historial
 
@@ -276,6 +280,8 @@ class DispatchSpec:
     verify_retries: int = 3       # reintentos si el primer prompt se pierde
     verify_wait_s: float = 30.0   # cuánto esperar a que el contexto salga de 0%
     verify_poll_s: float = 2.0
+    infra_retries: int = 2        # reintentos en el acto de un abandono infra (#37)
+    infra_retry_wait_s: float = 2.0
 
 
 class Dispatcher:
@@ -289,13 +295,13 @@ class Dispatcher:
         self.credits = credits or (lambda: None)  # () -> usado (float) | None
         self.dormir = dormir
 
-    def _log(self, job, tipo, ref, cuerpo):
+    def _log(self, job, tipo, ref, cuerpo, clase=None):
         """Evento de un job: además de lo fijo, el ticket ("repo#issue") y
         el intento global, para que el historial sepa qué se intentó y
         cuántas veces."""
         self.log.write(tipo, ref, cuerpo,
                        ticket="{}#{}".format(job.repo, job.issue),
-                       attempt=job.attempt)
+                       attempt=job.attempt, clase=clase)
 
     # ----------------------------------------------------------- nivel corrida
     def dispatch(self, jobs):
@@ -328,13 +334,13 @@ class Dispatcher:
             if not self._worktree_ok(job, ref):
                 pass  # ya se abandono con su motivo
             elif not self._pane(job, ref):
-                self._abandonar(job, ref, "no se pudo crear el pane de herdr")
+                pass  # ya se abandono con su motivo
             elif not self._agente(job, ref):
-                self._abandonar(job, ref, "no arranco el agente")
+                self._abandonar(job, ref, "no arranco el agente", clase="infra")
             elif not self._prompt_verificado(job, ref):
                 self._abandonar(job, ref, "primer prompt perdido: el contexto "
                                           "no salio de 0% en {} intentos".format(
-                                              self.spec.verify_retries))
+                                              self.spec.verify_retries), clase="infra")
             elif self._bloqueado(job, ref):
                 pass  # ya se abandono con su motivo
             elif not self._arbol_limpio(job, ref):
@@ -377,14 +383,18 @@ class Dispatcher:
         return ok
 
     def _worktree_ok(self, job, ref):
-        if self._worktree(job, ref):
+        ok = self._reintentar_infra(job, ref, "no se pudo crear el worktree",
+                                    lambda: self._worktree(job, ref))
+        if ok:
             self._log(job, "worktree", ref, job.worktree)
-            return True
-        self._abandonar(job, ref, "no se pudo crear el worktree")
-        return False
+        return ok
 
     def _pane(self, job, ref):
         """Un pane de herdr con el cwd en el worktree; sin robar el foco."""
+        return self._reintentar_infra(job, ref, "no se pudo crear el pane de herdr",
+                                      lambda: self._pane_intentar(job, ref))
+
+    def _pane_intentar(self, job, ref):
         ok, out = self.run_cmd(["herdr", "pane", "split", "--current",
                                 "--direction", "right", "--cwd", job.worktree,
                                 "--no-focus"], timeout=60)
@@ -473,31 +483,44 @@ class Dispatcher:
 
     def _bloqueado(self, job, ref):
         """Espera a que el agente se asiente. `blocked` = abrió un prompt de
-        aprobación o una pregunta: se abandona, se anota, y el dispatcher
-        sigue con el siguiente; no se queda esperando a un humano que no va
-        a estar."""
+        aprobación o una pregunta: se abandona (humano), se anota, y el
+        dispatcher sigue con el siguiente; no se queda esperando a un
+        humano que no va a estar. Un timeout de espera es que el agente no
+        progresó (watchdog): eso es `modelo`, no infra -- reintentarlo no
+        va a cambiar nada. Pero si el comando de herdr en sí no contesta
+        con nada reconocible (ni un estado, ni "timeout"), eso sí es
+        infra -- un problema del propio herdr, no del agente -- y se
+        reintenta en el acto (#37)."""
         wait_s = self.spec.wait_ms // 1000 + 120
-        # `done` va en la lista porque es donde se asienta claude cuando
-        # termina. Sin él, un agente que ya dejó el PR abierto no matchea
-        # ningún estado y el wait cuelga hasta el timeout —una hora de reloj
-        # por ticket terminado, con la corrida entera haciendo cola detrás.
-        ok, out = self.run_cmd(["herdr", "agent", "wait", job.agent,
-                                "--until", "idle", "--until", "blocked",
-                                "--until", "done",
-                                "--timeout", str(self.spec.wait_ms)],
-                               timeout=wait_s)
-        status = _json_field(out, ("result", "agent", "agent_status"))
-        if status == "blocked":
-            self._abandonar(job, ref, "agente bloqueado (aprobacion o pregunta pendiente)")
-            return True
-        if ok and status:
-            self._log(job, "agente", ref, "se asieto: {}".format(status))
-            return False
-        error = _json_field(out, ("error", "code"))
-        if error == "timeout":
-            self._abandonar(job, ref, "timeout de espera ({} ms)".format(self.spec.wait_ms))
-        else:
-            self._abandonar(job, ref, "fallo al esperar al agente: " + out.strip()[:200])
+        args = ["herdr", "agent", "wait", job.agent,
+                # `done` va en la lista porque es donde se asienta claude
+                # cuando termina. Sin él, un agente que ya dejó el PR
+                # abierto no matchea ningún estado y el wait cuelga hasta
+                # el timeout —una hora de reloj por ticket terminado, con
+                # la corrida entera haciendo cola detrás.
+                "--until", "idle", "--until", "blocked", "--until", "done",
+                "--timeout", str(self.spec.wait_ms)]
+        for intento in range(self.spec.infra_retries + 1):
+            ok, out = self.run_cmd(args, timeout=wait_s)
+            status = _json_field(out, ("result", "agent", "agent_status"))
+            if status == "blocked":
+                self._abandonar(job, ref,
+                                "agente bloqueado (aprobacion o pregunta pendiente)",
+                                clase="humano")
+                return True
+            if ok and status:
+                self._log(job, "agente", ref, "se asieto: {}".format(status))
+                return False
+            error = _json_field(out, ("error", "code"))
+            if error == "timeout":
+                self._abandonar(job, ref,
+                                "timeout de espera ({} ms)".format(self.spec.wait_ms),
+                                clase="modelo")
+                return True
+            if intento < self.spec.infra_retries:
+                self.dormir(self.spec.infra_retry_wait_s)
+        self._abandonar(job, ref, "fallo al esperar al agente: " + out.strip()[:200],
+                        clase="infra")
         return True
 
     def _preparar(self, job, ref):
@@ -530,20 +553,29 @@ class Dispatcher:
 
         El PR contiene la rama, no el árbol de trabajo: cambios sin commitear
         no entran al PR, y un gate verde sobre ellos sería un gate mentiroso
-        adentro del propio dispatcher. Sucio = abandono, sin correr el gate.
+        adentro del propio dispatcher. Sucio = abandono (modelo), sin correr
+        el gate. Que el propio `git status` falle es otra cosa -- infra, no
+        el trabajo del agente -- y se reintenta en el acto (#37).
         """
-        ok, out = self.run_cmd(["git", "-C", job.worktree, "status", "--porcelain"])
-        if ok and not out.strip():
+        salida = []
+
+        def intentar():
+            ok, out = self.run_cmd(["git", "-C", job.worktree, "status", "--porcelain"])
+            salida[:] = [ok, out]
+            return ok
+
+        if not self._reintentar_infra(
+                job, ref,
+                "no se pudo verificar el arbol (git status fallo): sin gate, sin PR",
+                intentar):
+            return False
+        _, out = salida
+        if not out.strip():
             return True
-        detalle = out.strip()[:200] if out and out.strip() else "git status fallo"
-        self._log(job, "gate", ref, "arbol sucio: " + detalle)
-        if ok:
-            self._abandonar(job, ref, "arbol sucio en el worktree: hay cambios "
-                                       "sin commitear que no entran al PR; sin "
-                                       "medicion, sin PR")
-        else:
-            self._abandonar(job, ref, "no se pudo verificar el arbol "
-                                       "(git status fallo): sin gate, sin PR")
+        self._log(job, "gate", ref, "arbol sucio: " + out.strip()[:200])
+        self._abandonar(job, ref, "arbol sucio en el worktree: hay cambios "
+                                   "sin commitear que no entran al PR; sin "
+                                   "medicion, sin PR", clase="modelo")
         return False
 
     def _gate_verde(self, job, ref):
@@ -556,7 +588,7 @@ class Dispatcher:
             self._log(job, "gate", ref, "verde")
             return True
         self._log(job, "gate", ref, "rojo: " + out.strip()[-200:])
-        self._abandonar(job, ref, "gate rojo en el worktree: sin PR")
+        self._abandonar(job, ref, "gate rojo en el worktree: sin PR", clase="modelo")
         return False
 
     def _pr_abierto(self, job, ref):
@@ -577,7 +609,7 @@ class Dispatcher:
                     num = pr.get("number")
                     break
         if num is None:
-            self._abandonar(job, ref, "el agente termino sin PR abierto")
+            self._abandonar(job, ref, "el agente termino sin PR abierto", clase="modelo")
             return
         if not self._pr_mide_el_head(job, ref, num):
             return
@@ -599,17 +631,28 @@ class Dispatcher:
         self._log(job, "gate", ref,
                        "head del PR {} != HEAD de la rama {}".format(oid, head))
         self._abandonar(job, ref, "el head del PR no coincide con el HEAD de la "
-                                   "rama: el gate midio algo que no va en el PR")
+                                   "rama: el gate midio algo que no va en el PR",
+                        clase="modelo")
         return False
 
     def _pr_no_toca_protegido(self, job, ref, num):
         """Un diff que toca el gate, los workflows o la config del runner de
-        tests no se acepta: queda anotado y el ticket se marca para humano."""
-        ok, out = self.run_cmd(["gh", "pr", "view", str(num), "--json", "files",
-                                "-R", job.slug])
-        if not ok or not out:
-            self._abandonar(job, ref, "no se pudieron leer los archivos del PR")
+        tests no se acepta: queda anotado y el ticket se marca para humano
+        (la etiqueta, no la clase: es el agente el que tocó lo protegido).
+        No poder leer los archivos del PR es otra cosa -- un `gh` que no
+        contesta -- y se reintenta en el acto (#37)."""
+        salida = []
+
+        def intentar():
+            ok, out = self.run_cmd(["gh", "pr", "view", str(num), "--json", "files",
+                                    "-R", job.slug])
+            salida[:] = [ok, out]
+            return ok and bool(out)
+
+        if not self._reintentar_infra(
+                job, ref, "no se pudieron leer los archivos del PR", intentar):
             return False
+        _, out = salida
         try:
             files = json.loads(out)
         except ValueError:
@@ -621,7 +664,8 @@ class Dispatcher:
         ruta, que_protege = tocada
         self._log(job, "gate", ref, "el PR toca {} ({})".format(que_protege, ruta))
         self._abandonar(job, ref, "el PR toca {} ({}): no se acepta; el ticket "
-                                   "queda para humano".format(que_protege, ruta))
+                                   "queda para humano".format(que_protege, ruta),
+                        clase="modelo")
         self._marcar_para_humano(job, ref)
         return False
 
@@ -663,10 +707,36 @@ class Dispatcher:
         self._log(job, "limpieza", ref,
                   "{}worktree removido, rama {} quedo".format(cerrado, job.branch))
 
-    def _abandonar(self, job, ref, motivo):
+    def _abandonar(self, job, ref, motivo, clase="modelo"):
+        """Marca el job como abandonado, con su clase (#37): `infra`
+        (worktree, pane, arranque del agente, prompt perdido, timeout de
+        red), `modelo` (gate rojo, sin PR, sin progreso) o `humano`
+        (agente bloqueado en una aprobación o pregunta). Una causa que
+        ningún llamador clasifica cae en `modelo`: el default conservador
+        es el que gasta peldaño de escalada, no el que reintenta gratis.
+        """
         job.estado = "abandonado"
         job.motivo = motivo
-        self._log(job, "abandono", ref, motivo)
+        job.clase_abandono = clase
+        self._log(job, "abandono", ref, motivo, clase=clase)
+
+    def _reintentar_infra(self, job, ref, motivo, intentar):
+        """Reintenta `intentar()` (sin argumentos, devuelve bool) en el
+        acto hasta `spec.infra_retries` veces más antes de rendirse.
+
+        Una falla de infraestructura (worktree, pane, o un comando de
+        herdr/git/gh que no contesta bien) es transitoria y no tiene nada
+        que ver con el trabajo del agente: se reintenta ahí mismo y, si
+        se agota, se abandona clasificado `infra` -- eso es lo que
+        `state.intentos_que_escalan` excluye al contar peldaños.
+        """
+        for intento in range(self.spec.infra_retries + 1):
+            if intentar():
+                return True
+            if intento < self.spec.infra_retries:
+                self.dormir(self.spec.infra_retry_wait_s)
+        self._abandonar(job, ref, motivo, clase="infra")
+        return False
 
 
 # ---------------------------------------------------------------- cosecha
