@@ -137,10 +137,10 @@ class TestTasas(unittest.TestCase):
         t = state.tasas(evs)
         self.assertEqual(t["por_runner"],
                          {"pi": {"exito": 1, "abandono": 1},
-                          "claude": {"exito": 1}})
+                          "claude": {"exito": 1, "abandono": 0}})
         self.assertEqual(t["por_repo"],
                          {"koku": {"exito": 1, "abandono": 1},
-                          "otro": {"exito": 1}})
+                          "otro": {"exito": 1, "abandono": 0}})
 
     def test_linea_vieja_entra_por_runner_no_por_repo(self):
         """Las líneas viejas no traen repo en el ticket: cuentan en
@@ -183,7 +183,8 @@ class TestDuracionMedia(unittest.TestCase):
                "2026-08-22T14:11:00Z", run_id="r1", ticket="otro#9"),
         ]
         self.assertEqual(state.duracion_media(evs, "pi"), 30.0)   # (20+40)/2
-        self.assertEqual(state.duracion_media(evs, "claude"), 10.0)
+        # claude: 14:00 (primer evento) -> 14:11 (pr) = 11 min
+        self.assertEqual(state.duracion_media(evs, "claude"), 11.0)
         self.assertEqual(state.duracion_media(evs, "codex"), 0.0)
 
 

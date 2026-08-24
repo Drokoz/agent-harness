@@ -62,6 +62,7 @@ from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa
 from harness.dispatch import (DispatchSpec, Dispatcher, EventLog, Job, cosechar)  # noqa: E402
 from harness.render import render  # noqa: E402
 from harness.snapshot import as_dict, snapshot  # noqa: E402
+from harness.state import intentos  # noqa: E402
 from harness.summary import (PrAbierto, Resumen, construir, filtrar,  # noqa: E402
                              guardar_marca, as_dict as resumen_as_dict,
                              leer_eventos, leer_marca, parse_fecha)
@@ -218,6 +219,9 @@ def run_main(args, contexts):
                              "herdr (sin HARNESS_OFFLINE, con HERDR_ENV=1)\n")
             return 2
         snap = snapshot(collect([ctx]))
+        # El intento global de cada ticket: cuántas veces quedó intentado en
+        # el historial del log, más uno (ticket #35).
+        eventos_previos = leer_eventos(log_path)
         log = EventLog(log_path, ctx.name)
         jobs = []
         for r in snap.contexts[0].repos:
@@ -229,7 +233,9 @@ def run_main(args, contexts):
                 continue
             for i in r.frontier:
                 jobs.append(Job(repo=r.name, repo_path=r.path, slug=r.slug,
-                                issue=i.number))
+                                issue=i.number,
+                                attempt=intentos(eventos_previos, r.name,
+                                                 i.number) + 1))
         if not jobs:
             sys.stdout.write('harness: "{}": nada en la frontera\n'.format(ctx.name))
             continue
