@@ -280,6 +280,55 @@ class TestRepos(unittest.TestCase):
         self.assertEqual(raw["issues"], issues)
         self.assertTrue(all(i["blocked_by"] is None for i in raw["issues"]))
 
+    def test_collect_repo_readiness_contra_la_rama_por_defecto(self):
+        """El working tree está en una rama de feature sin el gate; main lo
+        tiene. La readiness se mira en main: el repo cuenta como listo (issue
+        #22). Lo que falta de verdad en main sigue faltando."""
+        run = fake_run({
+            "git -C /x/koku branch": (True, "fix/pdp-dynamic-server-usage"),
+            "git -C /x/koku status": (True, ""),
+            "git -C /x/koku remote": (True, "git@github.com:Drokoz/koku.git"),
+            "git -C /x/koku symbolic-ref": (True, "refs/remotes/origin/main"),
+            "git -C /x/koku ls-tree": (True, "CONTEXT.md\nscripts/gate.sh\n"),
+        })
+        with mock.patch.object(adapters, "run", run):
+            raw = adapters.collect_repo(Path("/x/koku"))
+        self.assertEqual(raw["default_branch"], "main")
+        self.assertEqual(raw["readiness_source"], "default-branch")
+        # main tiene gate y contexto, no skills: la tabla deja de mentir.
+        self.assertEqual(raw["exists"],
+                         {"gate": True, "skills": False, "context": True})
+
+    def test_collect_repo_sin_rama_por_defecto_cae_al_working_tree(self):
+        """Sin remote (o sin `origin/HEAD`) no hay rama por defecto que mirar:
+        se cae al working tree y lo marca, en vez de fallar."""
+        run = fake_run({
+            "git -C /x/koku branch": (True, "main"),
+            "git -C /x/koku status": (True, ""),
+        })
+        with mock.patch.object(adapters, "run", run):
+            raw = adapters.collect_repo(Path("/x/koku"))
+        self.assertIsNone(raw["slug"])  # sin remote: como hoy
+        self.assertIsNone(raw["default_branch"])
+        self.assertEqual(raw["readiness_source"], "working-tree")
+        # /x/koku no existe en el disco: el working tree no trae nada.
+        self.assertEqual(raw["exists"],
+                         {"gate": False, "skills": False, "context": False})
+
+    def test_default_branch_of(self):
+        run = fake_run({"git -C /x/koku symbolic-ref": (True, "refs/remotes/origin/main")})
+        with mock.patch.object(adapters, "run", run):
+            self.assertEqual(adapters.default_branch_of(Path("/x/koku")), "main")
+
+    def test_default_branch_of_sin_origin_head(self):
+        with mock.patch.object(adapters, "run", fake_run({})):
+            self.assertIsNone(adapters.default_branch_of(Path("/x/koku")))
+
+    def test_exists_on_default_branch_fallando_es_none(self):
+        """`git ls-tree` falló: None, para que el llamador cae al working tree."""
+        with mock.patch.object(adapters, "run", fake_run({})):
+            self.assertIsNone(adapters.exists_on_default_branch(Path("/x/koku")))
+
     def test_collect_repo_con_dependencias_nativas(self):
         """Si GraphQL contesta, issues salen de ahí y no se llama al REST de issues."""
         g = json.dumps(support.fixture("gh_issue_graphql.json"))

@@ -182,7 +182,15 @@ def _readiness(repos, c, out):
         )
         hint = (f"  {c.dim}falta: {r.missing[0]}{c.off}" if r.missing
                 else f"  {c.grn}listo{c.off}")
-        out(f"   {r.name:<22} {marks}{hint}")
+        # La readiness se mira en la rama por defecto; si el working tree está
+        # en otra rama (o la mirada cayó al working tree), se nota en la línea.
+        nota = ""
+        if r.readiness_source == "default-branch":
+            if r.default_branch and r.branch not in ("?", r.default_branch):
+                nota = f"  {c.dim}(rama: {r.branch}, readiness: {r.default_branch}){c.off}"
+        elif r.default_branch:
+            nota = f"  {c.dim}(readiness: working tree){c.off}"
+        out(f"   {r.name:<22} {marks}{hint}{nota}")
 
 
 def render(snap, quiet=False, color=True, resumen=None):
