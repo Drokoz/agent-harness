@@ -134,10 +134,10 @@ def ruta_protegida(ruta):
     return None
 
 
-def toca_protegido(camios):
+def toca_protegido(cambios):
     """El primer `(ruta, qué_protege)` de la lista de archivos de un diff,
     o None si el diff no toca nada protegido."""
-    for ruta in camios:
+    for ruta in cambios:
         que_protege = ruta_protegida(ruta)
         if que_protege:
             return (ruta, que_protege)
@@ -626,11 +626,20 @@ class Dispatcher:
         return False
 
     def _marcar_para_humano(self, job, ref):
-        """La etiqueta canónica del triage: `ready-for-human`."""
+        """La etiqueta canónica del triage: `ready-for-human`, sacando
+        `ready-for-agent` en la misma llamada.
+
+        Sin esto el ticket sigue en la frontera (`AGENT_LABEL` en
+        `snapshot.py`): la próxima corrida lo vuelve a despachar, el agente
+        vuelve a tocar lo mismo, y se rechaza de nuevo — para siempre,
+        gastando un slot y plata cada vez.
+        """
         if not job.slug:
             return
-        self.run_cmd(["gh", "issue", "edit", str(job.issue), "--add-label",
-                      "ready-for-human", "-R", job.slug])
+        self.run_cmd(["gh", "issue", "edit", str(job.issue),
+                      "--add-label", "ready-for-human",
+                      "--remove-label", "ready-for-agent",
+                      "-R", job.slug])
 
     # --------------------------------------------------------------- limpieza
     def _costo_pane(self, job):

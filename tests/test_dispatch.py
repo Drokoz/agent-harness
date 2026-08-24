@@ -783,7 +783,8 @@ class TestElGateMideLoQueVaEnElPR(unittest.TestCase):
         res, lineas = despachar(m, [job()])
         self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
         self.assertIn("gate.sh", res[0].motivo)
-        (marco,) = m.llamo("gh", "issue", "edit", "--add-label", "ready-for-human")
+        (marco,) = m.llamo("gh", "issue", "edit", "--add-label", "ready-for-human",
+                           "--remove-label", "ready-for-agent")
         self.assertEqual(marco[0][3], "7")
         self.assertNotIn("pr", [l["tipo"] for l in lineas])
 
@@ -792,6 +793,25 @@ class TestElGateMideLoQueVaEnElPR(unittest.TestCase):
             m = Mundo(pr_files=[ruta])
             res, _ = despachar(m, [job()])
             self.assertEqual(res[0].estado, "abandonado", (ruta, res[0].motivo))
+
+    def test_marcar_para_humano_saca_ready_for_agent(self):
+        """`_marcar_para_humano` no sólo agrega `ready-for-human`: tiene que
+        sacar `ready-for-agent` en la misma llamada, o el ticket sigue en la
+        frontera y la próxima corrida lo vuelve a despachar (#52)."""
+        m = Mundo()
+        d = Dispatcher(spec(), log_en(tempfile.mkdtemp()), m.cmd, dormir=m.dormir)
+        j = job()
+
+        d._marcar_para_humano(j, "ticket/7")
+
+        (llamada,) = m.llamo("gh", "issue", "edit")
+        args = llamada[0]
+        self.assertIn("7", args)
+        self.assertIn("Drokoz/koku", args)
+        i_add = args.index("--add-label")
+        self.assertEqual(args[i_add + 1], "ready-for-human")
+        i_remove = args.index("--remove-label")
+        self.assertEqual(args[i_remove + 1], "ready-for-agent")
 
     def test_ruta_protegida(self):
         self.assertEqual(dispatch.ruta_protegida("scripts/gate.sh"), "el gate")
