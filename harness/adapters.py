@@ -147,6 +147,37 @@ def slug_of(path):
     return m.group(1) if m else None
 
 
+def default_branch_of(path):
+    """La rama por defecto del remote: a qué rama apunta `origin/HEAD`.
+
+    `origin/HEAD` es un ref simbólico local que git mantiene con `git fetch`,
+    así que consultarlo no toca la red (como `slug_of`). None cuando no hay
+    remote origin o git nunca supo cuál es la rama por defecto.
+    """
+    ok, out = run(["git", "-C", str(path), "symbolic-ref", "refs/remotes/origin/HEAD"])
+    prefijo = "refs/remotes/origin/"
+    if not ok or not out.startswith(prefijo):
+        return None
+    rama = out[len(prefijo):]
+    return rama or None
+
+
+def exists_on_default_branch(path):
+    """Los archivos de READINESS que están en la rama por defecto del remote.
+
+    Una sola llamada local de git (no toca la red): el árbol completo de
+    `origin/HEAD`. None cuando la rama por defecto no se puede inspeccionar
+    (sin remote, sin `origin/HEAD`, git falló): el llamador cae al working
+    tree en vez de inventar un estado.
+    """
+    ok, out = run(["git", "-C", str(path), "ls-tree", "-r", "--name-only",
+                   "origin/HEAD"])
+    if not ok:
+        return None
+    arbol = set(out.splitlines())
+    return {key: rel in arbol for key, rel, _ in READINESS}
+
+
 def _markdown_files(dirpath):
     """Los .md de una carpeta, ordenados. Carpeta inexistente → []: no todo
     repo documenta decisiones y una vault vacía no es un error de config."""
@@ -273,14 +304,26 @@ def collect_repo(path, tracker="github", offline=False):
     branch = branch if ok else None
     ok, porcelain = run(["git", "-C", str(path), "status", "--porcelain"])
 
+    # La readiness se mira en la rama por defecto, no en el working tree: un
+    # repo parado en una rama de feature anterior al gate no debe decir que
+    # "falta el gate" si la rama por defecto ya lo tiene. Git es local (lo
+    # mismo que `slug_of`): también corre en modo sin adaptadores. Si la rama
+    # por defecto no se puede inspeccionar, cae al working tree y lo marca.
+    default = default_branch_of(path)
+    en_defecto = exists_on_default_branch(path)
+
     raw = {
         "name": path.name,
         "path": str(path),
         "tracker": tracker,
         "slug": slug_of(path),  # git es local: también corre en modo sin adaptadores
         "branch": branch,
+        "default_branch": default,
         "status_porcelain": porcelain if ok else None,
-        "exists": {key: (path / rel).exists() for key, rel, _ in READINESS},
+        "readiness_source": ("default-branch" if en_defecto is not None
+                             else "working-tree"),
+        "exists": en_defecto if en_defecto is not None
+        else {key: (path / rel).exists() for key, rel, _ in READINESS},
         "issues": None,
         "prs": None,
     }

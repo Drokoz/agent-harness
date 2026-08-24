@@ -34,7 +34,7 @@
      1 sin triage
 
  Listo para el harness   gate  skills  context
-   agent-harness          ✓   ✓   ✓  listo
+   agent-harness          ✓   ✓   ✓  listo  (rama: ticket/3, readiness: main)
    koku                   ✓   ·   ·  falta: /setup-matt-pocock-skills corrido
    sin-remote             ·   ·   ·  falta: el gate: única fuente de verdad de 'esto mergea'
 
@@ -45,5 +45,5 @@
    tracker jira: todavía sin adaptador, no hay tickets que mostrar
 
  Listo para el harness   gate  skills  context
-   groceries-wl           ✓   ·   ✓  falta: /setup-matt-pocock-skills corrido
+   groceries-wl           ✓   ·   ✓  falta: /setup-matt-pocock-skills corrido  (rama: develop, readiness: main)
 

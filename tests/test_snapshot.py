@@ -196,6 +196,51 @@ class TestFronteraNativa(unittest.TestCase):
         self.assertIsNone(r.frontier_source)
 
 
+class TestReadinessRamaPorDefecto(unittest.TestCase):
+    """El caso del issue #22: el working tree está parado en una rama de
+    feature y la tabla no debe mentir. La readiness se mira contra la rama
+    por defecto (lo que trae `exists`), y el snapshot respeta de dónde salió."""
+
+    def repo(self, **over):
+        return snapshot(raw(repos=[repo_raw(**over)])).contexts[0].repos[0]
+
+    def test_en_rama_de_feature_y_listo_en_la_por_defecto(self):
+        """Repo en rama de feature sin los archivos en el working tree, pero
+        con todo en la rama por defecto: cuenta como listo."""
+        r = self.repo(branch="fix/pdp-dynamic-server-usage", default_branch="main",
+                      readiness_source="default-branch")
+        self.assertTrue(all(r.ready.values()))
+        self.assertEqual(r.missing, [])
+        self.assertEqual((r.default_branch, r.readiness_source), ("main", "default-branch"))
+
+    def test_lo_que_falla_en_la_por_defecto_sigue_faltando(self):
+        r = self.repo(default_branch="main", readiness_source="default-branch",
+                      exists={"gate": False, "skills": True, "context": True})
+        self.assertFalse(r.ready["gate"])
+        self.assertEqual(r.missing, [READINESS[0][2]])
+
+    def test_fallback_al_working_tree_se_mantiene(self):
+        r = self.repo(default_branch="main", readiness_source="working-tree",
+                      exists={"gate": True, "skills": False, "context": False})
+        self.assertEqual((r.default_branch, r.readiness_source), ("main", "working-tree"))
+        self.assertEqual(r.ready, {"gate": True, "skills": False, "context": False})
+
+    def test_crudo_sin_las_claves_nuevas_funciona(self):
+        """Atrás: un crudo viejo sin `default_branch`/`readiness_source".
+        no rompe y se lee como working tree, que es cómo se hacía antes."""
+        r = self.repo()
+        self.assertIsNone(r.default_branch)
+        self.assertEqual(r.readiness_source, "working-tree")
+
+    def test_json_trae_las_claves_nuevas(self):
+        data = as_dict(snapshot(raw(repos=[repo_raw(default_branch="main",
+                                                  readiness_source="default-branch")])))
+        repo = data["contexts"][0]["repos"][0]
+        self.assertEqual(repo["default_branch"], "main")
+        self.assertEqual(repo["readiness_source"], "default-branch")
+        self.assertEqual(data["version"], SCHEMA_VERSION)
+
+
 class TestRepos(unittest.TestCase):
     def test_repo_sin_remote_no_rompe(self):
         """Sin slug no hay issues que traer, pero el repo sigue en la tabla."""
@@ -381,6 +426,7 @@ class TestJson(unittest.TestCase):
         self.assertEqual(data["version"], SCHEMA_VERSION)
         self.assertEqual([c["name"] for c in data["contexts"]], ["personal", "trabajo"])
         self.assertIn("frontier", texto)
+        self.assertIn("readiness_source", texto)
         self.assertEqual(data["contexts"][1]["budget"]["polarity"], "spent")
         self.assertEqual(data["agents"]["state"], "ok")
 

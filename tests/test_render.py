@@ -47,6 +47,38 @@ class TestGolden(unittest.TestCase):
         self.assertEqual(render(SNAP, color=False), render(SNAP, color=False))
 
 
+class TestReadinessRamaPorDefecto(unittest.TestCase):
+    """El working tree en una rama distinta a la por defecto se nota en la
+    tabla de readiness, y el fallback al working tree también."""
+
+    def linea(self, **over):
+        """La línea de readiness de agent-harness (en el golden, ticket/3)."""
+        crudo = support.golden_raw("personal")
+        crudo["contexts"][0]["repos"][0].update(over)
+        for l in render(snapshot(crudo), color=False).splitlines():
+            if l.startswith("   agent-harness ") and "✓" in l:
+                return l
+        self.fail("falta la línea de readiness de agent-harness")
+
+    def test_rama_distinta_de_la_por_defecto_se_nota(self):
+        linea = self.linea(default_branch="main", readiness_source="default-branch")
+        self.assertIn("(rama: ticket/3, readiness: main)", linea)
+
+    def test_en_la_rama_por_defecto_no_hay_nota(self):
+        linea = self.linea(branch="main", default_branch="main",
+                           readiness_source="default-branch")
+        self.assertNotIn("readiness:", linea)
+
+    def test_fallback_al_working_tree_se_nota(self):
+        linea = self.linea(default_branch="main", readiness_source="working-tree")
+        self.assertIn("(readiness: working tree)", linea)
+
+    def test_sin_rama_por_defecto_no_hay_nota(self):
+        """Repo sin remote: sigue funcionando como hoy, sin anotaciones."""
+        linea = self.linea(default_branch=None, readiness_source="working-tree")
+        self.assertNotIn("readiness", linea)
+
+
 class TestResumen(unittest.TestCase):
     """El resumen de la mañana (ticket #7): arriba de todo, con lo accionable abajo."""
 

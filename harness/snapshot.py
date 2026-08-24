@@ -36,8 +36,11 @@ La forma de `raw` (ver `harness.adapters.collect`):
               "tracker": str,
               "slug": str | None,              # None = repo sin remote de GitHub
               "branch": str | None,
+              "default_branch": str | None,    # a qué rama apunta origin/HEAD; None =
+                                               # sin remote o sin origin/HEAD
               "status_porcelain": str | None,  # salida cruda de git status --porcelain
-              "exists": {clave_de_READINESS: bool},
+              "readiness_source": "default-branch" | "working-tree",
+              "exists": {clave_de_READINESS: bool},  # según readiness_source
               # Issue: {"number": int, "title": str, "body": str,
               #         "labels": [{"name": str}],
               #         "blocked_by": int | None}  # bloqueantes abiertos según las
@@ -60,7 +63,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import PurePosixPath
 from typing import Dict, List, Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 AGENT_LABEL = "ready-for-agent"
 TRIAGE_LABEL = "needs-triage"
@@ -131,6 +134,8 @@ class Repo:
     branch: str
     dirty: int
     ready: Dict[str, bool]
+    default_branch: Optional[str] = None  # la rama que mira `ready`; None = no se pudo
+    readiness_source: str = "working-tree"  # "default-branch" | "working-tree"
     missing: List[str] = field(default_factory=list)
     frontier: List[Issue] = field(default_factory=list)
     blocked: List[Issue] = field(default_factory=list)
@@ -284,6 +289,8 @@ def _repo(raw, offline=False):
         path=raw.get("path", ""),
         dirty=dirty,
         ready=ready,
+        default_branch=raw.get("default_branch"),
+        readiness_source=raw.get("readiness_source", "working-tree"),
         missing=[desc for key, _, desc in READINESS if not ready[key]],
     )
     if offline or repo.tracker != "github" or not repo.slug:
