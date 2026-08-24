@@ -136,6 +136,39 @@ class TestResumen(unittest.TestCase):
         self.assertIn(OFFLINE_HINT, salida)
 
 
+class TestEstadoFrontera(unittest.TestCase):
+    """El ticket #43: la línea de cada ticket de la frontera muestra su estado."""
+
+    def test_la_frontera_del_golden_tiene_pr_abierto(self):
+        """koku #7 tiene un PR abierto sobre ticket/7 (la fixture lo trae)."""
+        koku = SNAP.contexts[0].repos[1]
+        self.assertEqual([(i.number, i.estado) for i in koku.frontier],
+                         [(7, "pr-abierto"), (9, "libre")])
+        ah = SNAP.contexts[0].repos[0]
+        self.assertEqual([i.estado for i in ah.frontier],
+                         ["libre", "libre", "libre", "libre"])
+
+    def test_el_estado_sale_en_la_linea(self):
+        lineas = render(SNAP, color=False).splitlines()
+        self.assertTrue(any("#7 Cerrar caja del dia sin doble conteo  pr-abierto" in l
+                            for l in lineas))
+        self.assertTrue(any("#9 Exportar a CSV  libre" in l for l in lineas))
+
+    def test_despachado_tambien_se_ve(self):
+        crudo = support.golden_raw("personal")
+        crudo["eventos"] = [{"timestamp": "2026-08-24T02:00:00Z",
+                             "contexto": "personal", "origen": "harness",
+                             "run_id": "r1", "ticket": "koku#9", "attempt": 1,
+                             "tipo": "agente", "ref": "ticket/9",
+                             "cuerpo": "koku-9 (kind pi, pane w9:p2)"}]
+        crudo["agents"] = [{"cwd": "/x/.worktrees/koku-ticket-9"}]
+        for l in render(snapshot(crudo), color=False).splitlines():
+            if "#9 Exportar a CSV" in l:
+                self.assertIn("despachado", l)
+                return
+        self.fail("falta la línea de #9")
+
+
 class TestColor(unittest.TestCase):
     def test_sin_color_no_hay_escapes(self):
         """Cuando la salida no es un TTY el CLI pasa color=False."""

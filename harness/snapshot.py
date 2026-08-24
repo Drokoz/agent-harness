@@ -17,6 +17,9 @@ La forma de `raw` (ver `harness.adapters.collect`):
     {
       "offline": bool,
       "agents": [ {...} ] | None,          # None = no hay sesión de herdr
+      "eventos": [ {...} ] | None,          # log de eventos del dispatcher
+                                               # (harness.summary.leer_eventos);
+                                               # da el estado `despachado`
       "contexts": [
         {
           "name": str,
@@ -49,6 +52,8 @@ La forma de `raw` (ver `harness.adapters.collect`):
               #                                     # se parsea el body (fallback)
               "issues": [ {...} ] | None,      # None = gh no contestó
               "prs": [ {...} ] | None,
+              "prs_merged": [ {...} ] | None,  # PRs merged recientes (headRefName);
+                                               # da el estado `mergeado`
             },
           ],
         },
@@ -63,7 +68,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import PurePosixPath
 from typing import Dict, List, Optional
 
-SCHEMA_VERSION = 2
+from harness.state import agente_vivo, despachado, estado_frontier, rama_de
+
+SCHEMA_VERSION = 3
 
 AGENT_LABEL = "ready-for-agent"
 TRIAGE_LABEL = "needs-triage"
@@ -117,6 +124,10 @@ class Agents:
 class Issue:
     number: int
     title: str
+    # Estado de la frontera (ticket #43): libre | despachado | pr-abierto |
+    # mergeado | parkeado. Sólo lo llevan los de la frontera; bloqueados y
+    # triage lo dejan en None.
+    estado: Optional[str] = None
 
 
 @dataclass
@@ -240,15 +251,20 @@ def _agents(raw, offline):
     return Agents(state="ok", items=items)
 
 
-def _issues(raw):
-    """Parte los issues en frontera, bloqueados y sin triage.
+def _issues(raw, prs, prs_merged, eventos, agentes, repo):
+    """Parte los issues en frontera, bloqueados y sin triage, y le da a cada
+    issue de la frontera su estado (ticket #43).
 
     Un issue está bloqueado sólo si le quedan bloqueantes abiertos. La fuente de
     verdad son las dependencias nativas de GitHub (`blocked_by`: bloqueantes
     abiertos, lo que ve la UI); el parseo del body (`blockers_of`) queda como
-    fallback para los issues sin datos nativos.
+    fallback para los issues sin datos nativos. El estado sale de
+    `harness.state.estado_frontier`: PR abierto o merged sobre `ticket/<n>`,
+    etiquetas de parking, y el log de eventos más los agentes vivos.
     """
     open_nums = {i["number"] for i in raw}
+    abiertas = {p.get("headRefName") for p in (prs or [])}
+    merged = {p.get("headRefName") for p in (prs_merged or [])}
     frontier, blocked, triage = [], [], []
     for i in raw:
         labels = {l["name"] for l in i.get("labels", [])}
@@ -257,12 +273,22 @@ def _issues(raw):
             triage.append(issue)
         if AGENT_LABEL not in labels:
             continue
+        rama = rama_de(i["number"])
         blocked_by = i.get("blocked_by")
         if blocked_by is not None:
             es_bloqueado = int(blocked_by) > 0
         else:
             es_bloqueado = bool(blockers_of(i.get("body")) & open_nums)
-        (blocked if es_bloqueado else frontier).append(issue)
+        if es_bloqueado:
+            blocked.append(issue)
+            continue
+        issue.estado = estado_frontier(
+            labels,
+            despachado(eventos, repo, i["number"]),
+            agente_vivo(agentes, repo, i["number"]),
+            rama in abiertas,
+            rama in merged)
+        frontier.append(issue)
     return frontier, blocked, triage
 
 
@@ -276,7 +302,7 @@ def _issues_source(issues):
     return "body"
 
 
-def _repo(raw, offline=False):
+def _repo(raw, offline=False, eventos=None, agentes=None):
     porcelain = raw.get("status_porcelain")
     dirty = len([l for l in porcelain.splitlines() if l.strip()]) if porcelain else 0
     ready = {key: bool(raw.get("exists", {}).get(key)) for key, _, _ in READINESS}
@@ -303,7 +329,8 @@ def _repo(raw, offline=False):
     if issues is None:
         repo.degraded.append("issues")
     else:
-        repo.frontier, repo.blocked, repo.triage = _issues(issues)
+        repo.frontier, repo.blocked, repo.triage = _issues(
+            issues, prs, raw.get("prs_merged"), eventos, agentes, repo.name)
         repo.frontier_source = _issues_source(issues)
     if prs is None:
         repo.degraded.append("prs")
@@ -315,7 +342,7 @@ def _repo(raw, offline=False):
     return repo
 
 
-def _context(raw, offline):
+def _context(raw, offline, eventos, agentes):
     return Context(
         name=raw.get("name", "?"),
         tracker=raw.get("tracker", "github"),
@@ -323,17 +350,21 @@ def _context(raw, offline):
         run=raw.get("run", "?"),
         vault=raw.get("vault"),
         budget=_budget(raw.get("budget"), offline),
-        repos=[_repo(r, offline) for r in raw.get("repos", [])],
+        repos=[_repo(r, offline, eventos, agentes)
+               for r in raw.get("repos", [])],
     )
 
 
 def snapshot(raw):
     """Todo el estado, en una estructura que sólo hay que dibujar."""
     offline = bool(raw.get("offline"))
+    eventos = raw.get("eventos")
+    agentes = raw.get("agents")
     return Snapshot(
         offline=offline,
-        agents=_agents(raw.get("agents"), offline),
-        contexts=[_context(c, offline) for c in raw.get("contexts", [])],
+        agents=_agents(agentes, offline),
+        contexts=[_context(c, offline, eventos, agentes)
+                  for c in raw.get("contexts", [])],
     )
 
 

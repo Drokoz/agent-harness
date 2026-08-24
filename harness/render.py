@@ -20,6 +20,11 @@ MAX_FRONTIER = 5
 MAX_BLOCKED = 3
 MAX_PRS = 5
 
+# De qué color se dibuja cada estado de la frontera (ticket #43): lo que se
+# puede tomar está en verde; lo que ya está en manos de alguien, en su color.
+ESTADO_COLOR = {"libre": "grn", "despachado": "cya", "pr-abierto": "yel",
+                "mergeado": "grn", "parkeado": "dim"}
+
 OFFLINE_HINT = "sin adaptadores (HARNESS_OFFLINE=1)"
 PROVIDERS = {"openrouter": "OpenRouter", "manual": "Presupuesto", "none": "Presupuesto"}
 
@@ -149,7 +154,9 @@ def _work(ctx, c, out):
                "body": " (frontera: parseo del body)"}.get(r.frontier_source, "")
         out(f"   {c.bold}{r.name}{c.off} {c.dim}{r.branch}{dirty}{src}{c.off}")
         for i in r.frontier[:MAX_FRONTIER]:
-            out(f"     {c.grn}▸{c.off} #{i.number} {i.title[:64]}")
+            esc = getattr(c, ESTADO_COLOR.get(i.estado, ""), "")
+            out(f"     {c.grn}▸{c.off} #{i.number} {i.title[:44]}  "
+                f"{esc}{i.estado or 'libre'}{c.off}")
         if len(r.frontier) > MAX_FRONTIER:
             out(f"     {c.dim}… y {len(r.frontier) - MAX_FRONTIER} más "
                 f"en la frontera{c.off}")

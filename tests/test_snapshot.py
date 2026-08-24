@@ -196,6 +196,78 @@ class TestFronteraNativa(unittest.TestCase):
         self.assertIsNone(r.frontier_source)
 
 
+class TestEstadoFrontera(unittest.TestCase):
+    """El ticket #43: cada issue de la frontera tiene estado (libre,
+    despachado, pr-abierto, mergeado, parkeado), y sólo los libres se despachan."""
+
+    def repo(self, issues, prs=None, merged=None, agentes=None, eventos=None):
+        crudo = raw(agents=agentes, repos=[repo_raw(issues=issues, prs=prs or [])])
+        r = crudo["contexts"][0]["repos"][0]
+        if merged is not None:
+            r["prs_merged"] = merged
+        if eventos is not None:
+            crudo["eventos"] = eventos
+        return snapshot(crudo).contexts[0].repos[0]
+
+    def ev(self, tipo, run_id="r1", cuerpo="koku-7 (kind pi, pane w9:p1)"):
+        return {"timestamp": "2026-08-24T02:00:00Z", "contexto": "personal",
+                "origen": "harness", "run_id": run_id, "ticket": "koku#7",
+                "attempt": 1, "tipo": tipo, "ref": "ticket/7", "cuerpo": cuerpo}
+
+    def prs(self, rama, num=21):
+        return [{"number": num, "title": "t", "isDraft": False, "headRefName": rama}]
+
+    def estados(self, r):
+        return [(i.number, i.estado) for i in r.frontier]
+
+    def test_libre_sin_pr_ni_log(self):
+        self.assertEqual(self.estados(self.repo([issue(7)])), [(7, "libre")])
+
+    def test_pr_abierto_sobre_su_rama(self):
+        r = self.repo([issue(7)], prs=self.prs("ticket/7"))
+        self.assertEqual(self.estados(r), [(7, "pr-abierto")])
+
+    def test_pr_de_otra_rama_no_cuenta(self):
+        r = self.repo([issue(7)], prs=self.prs("ticket/9"))
+        self.assertEqual(self.estados(r), [(7, "libre")])
+
+    def test_pr_merged_sobre_su_rama(self):
+        r = self.repo([issue(7)], merged=[{"number": 5, "headRefName": "ticket/7"}])
+        self.assertEqual(self.estados(r), [(7, "mergeado")])
+
+    def test_despachado_con_agente_vivo(self):
+        agente = {"cwd": "/x/.worktrees/koku-ticket-7", "agent_status": "working"}
+        r = self.repo([issue(7)], agentes=[agente], eventos=[self.ev("agente")])
+        self.assertEqual(self.estados(r), [(7, "despachado")])
+
+    def test_corrida_muerta_vuelve_a_libre(self):
+        """Despacho de una corrida anterior, sin PR y sin agente vivo: no colga."""
+        r = self.repo([issue(7)], eventos=[self.ev("agente", run_id="r-anoche")])
+        self.assertEqual(self.estados(r), [(7, "libre")])
+
+    def test_parkeado_por_ready_for_human(self):
+        r = self.repo([issue(7, labels=("ready-for-agent", "ready-for-human"))])
+        self.assertEqual(self.estados(r), [(7, "parkeado")])
+
+    def test_parkeado_gana_al_pr_abierto(self):
+        r = self.repo([issue(7, labels=("ready-for-agent", "ready-for-human"))],
+                      prs=self.prs("ticket/7"))
+        self.assertEqual(self.estados(r), [(7, "parkeado")])
+
+    def test_bloqueados_y_triage_no_llevan_estado(self):
+        r = self.repo([issue(1), issue(2, body="Blocked by #1"),
+                       issue(3, labels=("needs-triage",))])
+        self.assertEqual(r.blocked[0].estado, None)
+        self.assertEqual(r.triage[0].estado, None)
+
+    def test_json_trae_el_estado(self):
+        crudo = raw(repos=[repo_raw(issues=[issue(7)], prs=self.prs("ticket/7"))])
+        data = as_dict(snapshot(crudo))
+        self.assertEqual(data["contexts"][0]["repos"][0]["frontier"][0]["estado"],
+                         "pr-abierto")
+        self.assertEqual(data["version"], SCHEMA_VERSION)
+
+
 class TestReadinessRamaPorDefecto(unittest.TestCase):
     """El caso del issue #22: el working tree está parado en una rama de
     feature y la tabla no debe mentir. La readiness se mira contra la rama

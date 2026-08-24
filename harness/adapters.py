@@ -326,6 +326,7 @@ def collect_repo(path, tracker="github", offline=False):
         else {key: (path / rel).exists() for key, rel, _ in READINESS},
         "issues": None,
         "prs": None,
+        "prs_merged": None,
     }
     if offline or tracker != "github" or not raw["slug"]:
         return raw
@@ -339,6 +340,11 @@ def collect_repo(path, tracker="github", offline=False):
         raw["issues"] = normalize_issues(rest) if rest is not None else None
     raw["prs"] = gh_json(raw["slug"], ["pr", "list", "--state", "open", "--limit", "50",
                                        "--json", "number,title,isDraft,headRefName"])
+    # Los merged recientes dan el estado `mergeado` de la frontera (ticket #43):
+    # un PR merged sobre `ticket/<n>` con el issue aún abierto no se re-trabaja.
+    raw["prs_merged"] = gh_json(raw["slug"], ["pr", "list", "--state", "merged",
+                                              "--limit", "20",
+                                              "--json", "number,headRefName"])
     return raw
 
 
