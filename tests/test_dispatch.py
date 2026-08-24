@@ -162,6 +162,17 @@ class TestPuros(unittest.TestCase):
         self.assertIn("./scripts/gate.sh", p)
         self.assertIn("never merge", p)
 
+    def test_prompt_exige_commitear_y_empujar(self):
+        """Cinco de seis tickets de la tanda del 2026-08-24 se abandonaron con
+        cero commits en la rama: el prompt presentaba el PR como condicional
+        ("open the PR only if...") y nunca decia que commitear era obligatorio.
+        El trabajo sin commitear no entra al PR y la limpieza lo borra."""
+        p = prompt_de(7)
+        self.assertIn("commit", p)
+        self.assertIn("push", p)
+        # Que quede dicho que no terminar asi es un fracaso, no una opcion.
+        self.assertIn("discarded", p)
+
     def test_nombre_agente_es_valido_y_distingue(self):
         for n in (nombre_agente("koku", 7), nombre_agente("ERP-IphoneUp", 7),
                   nombre_agente("entrevestidos-ventas", 12345)):
