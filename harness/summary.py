@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -27,14 +27,30 @@ from typing import Callable, List, Optional
 # se suma: mide el mismo gasto por otra vía y sumar ambos lo contaría dos veces.
 COSTO_JOB_RE = re.compile(r"^\$(\d+(?:\.\d+)?)$")
 
+# El PR de un evento "pr" viene en el cuerpo: "PR #19 abierto (gate verde)".
+PR_NUM_RE = re.compile(r"PR #(\d+)")
+
+# El estado en vivo de `gh pr view` (OPEN/MERGED/CLOSED) a como se muestra.
+ESTADOS_VIVOS = {"OPEN": "abierto", "MERGED": "mergeado", "CLOSED": "cerrado"}
+
 
 @dataclass
 class Ticket:
-    """Un ticket cuyo trabajo quedó hecho: el dispatcher lo anota como `pr`."""
+    """Un ticket cuyo trabajo quedó hecho: el dispatcher lo anota como `pr`.
+
+    `estado` es lo que dice el log al momento de escribirlo: siempre
+    "abierto", porque el merge es humano y no deja evento. `reconciliar` lo
+    corrige contra GitHub cuando puede; `en_vivo` distingue esa corrección
+    de lo que el log todavía cree.
+    """
 
     contexto: str
     ref: str
     detalle: str
+    repo: Optional[str] = None
+    numero: Optional[int] = None
+    estado: str = "abierto"
+    en_vivo: bool = False
 
 
 @dataclass
@@ -135,6 +151,15 @@ def filtrar(eventos, desde):
     return out
 
 
+def _ticket_repo(e):
+    """El repo de un evento, del campo `ticket` ("repo#issue"). None cuando
+    el evento no lo trae (líneas viejas, u otro tipo de evento)."""
+    ticket = e.get("ticket")
+    if not isinstance(ticket, str) or "#" not in ticket:
+        return None
+    return ticket.rsplit("#", 1)[0] or None
+
+
 def resumir(eventos):
     """(tickets, trabados, costo) de un período ya filtrado.
 
@@ -148,7 +173,10 @@ def resumir(eventos):
         tipo, ref = e.get("tipo"), e.get("ref", "?")
         ctx, cuerpo = e.get("contexto", "?"), str(e.get("cuerpo", ""))
         if tipo == "pr":
-            tickets.append(Ticket(contexto=ctx, ref=ref, detalle=cuerpo))
+            m = PR_NUM_RE.search(cuerpo)
+            numero = int(m.group(1)) if m else None
+            tickets.append(Ticket(contexto=ctx, ref=ref, detalle=cuerpo,
+                                  repo=_ticket_repo(e), numero=numero))
         elif tipo == "abandono":
             trabados.append(Trabado(contexto=ctx, ref=ref, motivo=cuerpo))
         elif tipo == "costo":
@@ -158,9 +186,34 @@ def resumir(eventos):
     return tickets, trabados, costo
 
 
-def construir(eventos, prs, estado="ok", desde=None, hasta=None):
-    """El `Resumen` de un período ya filtrado, con los PRs abiertos en vivo."""
+def reconciliar(tickets, resolver):
+    """Los tickets con su estado en vivo, cuando se puede consultar.
+
+    `resolver(repo, numero)` es la única frontera de red: devuelve
+    OPEN/MERGED/CLOSED, o None cuando no se pudo (sin red, sin repo o número
+    en el evento, PR inexistente). Sin resultado el ticket se queda con lo
+    que dice el log —abierto, `en_vivo=False`— en vez de romper el resumen.
+    """
+    out = []
+    for t in tickets:
+        vivo = resolver(t.repo, t.numero) if t.repo and t.numero is not None else None
+        if vivo in ESTADOS_VIVOS:
+            out.append(replace(t, estado=ESTADOS_VIVOS[vivo], en_vivo=True))
+        else:
+            out.append(t)
+    return out
+
+
+def construir(eventos, prs, estado="ok", desde=None, hasta=None, resolver_pr=None):
+    """El `Resumen` de un período ya filtrado, con los PRs abiertos en vivo.
+
+    `resolver_pr`, si se pasa, reconcilia cada ticket contra su estado real
+    (ver `reconciliar`): el merge es humano y no deja evento, así que sin
+    esto un PR mergeado se sigue mostrando como recién abierto.
+    """
     tickets, trabados, costo = resumir(eventos)
+    if resolver_pr is not None:
+        tickets = reconciliar(tickets, resolver_pr)
     return Resumen(estado=estado, desde=desde, hasta=hasta,
                    tickets=tickets, trabados=trabados, prs=list(prs), costo=costo)
 

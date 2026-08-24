@@ -74,9 +74,7 @@ def _resumen(r, c, out):
         out(f"   {c.dim}no pasó nada{c.off}")
         return
     if r.tickets:
-        out(f"   {c.grn}✓{c.off} {len(r.tickets)} tickets con PR abierto (gate verde)")
-        for t in r.tickets:
-            out(f"     · {t.contexto} {t.ref}: {t.detalle}")
+        _tickets(r.tickets, c, out)
     if r.trabados:
         out(f"   {c.red}⊘{c.off} {len(r.trabados)} trabado(s)")
         for t in r.trabados:
@@ -87,6 +85,26 @@ def _resumen(r, c, out):
             out(f"     · {p.repo} #{p.number} {p.title[:60]}")
     if r.costo > 0:
         out(f"   costo del período: ${r.costo:.2f}")
+
+
+def _tickets(tickets, c, out):
+    """Los tickets del período, agrupados por el estado en vivo del PR: el
+    merge es humano y no deja evento, así que "abierto" es sólo lo que decía
+    el log en su momento. Un ticket sin reconciliar (sin red, sin slug) se
+    marca como tal en vez de fingir que se confirmó."""
+    grupos = (
+        ("mergeado", c.grn, "✓", "tickets mergeados"),
+        ("abierto", c.yel, "◌", "tickets con PR abierto (gate verde)"),
+        ("cerrado", c.red, "✗", "tickets cerrados sin mergear"),
+    )
+    for estado, color, icono, etiqueta in grupos:
+        del_estado = [t for t in tickets if t.estado == estado]
+        if not del_estado:
+            continue
+        out(f"   {color}{icono}{c.off} {len(del_estado)} {etiqueta}")
+        for t in del_estado:
+            marca = "" if t.en_vivo else f" {c.dim}(según el log, sin confirmar){c.off}"
+            out(f"     · {t.contexto} {t.ref}: {t.detalle}{marca}")
 
 
 def _budget(b, c, out):
