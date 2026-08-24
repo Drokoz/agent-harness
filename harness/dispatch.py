@@ -104,6 +104,45 @@ def comando_de_instalacion(archivos):
     return None
 
 
+# Un diff que toca estas rutas no es trabajo del ticket, es trabajo de la red:
+# un agente trabado puede hacer verde el gate editándolo. Prefijos de nombre
+# de config del runner de tests (jest.config.js/ts/mjs, .mocharc.yml, etc.).
+CONFIG_RUNNER_TESTS = (
+    "jest.config", "vitest.config", ".mocharc", "mocha.opts",
+    "karma.conf", "pytest.ini", ".pytest.ini", "phpunit.xml",
+)
+
+
+def ruta_protegida(ruta):
+    """Qué protege esta ruta del diff de un PR, o None si no protege nada.
+
+    El gate, los workflows que pueden rodearlo, y la config del runner de
+    tests: con ella se cambia qué corren los tests sin que el cambio se vea
+    como código en el diff.
+    """
+    ruta = (ruta or "").strip()
+    if not ruta:
+        return None
+    if ruta == "scripts/gate.sh":
+        return "el gate"
+    if ruta.startswith(".github/workflows/"):
+        return "los workflows"
+    base = ruta.rsplit("/", 1)[-1]
+    if any(base.startswith(pref) for pref in CONFIG_RUNNER_TESTS):
+        return "la config del runner de tests"
+    return None
+
+
+def toca_protegido(camios):
+    """El primer `(ruta, qué_protege)` de la lista de archivos de un diff,
+    o None si el diff no toca nada protegido."""
+    for ruta in camios:
+        que_protege = ruta_protegida(ruta)
+        if que_protege:
+            return (ruta, que_protege)
+    return None
+
+
 def copiar_entorno(repo_path, worktree):
     """Lleva al worktree los `.env` que git no versiona.
 
@@ -277,6 +316,8 @@ class Dispatcher:
                                           "no salio de 0% en {} intentos".format(
                                               self.spec.verify_retries))
             elif self._bloqueado(job, ref):
+                pass  # ya se abandono con su motivo
+            elif not self._arbol_limpio(job, ref):
                 pass  # ya se abandono con su motivo
             elif not self._gate_verde(job, ref):
                 pass  # ya se abandono con su motivo
@@ -464,6 +505,27 @@ class Dispatcher:
         if copiados:
             self.log.write("worktree", ref, "entorno: " + ", ".join(copiados))
 
+    def _arbol_limpio(self, job, ref):
+        """Antes de correr el gate: el worktree tiene que estar limpio.
+
+        El PR contiene la rama, no el árbol de trabajo: cambios sin commitear
+        no entran al PR, y un gate verde sobre ellos sería un gate mentiroso
+        adentro del propio dispatcher. Sucio = abandono, sin correr el gate.
+        """
+        ok, out = self.run_cmd(["git", "-C", job.worktree, "status", "--porcelain"])
+        if ok and not out.strip():
+            return True
+        detalle = out.strip()[:200] if out and out.strip() else "git status fallo"
+        self.log.write("gate", ref, "arbol sucio: " + detalle)
+        if ok:
+            self._abandonar(job, ref, "arbol sucio en el worktree: hay cambios "
+                                       "sin commitear que no entran al PR; sin "
+                                       "medicion, sin PR")
+        else:
+            self._abandonar(job, ref, "no se pudo verificar el arbol "
+                                       "(git status fallo): sin gate, sin PR")
+        return False
+
     def _gate_verde(self, job, ref):
         """El gate se corre en el worktree, por el dispatcher: no confía en
         la palabra del agente. Rojo = abandono, y no hay PR."""
@@ -478,8 +540,9 @@ class Dispatcher:
         return False
 
     def _pr_abierto(self, job, ref):
-        """El agente debió dejar un PR abierto sobre su rama. Si no, el
-        ticket no tiene entregable y el trabajo no cuenta."""
+        """El agente debió dejar un PR abierto sobre su rama, y antes de
+        declarar hecho se verifica que ese PR sea lo que el gate midió:
+        apunta al mismo HEAD y no toca rutas protegidas."""
         num = None
         if job.slug:
             ok, out = self.run_cmd(["gh", "pr", "list", "--state", "open",
@@ -493,11 +556,61 @@ class Dispatcher:
                 if pr.get("headRefName") == job.branch:
                     num = pr.get("number")
                     break
-        if num is not None:
-            job.estado = "hecho"
-            self.log.write("pr", ref, "PR #{} abierto (gate verde)".format(num))
-        else:
+        if num is None:
             self._abandonar(job, ref, "el agente termino sin PR abierto")
+            return
+        if not self._pr_mide_el_head(job, ref, num):
+            return
+        if not self._pr_no_toca_protegido(job, ref, num):
+            return
+        job.estado = "hecho"
+        self.log.write("pr", ref, "PR #{} abierto (gate verde)".format(num))
+
+    def _pr_mide_el_head(self, job, ref, num):
+        """El gate midió el HEAD de la rama. Si el PR apunta a otro commit,
+        el verde no aplica a lo que va a mergear."""
+        ok, out = self.run_cmd(["git", "-C", job.worktree, "rev-parse", "HEAD"])
+        head = out.strip().splitlines()[-1].strip() if ok and out.strip() else ""
+        ok, out = self.run_cmd(["gh", "pr", "view", str(num), "--json", "headRefOid",
+                                "-R", job.slug])
+        oid = _json_field(out, ("headRefOid",))
+        if head and oid and head == oid:
+            return True
+        self.log.write("gate", ref,
+                       "head del PR {} != HEAD de la rama {}".format(oid, head))
+        self._abandonar(job, ref, "el head del PR no coincide con el HEAD de la "
+                                   "rama: el gate midio algo que no va en el PR")
+        return False
+
+    def _pr_no_toca_protegido(self, job, ref, num):
+        """Un diff que toca el gate, los workflows o la config del runner de
+        tests no se acepta: queda anotado y el ticket se marca para humano."""
+        ok, out = self.run_cmd(["gh", "pr", "view", str(num), "--json", "files",
+                                "-R", job.slug])
+        if not ok or not out:
+            self._abandonar(job, ref, "no se pudieron leer los archivos del PR")
+            return False
+        try:
+            files = json.loads(out)
+        except ValueError:
+            files = []
+        rutas = [f.get("path") for f in files if isinstance(f, dict)]
+        tocada = toca_protegido(rutas)
+        if not tocada:
+            return True
+        ruta, que_protege = tocada
+        self.log.write("gate", ref, "el PR toca {} ({})".format(que_protege, ruta))
+        self._abandonar(job, ref, "el PR toca {} ({}): no se acepta; el ticket "
+                                   "queda para humano".format(que_protege, ruta))
+        self._marcar_para_humano(job, ref)
+        return False
+
+    def _marcar_para_humano(self, job, ref):
+        """La etiqueta canónica del triage: `ready-for-human`."""
+        if not job.slug:
+            return
+        self.run_cmd(["gh", "issue", "edit", str(job.issue), "--add-label",
+                      "ready-for-human", "-R", job.slug])
 
     # --------------------------------------------------------------- limpieza
     def _costo_pane(self, job):

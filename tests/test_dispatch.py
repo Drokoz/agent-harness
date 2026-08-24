@@ -40,13 +40,18 @@ class Mundo:
     """
 
     def __init__(self, pane_out=PANE_ARRANCO, wait_out=None, gate=(True, "VERDE"),
-                 prs=None, credits=(None, None)):
+                 prs=None, credits=(None, None), head_oid="a" * 40,
+                 pr_head_oid=None, pr_files=None):
         self.pane_out = pane_out
         self.wait_out = wait_out or '{"result":{"agent":{"agent_status":"idle"}}}'
         self.gate = gate
         self.prs = prs if prs is not None else [
             {"number": 31, "headRefName": "ticket/7"}]
         self.creditos = list(credits)
+        self.head_oid = head_oid
+        self.pr_head_oid = pr_head_oid if pr_head_oid is not None else head_oid
+        self.pr_files = pr_files if pr_files is not None else [
+            "harness/dispatch.py", "tests/test_dispatch.py"]
         self.n_creditos = 0
         self.respuestas = []
         self.llamadas = []
@@ -77,6 +82,8 @@ class Mundo:
         a = args[0]
         if a == "git":
             if "rev-parse" in args:
+                if args[-1] == "HEAD":
+                    return (True, self.head_oid + "\n")
                 return (False, "")  # la rama no existe todavía: -b
             return (True, "")
         if a == "herdr":
@@ -91,6 +98,11 @@ class Mundo:
         if a == "gh":
             if "pr" in args and "list" in args:
                 return (True, json.dumps(self.prs))
+            if "pr" in args and "view" in args:
+                if "files" in args:
+                    return (True, json.dumps([{"path": p}
+                                              for p in self.pr_files]))
+                return (True, json.dumps({"headRefOid": self.pr_head_oid}))
             if "issue" in args and "close" in args:
                 return (True, "")
             return (True, '{"state":"CLOSED"}')
@@ -685,3 +697,75 @@ class TestElOrdenDelPreparado(unittest.TestCase):
 
             self.assertEqual(orden, ["instalar", "copiar_entorno"],
                              "el .env de producción no puede estar puesto al instalar")
+
+
+class TestElGateMideLoQueVaEnElPR(unittest.TestCase):
+    """El gate corre en el worktree, pero el PR contiene la rama (#36).
+
+    Un cambio sin commitear hace verde el gate sobre código que no va en el
+    PR; y un agente trabado puede hacer verde el gate editándolo. Las dos
+    vías de escape cierran aquí: árbol limpio antes del gate, HEAD de la
+    rama == head del PR, y ningún diff que toque el gate, los workflows o la
+    config del runner de tests.
+    """
+
+    def test_arbol_sucio_no_corre_el_gate_y_no_abre_pr(self):
+        m = Mundo()
+        m.responder(lambda a: a[0] == "git" and "status" in a,
+                    (True, " M harness/dispatch.py\n?? basura.txt\n"))
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+        self.assertIn("sucio", res[0].motivo)
+        self.assertEqual(m.llamo("./scripts/gate.sh"), [],
+                         "no se corre el gate sobre un árbol sucio")
+        self.assertNotIn("pr", [l["tipo"] for l in lineas])
+
+    def test_arbol_sucio_y_gate_rojo_no_es_lo_mismo(self):
+        """Son problemas distintos: uno es el estado del worktree antes del
+        gate, el otro es el veredicto del gate."""
+        sucio_m = Mundo()
+        sucio_m.responder(lambda a: a[0] == "git" and "status" in a,
+                          (True, " M x.py\n"))
+        (j_sucio,), _ = despachar(sucio_m, [job()])
+        (j_rojo,), _ = despachar(Mundo(gate=(False, "ROJO: unittest")), [job()])
+        self.assertIn("sucio", j_sucio.motivo)
+        self.assertIn("gate", j_rojo.motivo)
+        self.assertNotIn("sucio", j_rojo.motivo,
+                         "el gate rojo no se confunde con árbol sucio")
+        self.assertNotIn("gate", j_sucio.motivo,
+                         "árbol sucio no llega a correr el gate")
+
+    def test_pr_que_no_apunta_al_head_no_cuenta(self):
+        """El gate midió el HEAD de la rama; si el PR apunta a otro commit,
+        el verde no aplica a lo que va a mergear."""
+        m = Mundo(pr_head_oid="b" * 40)
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+        self.assertIn("head", res[0].motivo)
+        self.assertNotIn("pr", [l["tipo"] for l in lineas])
+
+    def test_diff_que_toca_el_gate_se_rechaza(self):
+        m = Mundo(pr_files=["harness/dispatch.py", "scripts/gate.sh"])
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+        self.assertIn("gate.sh", res[0].motivo)
+        (marco,) = m.llamo("gh", "issue", "edit", "--add-label", "ready-for-human")
+        self.assertEqual(marco[0][3], "7")
+        self.assertNotIn("pr", [l["tipo"] for l in lineas])
+
+    def test_workflow_y_config_del_runner_tambien_estan_protegidos(self):
+        for ruta in (".github/workflows/ci.yml", "jest.config.js"):
+            m = Mundo(pr_files=[ruta])
+            res, _ = despachar(m, [job()])
+            self.assertEqual(res[0].estado, "abandonado", (ruta, res[0].motivo))
+
+    def test_ruta_protegida(self):
+        self.assertEqual(dispatch.ruta_protegida("scripts/gate.sh"), "el gate")
+        self.assertEqual(dispatch.ruta_protegida(".github/workflows/ci.yml"),
+                         "los workflows")
+        self.assertEqual(dispatch.ruta_protegida("jest.config.js"),
+                         "la config del runner de tests")
+        self.assertIsNone(dispatch.ruta_protegida("harness/dispatch.py"))
+        self.assertIsNone(dispatch.ruta_protegida("README.md"))
+        self.assertIsNone(dispatch.ruta_protegida("docs/scripts/gate.sh"),
+                          "sólo el gate del repo, no uno homónimo en otro path")
