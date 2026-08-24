@@ -160,7 +160,8 @@ class TestPuros(unittest.TestCase):
         self.assertIn("#7", p)
         self.assertIn("Closes #7", p)
         self.assertIn("./scripts/gate.sh", p)
-        self.assertIn("never merge", p)
+        # Sin distinguir mayusculas: la regla puede caer al inicio de oracion.
+        self.assertIn("never merge", p.lower())
 
     def test_prompt_exige_commitear_y_empujar(self):
         """Cinco de seis tickets de la tanda del 2026-08-24 se abandonaron con
