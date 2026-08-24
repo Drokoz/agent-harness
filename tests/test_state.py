@@ -372,5 +372,57 @@ class TestIntentosQueEscalan(unittest.TestCase):
         self.assertEqual(state.intentos_que_escalan(evs, "koku", 7), 0)
 
 
+class TestMotivosDeAbandono(unittest.TestCase):
+    """Los motivos que `Dispatcher.parkear` comenta al agotar la escalera
+    (#38): uno por línea `abandono`, en el orden del historial."""
+
+    def test_uno_por_run_en_orden(self):
+        evs = [
+            ev("abandono", "ticket/7", "gate rojo", "2026-08-22T12:00:00Z",
+               run_id="r1", clase="modelo"),
+            ev("agente", "ticket/7", "koku-7 (kind claude, pane p1)",
+               "2026-08-23T12:00:00Z", run_id="r2"),
+            ev("abandono", "ticket/7", "timeout de espera (3600000 ms)",
+               "2026-08-23T13:00:00Z", run_id="r2", clase="modelo"),
+        ]
+        self.assertEqual(state.motivos_de_abandono(evs, "koku", 7),
+                         ["gate rojo", "timeout de espera (3600000 ms)"])
+
+    def test_vacio_sin_abandonos(self):
+        evs = [ev("pr", "ticket/7", "PR #35 abierto (gate verde)",
+                  "2026-08-22T12:00:00Z")]
+        self.assertEqual(state.motivos_de_abandono(evs, "koku", 7), [])
+
+    def test_no_se_mezcla_con_otro_ticket(self):
+        evs = [ev("abandono", "ticket/8", "gate rojo", "2026-08-22T12:00:00Z",
+                  ticket="koku#8", clase="modelo")]
+        self.assertEqual(state.motivos_de_abandono(evs, "koku", 7), [])
+
+
+class TestUltimoGateRojo(unittest.TestCase):
+    """La cola del gate rojo del intento anterior (#38, peldaño 2 de la
+    escalera): sólo el cuerpo de la última línea `gate` que diga "rojo:"."""
+
+    def test_saca_el_prefijo_y_toma_el_ultimo(self):
+        evs = [
+            ev("gate", "ticket/7", "rojo: primer fallo", "2026-08-22T12:00:00Z",
+               run_id="r1"),
+            ev("gate", "ticket/7", "rojo: segundo fallo", "2026-08-23T12:00:00Z",
+               run_id="r2"),
+        ]
+        self.assertEqual(state.ultimo_gate_rojo(evs, "koku", 7), "segundo fallo")
+
+    def test_gate_verde_no_cuenta(self):
+        evs = [ev("gate", "ticket/7", "verde", "2026-08-22T12:00:00Z")]
+        self.assertIsNone(state.ultimo_gate_rojo(evs, "koku", 7))
+
+    def test_sin_lineas_de_gate_es_none(self):
+        """Un abandono sin gate (árbol sucio, timeout, sin PR) no deja
+        rastro: el peldaño 2 sigue sin cola, `prompt_de` la omite."""
+        evs = [ev("abandono", "ticket/7", "arbol sucio en el worktree",
+                  "2026-08-22T12:00:00Z", clase="modelo")]
+        self.assertIsNone(state.ultimo_gate_rojo(evs, "koku", 7))
+
+
 if __name__ == "__main__":
     unittest.main()

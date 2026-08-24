@@ -21,10 +21,13 @@
                                     usuario de esta máquina —ni otros dispositivos
                                     ni otros usuarios.
 
-    harness run                     lanza la frontera del contexto por defecto
+    harness run                     lanza la frontera del contexto por defecto;
+                                    cada ticket corre en el peldaño de la escalera
+                                    de reintentos que le toca (#38): --kind/--model
+                                    son sólo el fallback de un ticket sin peldaño
     harness run --max 2             tope de tickets en paralelo (24 GB: dos)
-    harness run --kind pi           pi | claude | codex | ...
-    harness run --model xai/grok    modelo nativo del agente (opcional)
+    harness run --kind pi           fallback: pi | claude | codex | ...
+    harness run --model xai/grok    fallback: modelo nativo del agente (opcional)
     harness run --log PATH          dónde va el log JSONL de eventos
 
 v0 deliberadamente chico: NO es una app, es un script que imprime. La idea es vivir
@@ -70,13 +73,15 @@ from harness.adapters import (adr_files, collect, load_config, openrouter_credit
                               repo_paths, vault_decision_files)  # noqa: E402
 from harness.config import ConfigError  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
-from harness.dispatch import (DispatchSpec, Dispatcher, EventLog, Job, cosechar)  # noqa: E402
+from harness.dispatch import (DispatchSpec, Dispatcher, EventLog, Job, cosechar,  # noqa: E402
+                              peldano_de)
 from harness.render import render  # noqa: E402
 from harness.quota import (agregar, as_dict as quota_as_dict, cuota_por_ventana,  # noqa: E402
                            leer_sesiones, puntos_de_ticket, render_quota,
                            resumen_evento, semana_de)
 from harness.snapshot import as_dict, snapshot  # noqa: E402
-from harness.state import intentos, pasos  # noqa: E402
+from harness.state import (intentos, intentos_que_escalan, motivos_de_abandono,  # noqa: E402
+                           pasos, ultimo_gate_rojo)
 from harness.summary import (PrAbierto, Resumen, con_cuota, construir,  # noqa: E402
                              filtrar, guardar_marca, as_dict as resumen_as_dict,
                              leer_eventos, leer_marca, parse_fecha)
@@ -120,9 +125,10 @@ def build_parser():
     p.add_argument("--max", type=int, default=2, dest="maximo",
                    help="run: tickets en paralelo (por defecto 2)")
     p.add_argument("--kind", default="pi",
-                   help="run: kind de agente de herdr (por defecto pi)")
+                   help="run: fallback de kind de agente (por defecto pi); la "
+                        "escalera de reintentos (#38) lo fija por ticket")
     p.add_argument("--model", default="",
-                   help="run: modelo nativo del agente (opcional)")
+                   help="run: fallback de modelo nativo (opcional); ídem --kind")
     p.add_argument("--log", default="",
                    help="run: dónde va el log JSONL de eventos")
     p.add_argument("--projects", default="",
@@ -361,7 +367,12 @@ def run_main(args, contexts):
         # (ticket #43): un ticket despachado no se re-despacha.
         crudo["eventos"] = eventos_previos
         snap = snapshot(crudo)
-        jobs = []
+        spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
+                            kind=args.kind, model=args.model)
+        disp = Dispatcher(spec, log, run_cmd=adapters.run,
+                          credits=_creditos_usado
+                          if ctx.budget.provider == "openrouter" else None)
+        jobs, parkeados = [], 0
         for r in snap.contexts[0].repos:
             if not r.slug:
                 continue
@@ -374,18 +385,34 @@ def run_main(args, contexts):
                 # despachado o parkeado no se re-trabaja (ticket #43).
                 if i.estado != "libre":
                     continue
+                # El peldaño se deriva del historial del log, no de un
+                # estado en memoria (#38): sobrevive reiniciar el
+                # dispatcher porque se recalcula acá, de `eventos_previos`.
+                escalados = intentos_que_escalan(eventos_previos, r.name, i.number)
+                peldano = peldano_de(escalados)
+                attempt = intentos(eventos_previos, r.name, i.number) + 1
+                if peldano is None:
+                    # Escalera agotada: se parkea acá mismo, sin worktree
+                    # ni pane -- no hay peldaño que correr.
+                    motivos = motivos_de_abandono(eventos_previos, r.name, i.number)
+                    disp.parkear(
+                        Job(repo=r.name, repo_path=r.path, slug=r.slug,
+                            issue=i.number, attempt=attempt),
+                        "ticket/{}".format(i.number), motivos)
+                    parkeados += 1
+                    continue
+                gate_tail = (ultimo_gate_rojo(eventos_previos, r.name, i.number)
+                            if peldano.get("cola_gate") else None)
                 jobs.append(Job(repo=r.name, repo_path=r.path, slug=r.slug,
-                                issue=i.number,
-                                attempt=intentos(eventos_previos, r.name,
-                                                 i.number) + 1))
+                                issue=i.number, attempt=attempt,
+                                kind=peldano["kind"], model=peldano["model"],
+                                extra_args=tuple(peldano["extra_args"]),
+                                gate_tail=gate_tail))
         if not jobs:
-            sys.stdout.write('harness: "{}": nada en la frontera\n'.format(ctx.name))
+            extra = " ({} parkeado(s))".format(parkeados) if parkeados else ""
+            sys.stdout.write('harness: "{}": nada en la frontera{}\n'.format(
+                ctx.name, extra))
             continue
-        spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
-                            kind=args.kind, model=args.model)
-        disp = Dispatcher(spec, log, run_cmd=adapters.run,
-                          credits=_creditos_usado
-                          if ctx.budget.provider == "openrouter" else None)
         resultados = disp.dispatch(jobs)
         for j in resultados:
             estado = "OK       " if j.estado == "hecho" else "ABANDONADO"

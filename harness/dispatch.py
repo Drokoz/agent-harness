@@ -173,9 +173,14 @@ def worktree_path(repo_path, issue):
     return repo_path.parent / ".worktrees" / "{}-ticket-{}".format(repo_path.name, issue)
 
 
-def prompt_de(issue):
-    """El trabajo de un agente, en una línea. En inglés: es machine-facing."""
-    return una_linea(
+def prompt_de(issue, gate_tail=None):
+    """El trabajo de un agente, en una línea. En inglés: es machine-facing.
+
+    `gate_tail` es la cola del gate rojo del intento anterior (peldaño 2 de
+    la escalera, #38): se pega al final y `una_linea` la aplasta junto con
+    el resto, así que sigue siendo una sola línea aunque traiga saltos.
+    """
+    texto = (
         "Read AGENTS.md and CONTEXT.md, then implement GitHub issue {} in this "
         "worktree (branch ticket/{}). Follow this sequence to the end: write the "
         "code; commit every change, so that `git status --porcelain` is empty; "
@@ -186,6 +191,41 @@ def prompt_de(issue):
         "force-push. Stop once the PR is open.".format(
             "#" + str(issue), issue, "#" + str(issue))
     )
+    if gate_tail:
+        texto += " The previous attempt's gate failed with: {}".format(gate_tail)
+    return una_linea(texto)
+
+
+# ----------------------------------------------------------------- escalera
+# La escalera de reintentos (#38, PLAN.md §"Barato primero, escalada
+# asimétrica"): dos peldaños baratos de pi/Qwen -- el segundo con más
+# thinking y la cola del gate del intento anterior en el prompt -- y dos
+# caros de Claude. El thinking/effort sube ANTES de cambiar de modelo:
+# los peldaños 1 y 2 comparten runner y modelo, sólo cambia el thinking.
+ESCALERA = (
+    {"kind": "pi", "model": "qwen/qwen3.8-27b", "extra_args": ("--thinking", "medium")},
+    {"kind": "pi", "model": "qwen/qwen3.8-27b", "extra_args": ("--thinking", "high"),
+     "cola_gate": True},
+    {"kind": "claude", "model": "sonnet", "extra_args": ("--effort", "medium")},
+    {"kind": "claude", "model": "opus", "extra_args": ("--effort", "medium")},
+)
+
+
+def peldano_de(escalados):
+    """El peldaño que le toca a un ticket con `escalados` abandonos que ya
+    consumieron peldaño (`state.intentos_que_escalan`, que excluye los
+    `infra` por #37): un dict de `ESCALERA`, o None si la escalera está
+    agotada -- parkear, no despachar de nuevo.
+
+    Puro y sin memoria: `escalados` sale de releer el log cada vez
+    (`state.intentos_que_escalan`), así que el peldaño sobrevive reiniciar
+    el dispatcher (#38).
+    """
+    if escalados < 0:
+        escalados = 0
+    if escalados >= len(ESCALERA):
+        return None
+    return ESCALERA[escalados]
 
 
 def _ahora():
@@ -267,6 +307,13 @@ class Job:
     # Un cero por default se confunde con "no costó nada"; ver `_repartir_costo`.
     costo: Optional[float] = None
     attempt: int = 1  # el intento global: lo numera el dispatcher con el historial
+    # El peldaño de la escalera (#38), ya resuelto por quien arma el Job
+    # (`state.intentos_que_escalan` + `peldano_de`): "" = usa spec.kind/model,
+    # para no romper a quien todavía no pasa por la escalera.
+    kind: str = ""
+    model: str = ""
+    extra_args: Tuple[str, ...] = ()          # --thinking/--effort del peldaño
+    gate_tail: Optional[str] = None           # cola del gate rojo del intento anterior
 
 
 @dataclass
@@ -287,6 +334,11 @@ class DispatchSpec:
     verify_poll_s: float = 2.0
     infra_retries: int = 2        # reintentos en el acto de un abandono infra (#37)
     infra_retry_wait_s: float = 2.0
+    # El router (#38, seam para #45): si no es None, se consulta antes de
+    # correr un peldaño de Claude -- piso de cuota y calendario. () -> (bool,
+    # motivo). La política no vive acá: dispatch.py sólo llama lo que se
+    # inyecte; sin nada inyectado, siempre permitido.
+    permitir_claude: Optional[Callable[[], Tuple[bool, str]]] = None
 
 
 class Dispatcher:
@@ -327,19 +379,34 @@ class Dispatcher:
                            "creditos antes {} / despues {} / delta ${:.4f}".format(
                                antes, despues, despues - antes))
         hechas = [j for j in resultados if j.estado == "hecho"]
+        abandonadas = [j for j in resultados if j.estado == "abandonado"]
+        # Un job que el router aplazó (#38) queda "pendiente": no gastó
+        # peldaño, no es un abandono, y se cuenta aparte para no mentir en
+        # el resumen de la corrida.
+        aplazadas = len(resultados) - len(hechas) - len(abandonadas)
         conocidos = [j.costo for j in resultados if j.costo is not None]
         costo_txt = "${:.4f}".format(sum(conocidos)) if conocidos else "desconocido"
         sin_medir = len(resultados) - len(conocidos)
         if sin_medir:
             costo_txt += " ({} sin medir)".format(sin_medir)
+        extra = ", {} aplazado(s) (router)".format(aplazadas) if aplazadas else ""
         self.log.write("corrida", ref,
-                       "fin: {} hecho(s), {} abandonado(s), costo de jobs {}".format(
-                           len(hechas), len(resultados) - len(hechas), costo_txt))
+                       "fin: {} hecho(s), {} abandonado(s){}, costo de jobs {}".format(
+                           len(hechas), len(abandonadas), extra, costo_txt))
         return resultados
 
     # ------------------------------------------------------------- un job
     def run_job(self, job):
         ref = "ticket/{}".format(job.issue)
+        permitido, motivo = self._permitir_claude(job)
+        if not permitido:
+            # No se gasta el peldaño: el job queda "pendiente" (no
+            # "abandonado") y la próxima corrida lo vuelve a intentar. Nada
+            # se creó todavía -- worktree y pane serían plata tirada si el
+            # router ya sabe que este peldaño no corre ahora.
+            self._log(job, "peldano", ref,
+                      "claude no permitido ahora (router): " + motivo)
+            return job
         try:
             if not self._worktree_ok(job, ref):
                 pass  # ya se abandono con su motivo
@@ -362,6 +429,16 @@ class Dispatcher:
         finally:
             self._limpiar(job, ref)
         return job
+
+    def _permitir_claude(self, job):
+        """(permitido, motivo). Sólo se consulta si el peldaño de este job
+        es de Claude y hay una política inyectada (`spec.permitir_claude`,
+        #38 -- seam para el router de #45): el piso de cuota y el
+        calendario todavía no existen acá, dispatch.py no los hardcodea."""
+        kind = job.kind or self.spec.kind
+        if kind != "claude" or self.spec.permitir_claude is None:
+            return True, ""
+        return self.spec.permitir_claude()
 
     # -------------------------------------------------- pasos del ciclo de vida
     def _worktree(self, job, ref):
@@ -415,12 +492,20 @@ class Dispatcher:
 
     def _agente(self, job, ref):
         job.agent = nombre_agente(job.repo, job.issue)
-        args = ["herdr", "agent", "start", job.agent, "--kind", self.spec.kind,
+        # El peldaño de la escalera (#38) resuelve kind/modelo por ticket;
+        # sin peldaño asignado (job.kind == ""), se usa el de la corrida
+        # entera -- el comportamiento de antes de la escalera.
+        kind = job.kind or self.spec.kind
+        modelo = job.model or self.spec.model
+        args = ["herdr", "agent", "start", job.agent, "--kind", kind,
                 "--pane", job.pane, "--timeout", "120000"]
-        if self.spec.model:
-            args += ["--", "--model", self.spec.model]
+        # El modelo va primero y el resto del peldaño (--thinking/--effort)
+        # después: son del mismo peldaño, van juntos.
+        extra = (["--model", modelo] if modelo else []) + list(job.extra_args)
+        if extra:
+            args += ["--"] + extra
         # El diálogo de confianza de Claude tapia el arranque en cada worktree.
-        if self.spec.kind == "claude":
+        if kind == "claude":
             confiar_en(job.worktree)
         # `pane split` vuelve antes de que el shell del pane esté listo, así que
         # el primer `agent start` puede rebotar con agent_pane_busy. Es una
@@ -429,8 +514,7 @@ class Dispatcher:
             ok, out = self.run_cmd(args, timeout=150)
             if ok:
                 self._log(job, "agente", ref,
-                          "{} (kind {}, pane {})".format(job.agent,
-                                                        self.spec.kind,
+                          "{} (kind {}, pane {})".format(job.agent, kind,
                                                         job.pane))
                 return True
             if _json_field(out, ("error", "code")) != "agent_pane_busy":
@@ -447,7 +531,7 @@ class Dispatcher:
         éxito igual. La evidencia de que llego es que el contexto del agente
         sube de 0%; si no, se reintenta. Un trabajo que nunca arranco no puede
         contarse como lanzado."""
-        prompt = prompt_de(job.issue)
+        prompt = prompt_de(job.issue, job.gate_tail)
         for intento in range(1, self.spec.verify_retries + 1):
             # `--wait --until working` es lo que hace que herdr entregue el
             # prompt y confirme que llegó. Sin `--wait`, `--timeout` es un
@@ -678,7 +762,8 @@ class Dispatcher:
 
     def _marcar_para_humano(self, job, ref):
         """La etiqueta canónica del triage: `ready-for-human`, sacando
-        `ready-for-agent` en la misma llamada.
+        `ready-for-agent` en la misma llamada. La usan tanto un PR que toca
+        rutas protegidas como `parkear` (escalera agotada, #38).
 
         Sin esto el ticket sigue en la frontera (`AGENT_LABEL` en
         `snapshot.py`): la próxima corrida lo vuelve a despachar, el agente
@@ -691,6 +776,27 @@ class Dispatcher:
                       "--add-label", "ready-for-human",
                       "--remove-label", "ready-for-agent",
                       "-R", job.slug])
+
+    def parkear(self, job, ref, motivos):
+        """Agota la escalera de reintentos (#38): saca `ready-for-agent`,
+        pone `ready-for-human` -- la etiqueta canónica de "para humano"
+        (`docs/agents/triage-labels.md`; no se inventa `needs-human`) -- y
+        comenta el motivo de cada intento, para que un humano no tenga que
+        releer el log de eventos para entender por qué.
+
+        Un ticket parkeado no vuelve a la frontera (`state.estado_frontier`,
+        #43 -- `PARKEADOS` incluye `ready-for-human`): la etiqueta ya lo saca,
+        no hace falta nada más acá.
+        """
+        self._marcar_para_humano(job, ref)
+        if job.slug:
+            cuerpo = "Escalera de reintentos agotada tras {} intento(s):\n".format(
+                len(motivos)) + "\n".join(
+                    "{}. {}".format(i, m) for i, m in enumerate(motivos, 1))
+            self.run_cmd(["gh", "issue", "comment", str(job.issue),
+                          "--body", cuerpo, "-R", job.slug])
+        self._log(job, "park", ref,
+                  "escalera agotada tras {} intento(s)".format(len(motivos)))
 
     # --------------------------------------------------------------- limpieza
     def _repartir_costo(self, jobs, antes, despues):
