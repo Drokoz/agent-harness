@@ -26,6 +26,16 @@ El vocabulario canónico de cinco roles, sin renombrar: `needs-triage`, `needs-i
 Single-context: un `CONTEXT.md` en la raíz y ADRs en `docs/adr/`.
 See `docs/agents/domain.md`.
 
+### Criterios de aceptación
+
+Un criterio de aceptación de un ticket para agente tiene que ser verificable por el
+agente: sin humano y sin herramientas interactivas. Caso real de lo que no hacer: #39
+pedía "calibrado a mano contra `/usage` al menos dos veces" — `/usage` es interactivo,
+un agente desatendido no puede correrlo, y el ticket se marcó hecho sin cumplirlo.
+
+Lo que sí necesita un humano va en una sección aparte del ticket, marcada como tal
+(por ejemplo "Necesita humano"), nunca como checkbox de aceptación.
+
 ## Output economy
 
 Output tokens cost several times more than input (Qwen3.8: $0.40 in / $3.00 out). Verbosity
