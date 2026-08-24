@@ -12,6 +12,15 @@
                                     ADRs por repo + notas de la vault
     harness decisions --json        lo mismo, parseable
 
+    harness quota                   la cuota de Claude, medida leyendo las
+                                    sesiones locales (~/.claude/projects)
+    harness quota --projects PATH   otra carpeta de sesiones (p.ej. una fixture)
+    harness quota --json            el agregado crudo, parseable
+                                    Limitaciones (también en docs/harness/quota.md):
+                                    es aproximado, y sólo ve las sesiones de este
+                                    usuario de esta máquina —ni otros dispositivos
+                                    ni otros usuarios.
+
     harness run                     lanza la frontera del contexto por defecto
     harness run --max 2             tope de tickets en paralelo (24 GB: dos)
     harness run --kind pi           pi | claude | codex | ...
@@ -61,6 +70,8 @@ from harness.config import ConfigError  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
 from harness.dispatch import (DispatchSpec, Dispatcher, EventLog, Job, cosechar)  # noqa: E402
 from harness.render import render  # noqa: E402
+from harness.quota import (agregar, as_dict as quota_as_dict, leer_sesiones,  # noqa: E402
+                           render_quota, resumen_evento)
 from harness.snapshot import as_dict, snapshot  # noqa: E402
 from harness.state import intentos  # noqa: E402
 from harness.summary import (PrAbierto, Resumen, construir, filtrar,  # noqa: E402
@@ -72,11 +83,20 @@ OFFLINE = os.environ.get("HARNESS_OFFLINE") == "1"
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="harness", description=__doc__.splitlines()[0])
+    p = argparse.ArgumentParser(prog="harness",
+                                description=__doc__.splitlines()[0],
+                                epilog=(
+                                    "quota: las dos limitaciones (ver también "
+                                    "docs/harness/quota.md): es aproximado, y "
+                                    "sólo ve las sesiones de Claude Code de este "
+                                    "usuario de esta máquina —no ve otros "
+                                    "dispositivos ni otros usuarios de la máquina."),
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", nargs="?", default="status",
-                   choices=["status", "decisions", "run", "report"],
-                   help="status (la pantalla), decisions (las decisiones) o "
-                        "run (el dispatcher de la frontera)")
+                   choices=["status", "decisions", "run", "report", "quota"],
+                   help="status (la pantalla), decisions (las decisiones), "
+                        "run (el dispatcher de la frontera) o "
+                        "quota (la cuota de Claude por sesiones locales)")
     p.add_argument("--context", metavar="NOMBRE",
                    help="un contexto en vez del de por defecto")
     p.add_argument("--all", action="store_true", dest="todos",
@@ -97,6 +117,9 @@ def build_parser():
                    help="run: modelo nativo del agente (opcional)")
     p.add_argument("--log", default="",
                    help="run: dónde va el log JSONL de eventos")
+    p.add_argument("--projects", default="",
+                   help="quota: carpeta de sesiones (por defecto "
+                        "~/.claude/projects)")
     return p
 
 
@@ -129,6 +152,8 @@ def main(argv=None):
         else:
             sys.stdout.write(render_decisions(groups, color=sys.stdout.isatty()))
         return 0
+    if args.command == "quota":
+        return quota_main(args, contexts)
     if args.command == "run":
         return run_main(args, contexts)
 
@@ -155,6 +180,27 @@ def main(argv=None):
     else:
         sys.stdout.write(render(snap, quiet=args.quiet, color=sys.stdout.isatty(),
                                 resumen=resumen))
+    return 0
+
+
+def quota_main(args, contexts):
+    """`harness quota`: la cuota de Claude medida sobre las sesiones locales
+    (la misma fuente que /usage). Deja una línea en el log de eventos para
+    que el histórico quede junto a todo lo demás; offline, sin efectos de
+    lado, como el resto del CLI."""
+    raices = [Path(c.repos.root).expanduser() for c in contexts]
+    projects = (Path(args.projects).expanduser() if args.projects
+                else Path.home() / ".claude" / "projects")
+    agg = agregar(leer_sesiones(projects), raices)
+    if args.como_json:
+        json.dump(quota_as_dict(agg), sys.stdout, indent=2, ensure_ascii=False,
+                  sort_keys=True)
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(render_quota(agg))
+    if not OFFLINE:
+        log = EventLog(_estado_dir() / "harness" / "events.jsonl", "harness")
+        log.write("quota", "quota", resumen_evento(agg))
     return 0
 
 
