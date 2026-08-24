@@ -15,11 +15,13 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import support
-from harness import dispatch
-from harness.dispatch import (DispatchSpec, Dispatcher, EventLog, Job, cosechar,
-                              nombre_agente, prompt_de, una_linea, worktree_path)
+from harness import dispatch, state
+from harness.dispatch import (ESCALERA, DispatchSpec, Dispatcher, EventLog, Job,
+                              cosechar, nombre_agente, peldano_de, prompt_de,
+                              una_linea, worktree_path)
 
 ROOT = support.ROOT
 HARNESS = ROOT / "bin" / "harness"
@@ -133,9 +135,17 @@ def spec(**kw):
 
 
 def job(issue=7, repo="koku", path="/repos/koku", slug="Drokoz/koku",
-        attempt=1):
+        attempt=1, kind="", model="", extra_args=(), gate_tail=None):
     return Job(repo=repo, repo_path=path, slug=slug, issue=issue,
-               attempt=attempt)
+               attempt=attempt, kind=kind, model=model,
+               extra_args=extra_args, gate_tail=gate_tail)
+
+
+def job_de_peldano(escalados, **kw):
+    """Un job en el peldaño que le toca a `escalados` abandonos previos
+    (#38): lo mismo que arma `bin/harness` antes de llamar a `dispatch`."""
+    p = peldano_de(escalados)
+    return job(kind=p["kind"], model=p["model"], extra_args=p["extra_args"], **kw)
 
 
 def despachar(mundo, jobs, **kw):
@@ -186,6 +196,72 @@ class TestPuros(unittest.TestCase):
         b = worktree_path("/repos/koku", 8)
         self.assertNotEqual(a, b)
         self.assertIn(".worktrees", a.parts)
+
+    def test_prompt_sin_cola_de_gate_no_la_menciona(self):
+        self.assertEqual(prompt_de(7), prompt_de(7, gate_tail=None))
+        self.assertEqual(prompt_de(7), prompt_de(7, gate_tail=""))
+
+    def test_prompt_con_cola_de_gate_va_en_una_sola_linea(self):
+        """Peldaño 2 de la escalera (#38): la cola del gate del intento
+        anterior se pega al prompt, y sigue siendo una sola línea aunque
+        la cola traiga saltos -- herdr no entrega nada si no lo es."""
+        p = prompt_de(7, gate_tail="TypeError: x is undefined\n  at foo.js:12")
+        self.assertNotIn("\n", p)
+        self.assertIn("TypeError: x is undefined", p)
+        self.assertIn("at foo.js:12", p)
+
+
+class TestPeldanoDe(unittest.TestCase):
+    """`peldano_de` (#38): puro, sin memoria -- `escalados` es lo único que
+    entra, y siempre sale de releer el log (`state.intentos_que_escalan`)."""
+
+    def test_hay_cuatro_peldanos_y_el_quinto_es_parquear(self):
+        self.assertEqual(len(ESCALERA), 4)
+        for i in range(4):
+            self.assertIsNotNone(peldano_de(i))
+        self.assertIsNone(peldano_de(4))
+        self.assertIsNone(peldano_de(5))
+
+    def test_peldano_1_y_2_son_el_mismo_runner_y_modelo(self):
+        """El thinking sube ANTES de cambiar de modelo (#38)."""
+        p1, p2 = peldano_de(0), peldano_de(1)
+        self.assertEqual(p1["kind"], "pi")
+        self.assertEqual(p1["kind"], p2["kind"])
+        self.assertEqual(p1["model"], p2["model"])
+        self.assertNotEqual(p1["extra_args"], p2["extra_args"])
+        self.assertIn("medium", p1["extra_args"])
+        self.assertIn("high", p2["extra_args"])
+        self.assertNotIn("cola_gate", p1)
+        self.assertTrue(p2.get("cola_gate"))
+
+    def test_peldano_3_cambia_a_claude_sonnet(self):
+        p = peldano_de(2)
+        self.assertEqual(p["kind"], "claude")
+        self.assertEqual(p["model"], "sonnet")
+        self.assertEqual(p["extra_args"], ("--effort", "medium"))
+
+    def test_peldano_4_es_claude_opus(self):
+        p = peldano_de(3)
+        self.assertEqual(p["kind"], "claude")
+        self.assertEqual(p["model"], "opus")
+
+    def test_negativo_es_el_primer_peldano(self):
+        self.assertEqual(peldano_de(-1), peldano_de(0))
+
+    def test_se_deriva_del_historial_no_de_memoria(self):
+        """El peldaño no vive en ningún objeto vivo del dispatcher: se
+        recalcula leyendo el log cada vez (#38), así que sobrevive
+        reiniciar el proceso -- acá, dos abandonos que escalan en dos
+        `run_id` distintos (dos "reinicios") alcanzan el peldaño 3."""
+        evs = [
+            {"tipo": "abandono", "ref": "ticket/7", "ticket": "koku#7",
+             "run_id": "r1", "cuerpo": "gate rojo", "clase": "modelo"},
+            {"tipo": "abandono", "ref": "ticket/7", "ticket": "koku#7",
+             "run_id": "r2", "cuerpo": "timeout", "clase": "modelo"},
+        ]
+        escalados = state.intentos_que_escalan(evs, "koku", 7)
+        p = peldano_de(escalados)
+        self.assertEqual((p["kind"], p["model"]), ("claude", "sonnet"))
 
 
 class TestEventLog(unittest.TestCase):
@@ -1049,3 +1125,127 @@ class TestClasificacionDeAbandonos(unittest.TestCase):
             j = job()
             d._abandonar(j, "ticket/7", "algo que no se anticipo")
         self.assertEqual(j.clase_abandono, "modelo")
+
+
+class TestEscaleraDispatcher(unittest.TestCase):
+    """Un test por peldaño (#38), contra el mundo scripteado: kind, modelo
+    y thinking/effort que le llegan a `herdr agent start`, sobre un Job ya
+    resuelto por `peldano_de` -- lo mismo que arma `bin/harness` antes de
+    llamar a `Dispatcher.dispatch`."""
+
+    def _args_de_start(self, m):
+        (start,) = m.llamo("herdr", "agent", "start")
+        return list(start[0])
+
+    def test_peldano_1_pi_qwen_thinking_medio(self):
+        m = Mundo()
+        res, _ = despachar(m, [job_de_peldano(0)])
+        args = self._args_de_start(m)
+        self.assertEqual(args[args.index("--kind") + 1], "pi")
+        cola = args[args.index("--") + 1:]
+        self.assertEqual(cola, ["--model", "qwen/qwen3.8-27b", "--thinking", "medium"])
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+
+    def test_peldano_2_thinking_alto_y_cola_el_gate_en_el_prompt(self):
+        m = Mundo()
+        j = job_de_peldano(1, gate_tail="ROJO: fallo del intento anterior")
+        despachar(m, [j])
+        args = self._args_de_start(m)
+        cola = args[args.index("--") + 1:]
+        self.assertEqual(cola, ["--model", "qwen/qwen3.8-27b", "--thinking", "high"])
+        (prompt,) = m.llamo("herdr", "agent", "prompt")
+        texto = prompt[0][4]
+        self.assertIn("ROJO: fallo del intento anterior", texto)
+        self.assertNotIn("\n", texto)
+
+    def test_peldano_3_claude_sonnet_effort_medio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(dispatch, "CLAUDE_JSON", Path(tmp) / "claude.json"):
+                m = Mundo()
+                res, _ = despachar(m, [job_de_peldano(2)])
+        args = self._args_de_start(m)
+        self.assertEqual(args[args.index("--kind") + 1], "claude")
+        cola = args[args.index("--") + 1:]
+        self.assertEqual(cola, ["--model", "sonnet", "--effort", "medium"])
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+
+    def test_peldano_4_claude_opus_effort_medio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(dispatch, "CLAUDE_JSON", Path(tmp) / "claude.json"):
+                m = Mundo()
+                res, _ = despachar(m, [job_de_peldano(3)])
+        args = self._args_de_start(m)
+        cola = args[args.index("--") + 1:]
+        self.assertEqual(cola, ["--model", "opus", "--effort", "medium"])
+
+
+class TestRouterSeam(unittest.TestCase):
+    """El router (#38, seam para #45): si el peldaño es de Claude y hay una
+    política inyectada que lo bloquea (piso de cuota, calendario -- #45),
+    no se gasta nada -- ni worktree ni pane -- y el job queda pendiente,
+    no abandonado: no consume peldaño."""
+
+    def test_claude_bloqueado_por_el_router_no_gasta_peldano(self):
+        m = Mundo()
+        with tempfile.TemporaryDirectory() as tmp:
+            log = log_en(tmp)
+            d = Dispatcher(
+                spec(permitir_claude=lambda: (False, "piso de cuota semanal")),
+                log, m.cmd, credits=m.credits, dormir=m.dormir)
+            res = d.dispatch([job_de_peldano(2)])
+            lineas = [json.loads(l) for l in log.path.read_text().splitlines()]
+        self.assertEqual(res[0].estado, "pendiente")
+        self.assertEqual(m.llamo("git", "worktree", "add"), [])
+        self.assertEqual(m.llamo("herdr", "pane", "split"), [])
+        peldano_lineas = [l for l in lineas if l["tipo"] == "peldano"]
+        self.assertEqual(len(peldano_lineas), 1)
+        self.assertIn("piso de cuota semanal", peldano_lineas[0]["cuerpo"])
+
+    def test_pi_no_consulta_al_router(self):
+        """El router sólo aplica a los peldaños de Claude: pi/Qwen sigue
+        corriendo aunque haya una política inyectada."""
+        m = Mundo()
+        llamado = []
+
+        def bloquear():
+            llamado.append(1)
+            return (False, "no deberia llamarse")
+
+        res, _ = despachar(m, [job_de_peldano(0)], permitir_claude=bloquear)
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        self.assertEqual(llamado, [])
+
+
+class TestParkear(unittest.TestCase):
+    """Al agotar la escalera (#38): saca `ready-for-agent`, pone
+    `ready-for-human` y comenta el motivo de cada intento."""
+
+    def test_parkear_cambia_labels_y_comenta_los_motivos(self):
+        m = Mundo()
+        motivos = ["gate rojo en el worktree: sin PR",
+                  "timeout de espera (3600000 ms)",
+                  "agente bloqueado (aprobacion o pregunta pendiente)",
+                  "el agente termino sin PR abierto"]
+        with tempfile.TemporaryDirectory() as tmp:
+            log = log_en(tmp)
+            d = Dispatcher(spec(), log, m.cmd, credits=m.credits, dormir=m.dormir)
+            d.parkear(job(attempt=5), "ticket/7", motivos)
+            lineas = [json.loads(l) for l in log.path.read_text().splitlines()]
+        (edit,) = m.llamo("gh", "issue", "edit")
+        self.assertEqual(edit[0][edit[0].index("--add-label") + 1], "ready-for-human")
+        self.assertEqual(edit[0][edit[0].index("--remove-label") + 1], "ready-for-agent")
+        (comentario,) = m.llamo("gh", "issue", "comment")
+        cuerpo = comentario[0][comentario[0].index("--body") + 1]
+        for motivo in motivos:
+            self.assertIn(motivo, cuerpo)
+        park_lineas = [l for l in lineas if l["tipo"] == "park"]
+        self.assertEqual(len(park_lineas), 1)
+
+    def test_sin_slug_no_comenta_pero_no_explota(self):
+        m = Mundo()
+        with tempfile.TemporaryDirectory() as tmp:
+            log = log_en(tmp)
+            d = Dispatcher(spec(), log, m.cmd, credits=m.credits, dormir=m.dormir)
+            d.parkear(job(slug=""), "ticket/7", ["algo"])
+        self.assertEqual(m.llamo("gh", "issue", "edit"), [])
+        self.assertEqual(m.llamo("gh", "issue", "comment"), [])
