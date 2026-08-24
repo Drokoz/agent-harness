@@ -56,7 +56,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -70,13 +72,19 @@ from harness.config import ConfigError  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
 from harness.dispatch import (DispatchSpec, Dispatcher, EventLog, Job, cosechar)  # noqa: E402
 from harness.render import render  # noqa: E402
-from harness.quota import (agregar, as_dict as quota_as_dict, leer_sesiones,  # noqa: E402
-                           render_quota, resumen_evento)
+from harness.quota import (agregar, as_dict as quota_as_dict, cuota_por_ventana,  # noqa: E402
+                           leer_sesiones, puntos_de_ticket, render_quota,
+                           resumen_evento, semana_de)
 from harness.snapshot import as_dict, snapshot  # noqa: E402
-from harness.state import intentos  # noqa: E402
-from harness.summary import (PrAbierto, Resumen, construir, filtrar,  # noqa: E402
-                             guardar_marca, as_dict as resumen_as_dict,
+from harness.state import intentos, pasos  # noqa: E402
+from harness.summary import (PrAbierto, Resumen, con_cuota, construir,  # noqa: E402
+                             filtrar, guardar_marca, as_dict as resumen_as_dict,
                              leer_eventos, leer_marca, parse_fecha)
+
+# El issue de un ticket, del `ref` que anota el dispatcher ("ticket/256"):
+# lo que necesitan `state.pasos` y `quota.puntos_de_ticket`, que quieren el
+# issue, no el PR (`Ticket.numero` es el PR — "PR #19 abierto"— no el issue).
+REF_ISSUE_RE = re.compile(r"^ticket/(\d+)$")
 
 # Modo sin adaptadores: sin red ni dependencias externas (OpenRouter, gh, herdr).
 OFFLINE = os.environ.get("HARNESS_OFFLINE") == "1"
@@ -158,33 +166,50 @@ def main(argv=None):
         return run_main(args, contexts)
 
     raw = collect(contexts, offline=OFFLINE)
+    quota_registros, quota_agg = None, None
     if not OFFLINE:
         # El log de eventos da el estado `despachado` de la frontera (ticket #43).
         raw["eventos"] = leer_eventos(_estado_dir() / "harness" / "events.jsonl")
+        # La cuota (#47): sesiones locales de Claude, sin red — igual que
+        # `harness quota`, pero con la carpeta por defecto (sin `--projects`:
+        # esa bandera es de `quota`, acá no hace falta exponerla).
+        raices = [Path(c.repos.root).expanduser() for c in contexts]
+        quota_registros = leer_sesiones(Path.home() / ".claude" / "projects")
+        quota_agg = agregar(quota_registros, raices)
     snap = snapshot(raw)
     if args.since and parse_fecha(args.since) is None:
         sys.stderr.write("harness: --since inválido: se espera YYYY-MM-DD o ISO "
                          "8601 (p.ej. 2026-08-21)\n")
         return 2
-    resumen = resumen_de(args, snap)
-    if args.command == "report":
+    resumen = resumen_de(args, snap, contexts, quota_agg, quota_registros)
+    if args.command == "report" or args.como_json:
         # El reporte consume el MISMO dict que emite --json: es el contrato que el
         # spec fijó entre el núcleo y cualquier frontend. Si mañana la web se escribe
         # en otro lenguaje, consume esto y no las internas.
-        from harness.report import render_html
         data = as_dict(snap)
         data["resumen"] = resumen_as_dict(resumen)
-        sys.stdout.write(render_html(data))
+        data["cuota"] = _cuota_dict(quota_agg)
+        if args.command == "report":
+            from harness.report import render_html
+            sys.stdout.write(render_html(data))
+        else:
+            json.dump(data, sys.stdout, indent=2, ensure_ascii=False, sort_keys=True)
+            sys.stdout.write("\n")
         return 0
-    if args.como_json:
-        data = as_dict(snap)
-        data["resumen"] = resumen_as_dict(resumen)
-        json.dump(data, sys.stdout, indent=2, ensure_ascii=False, sort_keys=True)
-        sys.stdout.write("\n")
-    else:
-        sys.stdout.write(render(snap, quiet=args.quiet, color=sys.stdout.isatty(),
-                                resumen=resumen))
+    sys.stdout.write(render(snap, quiet=args.quiet, color=sys.stdout.isatty(),
+                            resumen=resumen))
     return 0
+
+
+def _cuota_dict(quota_agg):
+    """La cuota para `--json`/`report` (#47): sólo `por_dia` (la evolución
+    por noche), no el agregado entero — eso ya lo tiene `harness quota`.
+    `None` (offline, o sin dónde leer sesiones) se dice tal cual: la
+    página lo interpreta como "sin datos" y sigue (ver `report._cuota_seccion`).
+    """
+    if quota_agg is None:
+        return {"estado": "offline"}
+    return {"estado": "ok", "por_dia": quota_agg["por_dia"]}
 
 
 def quota_main(args, contexts):
@@ -212,27 +237,73 @@ def _ahora_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def resumen_de(args, snap):
+def resumen_de(args, snap, contexts, quota_agg, quota_registros):
     """El resumen de la mañana: el log de eventos desde la última vez que se
     miró (o desde `--since`), más los PRs abiertos que trae el snapshot.
 
     La marca vive junto al log y se actualiza con cada vista; `--since` mira
     otro período a propósito y no la mueve. Offline no hay resumen ni marca:
     el gate no debe tener efectos de lado.
+
+    `quota_agg`/`quota_registros` (None si offline, #47) cruzan el resumen
+    contra la cuota: la semana vigente y, por ticket, el costo en las dos
+    monedas y el desglose por peldaño de una escalada. Ese cruce necesita
+    el historial COMPLETO del ticket (`state.pasos`), no sólo lo que cae
+    en el período, así que se lee el log entero acá, aparte del filtrado.
     """
     if OFFLINE:
         return Resumen(estado="offline")
     base = _estado_dir() / "harness"
     log_path, mark_path = base / "events.jsonl", base / "last_viewed"
     desde_dt = parse_fecha(args.since) if args.since else leer_marca(mark_path)
-    eventos = filtrar(leer_eventos(log_path), desde_dt)
+    eventos_todos = leer_eventos(log_path)
+    eventos = filtrar(eventos_todos, desde_dt)
     prs = [PrAbierto(repo=r.name, number=p.number, title=p.title)
           for ctx in snap.contexts for r in ctx.repos for p in r.prs]
     if not args.since:
         guardar_marca(mark_path, _ahora_str)
-    return construir(eventos, prs,
-                     desde=None if desde_dt is None else _iso_utc(desde_dt),
-                     hasta=_ahora_str(), resolver_pr=_resolver_pr(snap))
+    resumen = construir(eventos, prs,
+                        desde=None if desde_dt is None else _iso_utc(desde_dt),
+                        hasta=_ahora_str(), resolver_pr=_resolver_pr(snap))
+    if quota_agg is None:
+        return resumen
+    return _con_cuota(resumen, eventos_todos, contexts, quota_agg, quota_registros)
+
+
+def _issue_de_ref(ref):
+    """El issue de un `Ticket.ref` ("ticket/256" -> 256), o None si no
+    matchea (líneas viejas, u otro formato de ref)."""
+    m = REF_ISSUE_RE.match(str(ref))
+    return int(m.group(1)) if m else None
+
+
+def _con_cuota(resumen, eventos_todos, contexts, quota_agg, quota_registros):
+    """El cruce de `resumen` contra la cuota (#47): la semana vigente, y por
+    ticket, el costo en las dos monedas más el desglose por peldaño.
+
+    Un ticket sin repo o sin issue (líneas viejas, PR sin ticket en el
+    evento) no tiene con qué cruzar: se salta y se queda con lo que traía.
+    """
+    raices = [Path(c.repos.root).expanduser() for c in contexts]
+    harness_sem, resto_sem = semana_de(quota_agg, datetime.now(timezone.utc))
+    costos, cuotas, peldanos = {}, {}, {}
+    for t in resumen.tickets:
+        issue = _issue_de_ref(t.ref)
+        if t.repo is None or issue is None:
+            continue
+        clave = (t.repo, t.ref)
+        pasos_t = pasos(eventos_todos, t.repo, issue)
+        puntos = puntos_de_ticket(quota_registros, raices, t.repo, issue)
+        pasos_t = [replace(p, cuota=cuota_por_ventana(puntos, p.inicio, p.fin))
+                  for p in pasos_t]
+        costos[clave] = sum(p.costo for p in pasos_t)
+        cuotas[clave] = sum(peso for _, peso in puntos)
+        peldanos[clave] = [{"attempt": p.attempt, "runner": p.runner,
+                            "motivo": p.motivo, "costo": p.costo, "cuota": p.cuota}
+                           for p in pasos_t]
+    return con_cuota(resumen, cuota_semana=harness_sem + resto_sem,
+                     cuota_semana_harness=harness_sem, costos_por_ticket=costos,
+                     cuotas_por_ticket=cuotas, peldanos_por_ticket=peldanos)
 
 
 def _resolver_pr(snap):

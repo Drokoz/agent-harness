@@ -88,6 +88,36 @@ def _texto(item):
     return item.get("title") or item.get("detalle") or ""
 
 
+def _gasto_texto(d):
+    """El gasto de un ticket o un peldaño en las dos monedas (#47): sólo
+    las que tengan algo que mostrar, `d` es un dict suelto (ticket, PR o
+    peldaño) así que un PR sin `costo`/`cuota` no muestra nada."""
+    partes = []
+    if d.get("costo"):
+        partes.append(f'US${d["costo"]:.2f}')
+    if d.get("cuota"):
+        partes.append(f'{round(d["cuota"]):,} tok')
+    return " · ".join(partes)
+
+
+def _fila_resumen(i, marca):
+    """Una fila de "Cerrados"/"Esperando review", con su gasto si lo trae, y
+    los peldaños de la escalada como filas propias cuando hubo más de un
+    intento (ticket que escaló, #47)."""
+    gasto = _gasto_texto(i)
+    sufijo = f' <span class="muted small">{_esc(gasto)}</span>' if gasto else ""
+    fila = (f'<li><span class="mark is-{marca}"></span>'
+           f'<span class="ref">{_esc(_ref(i))}</span> '
+           f'{_esc(_texto(i)[:88])}{sufijo}</li>')
+    peldanos = i.get("peldanos") or []
+    if len(peldanos) > 1:
+        for p in peldanos:
+            g = _gasto_texto(p) or "sin medir"
+            fila += (f'<li class="muted small peldano">peldaño {_esc(p.get("attempt"))} '
+                    f'({_esc(p.get("runner") or "?")}): {_esc(g)}</li>')
+    return fila
+
+
 def _resumen(r):
     if not r or r.get("estado") != "ok":
         return '<p class="muted">Sin log todavía: nada que resumir.</p>'
@@ -98,6 +128,12 @@ def _resumen(r):
               ("PRs esperando review", len(prs), "human" if prs else "machine"),
               ("Agentes trabados", len(trabados), "human" if trabados else "machine"),
               ("Costo del período", f"US${costo:.2f}", "machine")]
+    cuota_semana = r.get("cuota_semana")
+    if cuota_semana is not None:
+        harness = r.get("cuota_semana_harness") or 0
+        cifras.append(("Cuota de la semana",
+                       f"{round(cuota_semana):,} tok ({round(harness):,} harness)",
+                       "machine"))
     kpis = "".join(
         f'<div class="kpi"><span class="kpi-n is-{t}">{_esc(v)}</span>'
         f'<span class="kpi-l">{_esc(l)}</span></div>' for l, v, t in cifras)
@@ -106,16 +142,36 @@ def _resumen(r):
     for titulo, items, marca in (("Cerrados", tickets, "done"), ("Esperando review", prs, "wait")):
         if not items:
             continue
-        filas = "".join(
-            f'<li><span class="mark is-{marca}"></span>'
-            f'<span class="ref">{_esc(_ref(i))}</span> '
-            f'{_esc(_texto(i)[:88])}</li>' for i in items[:8])
+        filas = "".join(_fila_resumen(i, marca) for i in items[:8])
         extra = (f'<li class="muted">… y {len(items)-8} más</li>' if len(items) > 8 else "")
         detalle += f'<h3>{_esc(titulo)}</h3><ul class="list">{filas}{extra}</ul>'
 
     ventana = f'{_fecha(r.get("desde"))} → {_fecha(r.get("hasta"))}'
     return (f'<p class="muted window">{_esc(ventana)}</p>'
             f'<div class="kpis">{kpis}</div>{detalle}')
+
+
+def _cuota_seccion(cuota):
+    """La evolución por noche (#47): las últimas dos semanas de
+    `cuota["por_dia"]`, harness vs resto, con una barra relativa al pico.
+    Sin datos de cuota (offline, o la clave ni está) la sección lo dice y
+    sigue: no rompe la página."""
+    if not cuota or cuota.get("estado") != "ok":
+        return '<p class="muted">Sin datos de cuota.</p>'
+    por_dia = cuota.get("por_dia") or {}
+    if not por_dia:
+        return '<p class="muted">Sin datos de cuota todavía.</p>'
+    dias = sorted(por_dia)[-14:]
+    totales = {d: (por_dia[d].get("harness") or 0) + (por_dia[d].get("resto") or 0)
+              for d in dias}
+    pico = max(totales.values(), default=0) or 1
+    filas = "".join(
+        f'<li class="noche"><span class="mono muted small">{_esc(d)}</span>'
+        f'{_barra(totales[d] / pico)}'
+        f'<span class="muted small">{round(totales[d]):,} tok '
+        f'({round(por_dia[d].get("harness") or 0):,} harness)</span></li>'
+        for d in dias)
+    return f'<ul class="list noches">{filas}</ul>'
 
 
 def _agentes(a):
@@ -236,6 +292,9 @@ ul.list{list-style:none;padding:0;margin:0 0 14px}
 ul.list li{display:flex;gap:9px;align-items:baseline;padding:5px 0;font-size:15px;
 border-bottom:1px solid var(--rule-soft)}
 ul.list li:last-child{border-bottom:none}
+li.noche{display:flex;align-items:center;gap:10px}
+li.noche .bar{flex:1;margin:0}
+li.peldano{padding-left:16px;font-family:"IBM Plex Mono",monospace}
 .ref{font-size:12.5px;color:var(--muted);flex:none}
 .mark{width:7px;height:7px;border-radius:50%;flex:none;transform:translateY(-1px);background:var(--muted)}
 .mark.is-go,.mark.is-done{background:var(--machine)}
@@ -306,6 +365,8 @@ def render_html(snap, generado=None):
 </header>
 
 <section><h2>Qué pasó</h2>{_resumen(snap.get("resumen"))}</section>
+
+<section><h2>Cuota por noche</h2>{_cuota_seccion(snap.get("cuota"))}</section>
 
 <section><h2>Agentes</h2>{_agentes(snap.get("agents"))}</section>
 

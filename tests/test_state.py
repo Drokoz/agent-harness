@@ -8,9 +8,14 @@ romper y cuentan como intento 1.
 """
 
 import unittest
+from datetime import datetime, timezone
 
 import support  # noqa: F401  (pone la raíz del repo en sys.path)
 from harness import state
+
+
+def _dt(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
 def ev(tipo, ref, cuerpo, ts, run_id="r1", ticket="koku#7", attempt=1,
@@ -117,6 +122,78 @@ class TestDeTicket(unittest.TestCase):
         self.assertEqual(s.intentos, 1)
         self.assertEqual(s.ultimo_motivo, "timeout de espera (3600000 ms)")
         self.assertIsNone(s.ultimo_runner)
+
+
+class TestPasos(unittest.TestCase):
+    """`state.pasos` (#47): los peldaños de un ticket escalado, uno por
+    corrida, con lo que cada uno gastó en dólares y su ventana de tiempo
+    (para cruzar contra la cuota, ver `harness.quota.cuota_por_ventana`)."""
+
+    def historial(self):
+        """Dos intentos: el primero muere con gate rojo (pi, $0.05), el
+        segundo cierra (claude, $0.10)."""
+        return [
+            ev("worktree", "ticket/7", "/x", "2026-08-22T12:00:00Z", run_id="r1"),
+            ev("agente", "ticket/7", "koku-7 (kind pi, pane w9:p1)",
+               "2026-08-22T12:01:00Z", run_id="r1"),
+            ev("gate", "ticket/7", "rojo: unittest", "2026-08-22T12:10:00Z",
+               run_id="r1"),
+            ev("abandono", "ticket/7", "gate rojo en el worktree: sin PR",
+               "2026-08-22T12:10:00Z", run_id="r1", clase="modelo"),
+            ev("costo", "ticket/7", "$0.0500", "2026-08-22T12:11:00Z", run_id="r1"),
+            ev("worktree", "ticket/7", "/x", "2026-08-23T13:00:00Z", run_id="r2",
+               attempt=2),
+            ev("agente", "ticket/7", "koku-7 (kind claude, pane w9:p2)",
+               "2026-08-23T13:01:00Z", run_id="r2", attempt=2),
+            ev("gate", "ticket/7", "verde", "2026-08-23T13:20:00Z", run_id="r2",
+               attempt=2),
+            ev("pr", "ticket/7", "PR #35 abierto (gate verde)",
+               "2026-08-23T13:20:00Z", run_id="r2", attempt=2),
+            ev("costo", "ticket/7", "$0.1000", "2026-08-23T13:21:00Z", run_id="r2",
+               attempt=2),
+        ]
+
+    def test_dos_peldanos_en_orden(self):
+        pasos = state.pasos(self.historial(), "koku", 7)
+        self.assertEqual([p.attempt for p in pasos], [1, 2])
+        self.assertEqual([p.run_id for p in pasos], ["r1", "r2"])
+        self.assertEqual([p.runner for p in pasos], ["pi", "claude"])
+        self.assertAlmostEqual(pasos[0].costo, 0.05)
+        self.assertAlmostEqual(pasos[1].costo, 0.10)
+        self.assertEqual(pasos[0].motivo, "gate rojo en el worktree: sin PR")
+        self.assertIsNone(pasos[1].motivo)
+
+    def test_ventana_de_tiempo_por_peldano(self):
+        pasos = state.pasos(self.historial(), "koku", 7)
+        self.assertEqual(pasos[0].inicio, _dt("2026-08-22T12:00:00Z"))
+        self.assertEqual(pasos[0].fin, _dt("2026-08-22T12:11:00Z"))
+        self.assertEqual(pasos[1].inicio, _dt("2026-08-23T13:00:00Z"))
+        self.assertEqual(pasos[1].fin, _dt("2026-08-23T13:21:00Z"))
+
+    def test_cuota_empieza_sin_dato(self):
+        """El cruce con la cuota lo hace el CLI (harness.quota), no
+        `state`: acá el campo queda en None hasta que alguien lo llene."""
+        pasos = state.pasos(self.historial(), "koku", 7)
+        self.assertIsNone(pasos[0].cuota)
+        self.assertIsNone(pasos[1].cuota)
+
+    def test_lineas_viejas_dan_un_solo_peldano(self):
+        evs = [vieja("agente", "ticket/7", "koku-7 (kind pi, pane w9:p1)",
+                     "2026-08-22T12:01:00Z"),
+               vieja("abandono", "ticket/7", "timeout de espera (3600000 ms)",
+                     "2026-08-22T12:10:00Z")]
+        pasos = state.pasos(evs, "koku", 7)
+        self.assertEqual(len(pasos), 1)
+        self.assertEqual(pasos[0].attempt, 1)
+        self.assertEqual(pasos[0].runner, "pi")
+
+    def test_vacio(self):
+        self.assertEqual(state.pasos([], "koku", 7), [])
+
+    def test_no_se_mecha_con_otro_repo(self):
+        evs = [ev("costo", "ticket/7", "$0.05", "2026-08-22T12:00:00Z",
+                  run_id="r9", ticket="otro#7")]
+        self.assertEqual(state.pasos(evs, "koku", 7), [])
 
 
 class TestTasas(unittest.TestCase):

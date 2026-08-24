@@ -42,6 +42,14 @@ class Ticket:
     "abierto", porque el merge es humano y no deja evento. `reconciliar` lo
     corrige contra GitHub cuando puede; `en_vivo` distingue esa corrección
     de lo que el log todavía cree.
+
+    `costo` (dólares OpenRouter) y `cuota` (tokens de Claude ponderados)
+    son el gasto acumulado de TODO el historial del ticket, no sólo del
+    período (#47): un ticket que escaló gastó en noches anteriores, y ese
+    gasto es parte de lo que costó cerrarlo. `peldanos` es el desglose por
+    intento cuando hubo más de uno; ninguno de los tres lo puede calcular
+    `resumir` sola —hace falta cruzar contra `harness.quota` y
+    `harness.state`— así que entran por `con_cuota`.
     """
 
     contexto: str
@@ -51,6 +59,9 @@ class Ticket:
     numero: Optional[int] = None
     estado: str = "abierto"
     en_vivo: bool = False
+    costo: float = 0.0
+    cuota: float = 0.0
+    peldanos: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -77,6 +88,12 @@ class Resumen:
 
     `desde` es el inicio del período en ISO; None = desde el principio
     (primera vez que se mira, sin marca guardada).
+
+    `cuota_semana` y `cuota_semana_harness` (tokens de Claude ponderados,
+    #47) son la semana de cuota vigente, no el período: `None` cuando no se
+    calcularon (offline, o el CLI no tiene de dónde leer sesiones locales),
+    para que la pantalla sepa distinguir "no hay dato" de "dio cero". Ver
+    `con_cuota`.
     """
 
     estado: str
@@ -86,6 +103,8 @@ class Resumen:
     trabados: List[Trabado] = field(default_factory=list)
     prs: List[PrAbierto] = field(default_factory=list)
     costo: float = 0.0
+    cuota_semana: Optional[float] = None
+    cuota_semana_harness: Optional[float] = None
 
     @property
     def paso_algo(self):
@@ -218,6 +237,35 @@ def construir(eventos, prs, estado="ok", desde=None, hasta=None, resolver_pr=Non
                    tickets=tickets, trabados=trabados, prs=list(prs), costo=costo)
 
 
+def con_cuota(resumen, cuota_semana=None, cuota_semana_harness=None,
+              costos_por_ticket=None, cuotas_por_ticket=None,
+              peldanos_por_ticket=None):
+    """Un `Resumen` nuevo con la cuota cruzada adentro (#47).
+
+    Nada de esto sale del log solo: la cuota (tokens de Claude) sale de
+    `harness.quota` (sesiones locales) y los peldaños de `harness.state`
+    (el historial completo del ticket, no sólo el período); el CLI hace
+    ese cruce y llama acá con el resultado ya listo. Los tres dicts van por
+    `(repo, ref)` — no `(repo, numero)`: `numero` es el PR ("PR #19
+    abierto"), y `state.pasos`/`quota.puntos_de_ticket` necesitan el
+    issue, que sólo `ref` ("ticket/256") trae confiable. Un ticket sin
+    entrada se queda con lo que traía (costo 0.0, cuota 0.0, sin peldaños).
+    """
+    costos_por_ticket = costos_por_ticket or {}
+    cuotas_por_ticket = cuotas_por_ticket or {}
+    peldanos_por_ticket = peldanos_por_ticket or {}
+
+    def _enriquecido(t):
+        clave = (t.repo, t.ref)
+        return replace(t, costo=costos_por_ticket.get(clave, t.costo),
+                       cuota=cuotas_por_ticket.get(clave, t.cuota),
+                       peldanos=peldanos_por_ticket.get(clave, t.peldanos))
+
+    tickets = [_enriquecido(t) for t in resumen.tickets]
+    return replace(resumen, tickets=tickets, cuota_semana=cuota_semana,
+                   cuota_semana_harness=cuota_semana_harness)
+
+
 # ------------------------------------------------------------------------ marca
 def leer_marca(path):
     """La marca de "última vez que miré" como datetime UTC, o None."""
@@ -246,4 +294,6 @@ def as_dict(r: Resumen):
         "trabados": [asdict(t) for t in r.trabados],
         "prs": [asdict(p) for p in r.prs],
         "costo": r.costo,
+        "cuota_semana": r.cuota_semana,
+        "cuota_semana_harness": r.cuota_semana_harness,
     }

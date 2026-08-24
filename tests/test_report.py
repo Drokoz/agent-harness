@@ -114,6 +114,83 @@ class TestReport(unittest.TestCase):
         self.assertIn('[data-theme="dark"]', h)
 
 
+class TestCuota(unittest.TestCase):
+    """La cuota en el reporte HTML (#47): la semana en el resumen, el costo
+    por ticket en las dos monedas, los peldaños de un ticket escalado, y la
+    evolución por noche en su propia sección."""
+
+    def test_semana_en_el_resumen(self):
+        s = snap()
+        s["resumen"]["cuota_semana"] = 12345.0
+        s["resumen"]["cuota_semana_harness"] = 6000.0
+        h = render_html(s)
+        self.assertIn("Cuota de la semana", h)
+        self.assertIn("12,345", h)
+        self.assertIn("6,000", h)
+
+    def test_sin_cuota_semanal_no_muestra_el_kpi(self):
+        h = render_html(snap())
+        self.assertNotIn("Cuota de la semana", h)
+
+    def test_costo_por_ticket_en_las_dos_monedas(self):
+        s = snap()
+        s["resumen"]["tickets"] = [{"repo": "agent-harness", "number": 2,
+                                    "title": "Gate", "costo": 0.42, "cuota": 12345.0}]
+        h = render_html(s)
+        self.assertIn("US$0.42", h)
+        self.assertIn("12,345 tok", h)
+
+    def test_ticket_sin_gasto_no_muestra_sufijo_vacio(self):
+        s = snap()
+        s["resumen"]["tickets"] = [{"repo": "agent-harness", "number": 2, "title": "Gate"}]
+        h = render_html(s)
+        self.assertIn("agent-harness #2", h)
+
+    def test_peldanos_de_un_ticket_escalado(self):
+        s = snap()
+        s["resumen"]["tickets"] = [{
+            "repo": "agent-harness", "number": 2, "title": "Gate",
+            "costo": 0.05, "cuota": 8200.0,
+            "peldanos": [{"attempt": 1, "runner": "pi", "costo": 0.05, "cuota": 0.0},
+                        {"attempt": 2, "runner": "claude", "costo": 0.0, "cuota": 8200.0}],
+        }]
+        h = render_html(s)
+        self.assertIn("peldaño 1", h)
+        self.assertIn("peldaño 2", h)
+        self.assertIn("claude", h)
+        self.assertIn("8,200 tok", h)
+
+    def test_un_solo_peldano_no_desglosa(self):
+        s = snap()
+        s["resumen"]["tickets"] = [{
+            "repo": "agent-harness", "number": 2, "title": "Gate", "costo": 0.05,
+            "peldanos": [{"attempt": 1, "runner": "pi", "costo": 0.05, "cuota": 0.0}],
+        }]
+        h = render_html(s)
+        self.assertNotIn("peldaño", h)
+
+    def test_evolucion_por_noche(self):
+        s = snap(cuota={"estado": "ok", "por_dia": {
+            "2026-08-21": {"harness": 0.0, "resto": 2856.0},
+            "2026-08-28": {"harness": 9640.0, "resto": 0.0},
+        }})
+        h = render_html(s)
+        self.assertIn("2026-08-21", h)
+        self.assertIn("2026-08-28", h)
+        self.assertIn("9,640", h)
+
+    def test_sin_cuota_no_rompe(self):
+        """AC #47: sin datos de cuota la página no se rompe, dice que no
+        hay y sigue."""
+        h = render_html(snap(cuota={"estado": "offline"}))
+        self.assertIn("Reporte del Harness", h)
+        self.assertIn("Sin datos de cuota", h)
+
+    def test_cuota_ausente_no_rompe(self):
+        h = render_html(snap())
+        self.assertIn("Reporte del Harness", h)
+
+
 if __name__ == "__main__":
     unittest.main()
 

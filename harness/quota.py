@@ -256,11 +256,20 @@ def pico_5h(puntos, ventana=VENTANA_5H):
 # ----------------------------------------------------------------------- agregar
 def agregar(registros, raices):
     """El agregado crudo (la forma de `--json`, con los timestamps como
-    datetime, que `as_dict` convierte a ISO)."""
+    datetime, que `as_dict` convierte a ISO).
+
+    `por_semana_cuota` y `por_dia` (#47) son la vista ponderada, partida
+    harness/resto, que necesita el resumen de la mañana ("cuota de la
+    semana, cuánto es del harness") y la evolución por noche del reporte
+    HTML: `por_semana` sigue crudo y por modelo, sin tocar, porque
+    `test_por_semana` ya lo fija así. `por_dia` bucketea por fecha
+    calendario en `SEMANA_TZ`: es la "noche" del harness, no UTC."""
     total = vacio()
     por_modelo: Dict[str, dict] = {}
     puntos: Dict[str, list] = {}
     semanas: Dict[str, Dict[str, int]] = {}
+    por_semana_cuota: Dict[str, Dict[str, float]] = {}
+    por_dia: Dict[str, Dict[str, float]] = {}
     proyectos: Dict[str, dict] = {}
     harness = vacio()
     resto = vacio()
@@ -273,11 +282,21 @@ def agregar(registros, raices):
         wk = semanas.setdefault(semana_inicio(dt).isoformat(), {})
         wk[m] = wk.get(m, 0) + t["total"]
         proyecto, ticket, es_h = atribuir(r["dir"], raices)
+        peso = ponderar(t)
+        wkc = por_semana_cuota.setdefault(semana_inicio(dt).isoformat(),
+                                          {"harness": 0.0, "resto": 0.0})
+        wkc["harness" if es_h else "resto"] += peso
+        pd = por_dia.setdefault(dt.astimezone(SEMANA_TZ).date().isoformat(),
+                                {"harness": 0.0, "resto": 0.0})
+        pd["harness" if es_h else "resto"] += peso
         clave = proyecto + (" [harness]" if es_h else "")
-        p = proyectos.setdefault(clave, {"harness": es_h, **vacio(), "tickets": {}})
+        p = proyectos.setdefault(clave, {"harness": es_h, **vacio(),
+                                         "tickets": {}, "tickets_ponderado": {}})
         sumar_en(p, t)
         if ticket is not None:
             p["tickets"][str(ticket)] = p["tickets"].get(str(ticket), 0) + t["total"]
+            p["tickets_ponderado"][str(ticket)] = (
+                p["tickets_ponderado"].get(str(ticket), 0.0) + peso)
         sumar_en(harness if es_h else resto, t)
     return {
         "archivos": len({r["archivo"] for r in registros}),
@@ -287,10 +306,53 @@ def agregar(registros, raices):
         "por_modelo": por_modelo,
         "pico_5h": {m: pico_5h(pts) for m, pts in puntos.items()},
         "por_semana": semanas,
+        "por_semana_cuota": por_semana_cuota,
+        "por_dia": por_dia,
         "por_proyecto": proyectos,
         "harness": harness,
         "resto": resto,
     }
+
+
+def semana_de(agg, ahora):
+    """(harness, resto) ponderados de la semana de cuota que contiene
+    `ahora`, sobre `agg["por_semana_cuota"]`. Cero de las dos si esa semana
+    todavía no tiene mensajes: no es un error, es que no pasó nada."""
+    wk = agg["por_semana_cuota"].get(semana_inicio(ahora).isoformat(),
+                                     {"harness": 0.0, "resto": 0.0})
+    return wk["harness"], wk["resto"]
+
+
+# ------------------------------------------------------------------- por ticket
+def puntos_de_ticket(registros, raices, proyecto, ticket):
+    """[(timestamp, peso)] de los mensajes de un ticket puntual, ordenados.
+
+    Más fino que `agregar` (que sólo suma): sirve para repartir la cuota
+    entre los peldaños de la escalada de un ticket (#38, ver
+    `harness.state.pasos`), cruzando cada punto contra la ventana de tiempo
+    de cada intento con `cuota_por_ventana`. Vacío si no hay coincidencias,
+    no error: un ticket que nunca corrió con Claude no tiene cuota, y eso
+    no es distinto de no tener datos."""
+    out = []
+    for r in registros:
+        p, t, es_h = atribuir(r["dir"], raices)
+        if not es_h or t != ticket or p != proyecto:
+            continue
+        out.append((r["timestamp"], ponderar(r["tokens"])))
+    return sorted(out)
+
+
+def cuota_por_ventana(puntos, inicio, fin):
+    """La cuota ponderada de `puntos` [(dt, peso)] dentro de [inicio, fin]
+    (bordes inclusive). `None` en cualquier borde no filtra por ese lado."""
+    total = 0.0
+    for dt, peso in puntos:
+        if inicio is not None and dt < inicio:
+            continue
+        if fin is not None and dt > fin:
+            continue
+        total += peso
+    return total
 
 
 def as_dict(agg):
