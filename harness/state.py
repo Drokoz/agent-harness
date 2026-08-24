@@ -172,6 +172,30 @@ def intentos_que_escalan(eventos, repo, issue):
     return sum(1 for clase in clase_por_run.values() if clase != "infra")
 
 
+def motivos_de_abandono(eventos, repo, issue):
+    """Los motivos de cada abandono de este ticket (línea `abandono`), en el
+    orden del historial: lo que `Dispatcher.parkear` comenta al agotar la
+    escalera (#38), para que un humano no tenga que releer el log."""
+    return [str(e.get("cuerpo", "")) for e in eventos
+           if _es_de(e, repo, issue) and e.get("tipo") == "abandono"]
+
+
+def ultimo_gate_rojo(eventos, repo, issue):
+    """La cola del gate rojo más reciente de este ticket (sin el prefijo
+    "rojo:"), o None si no hubo ninguno: lo que el peldaño 2 de la escalera
+    (#38) inyecta en el prompt del intento siguiente. Un abandono que nunca
+    llegó a correr el gate (árbol sucio, timeout, sin PR) no deja rastro
+    acá, y el peldaño 2 sigue sin la cola -- `prompt_de` ya sabe omitirla."""
+    ultimo = None
+    for e in eventos:
+        if not _es_de(e, repo, issue) or e.get("tipo") != "gate":
+            continue
+        cuerpo = str(e.get("cuerpo", ""))
+        if cuerpo.startswith("rojo:"):
+            ultimo = cuerpo[len("rojo:"):].strip()
+    return ultimo
+
+
 def _agregar(tabla, grupo, clave):
     c = tabla.setdefault(grupo, {"exito": 0, "abandono": 0})
     c[clave] += 1
