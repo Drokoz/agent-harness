@@ -23,9 +23,9 @@ from pathlib import Path
 
 import support  # noqa: F401  (pone la raíz en sys.path)
 
-from harness.quota import (agregar, as_dict, atribuir, codificar_path,
+from harness.quota import (PESOS, agregar, as_dict, atribuir, codificar_path,
                            decodificar_uso, leer_sesiones, parsear_linea,
-                           pico_5h, render_quota, resumen_evento,
+                           pico_5h, ponderar, render_quota, resumen_evento,
                            semana_inicio)
 
 HARNESS = support.ROOT / "bin" / "harness"
@@ -67,6 +67,26 @@ def correr_quota(*args, config=CONFIG_QUOTA, offline=False):
         yield subprocess.run(
             [str(HARNESS), "quota", "--projects", str(SESIONES), *args],
             env=env, capture_output=True, text=True, timeout=120)
+
+
+class TestPonderar(unittest.TestCase):
+    def test_pondera_por_costo_relativo(self):
+        c = {"input": 100, "cache_creation": 100, "cache_read": 100, "output": 100}
+        # 100*1 + 100*1.25 + 100*0.1 + 100*5 = 100 + 125 + 10 + 500
+        self.assertEqual(ponderar(c), 735.0)
+
+    def test_cache_read_pesa_una_fraccion_del_input(self):
+        """El bug del ticket #54: la suma cruda trataba `cache_read` como si
+        pesara lo mismo que un `input`. Ponderado, vale un décimo."""
+        solo_cache_read = ponderar({"input": 0, "cache_creation": 0,
+                                    "cache_read": 1000, "output": 0})
+        solo_input = ponderar({"input": 100, "cache_creation": 0,
+                               "cache_read": 0, "output": 0})
+        self.assertEqual(solo_cache_read, solo_input)
+
+    def test_pesos_tienen_las_claves_del_total(self):
+        self.assertEqual(set(PESOS), {"input", "cache_creation",
+                                      "cache_read", "output"})
 
 
 class TestDecodificarUso(unittest.TestCase):
@@ -151,6 +171,13 @@ class TestAtribuir(unittest.TestCase):
     def test_fuera_del_root(self):
         self.assertEqual(atribuir("-otro-lugar", RAIZ), ("otro-lugar", None, False))
 
+    def test_repo_anidado_no_trunca_al_ultimo_tramo(self):
+        """Ticket #54: un repo anidado bajo el root (`f7league/app/calendario`,
+        el caso `entrevestidos/*` de docs/harness/config.md) no debe perder su
+        proyecto real y aparecer como si `calendario` fuera uno."""
+        self.assertEqual(atribuir("-u-docs-f7league-app-calendario", RAIZ),
+                         ("f7league-app-calendario", None, False))
+
     def test_codificar_path(self):
         self.assertEqual(codificar_path("/u/docs/.worktrees"), "-u-docs--worktrees")
 
@@ -221,6 +248,11 @@ class TestAgregar(unittest.TestCase):
                           "cache_read": 2250, "output": 3500,
                           "thinking": 250, "total": 8000})
 
+    def test_ponderado(self):
+        """750*1 + 1500*1.25 + 2250*0.1 + 3500*5 = 750+1875+225+17500."""
+        self.assertEqual(self.agg["ponderado"], 20350.0)
+        self.assertEqual(self.agg["ponderado"], ponderar(self.agg["total"]))
+
     def test_por_modelo(self):
         self.assertEqual(self.agg["por_modelo"]["claude-opus-5"],
                          {"input": 600, "cache_creation": 1200,
@@ -267,6 +299,7 @@ class TestAgregar(unittest.TestCase):
         texto = json.dumps(as_dict(self.agg), sort_keys=True)
         data = json.loads(texto)
         self.assertEqual(data["total"]["total"], 8000)
+        self.assertEqual(data["ponderado"], 20350.0)
         self.assertEqual(data["pico_5h"]["fable"],
                          [300, "2026-08-22T10:00:00+00:00",
                           "2026-08-22T15:00:00+00:00"])
@@ -275,7 +308,9 @@ class TestAgregar(unittest.TestCase):
 class TestRender(unittest.TestCase):
     def test_tabla_corta(self):
         texto = render_quota(agregar(leer_sesiones(SESIONES), RAIZ))
-        self.assertIn("8,000", texto)
+        self.assertIn("total ponderado 20,350", texto)
+        self.assertIn("suma cruda 8,000", texto)
+        self.assertIn("cache_read 2,250", texto)
         self.assertIn("claude-opus-5", texto)
         self.assertIn("fable", texto)
         self.assertIn("[harness]", texto)
@@ -286,7 +321,7 @@ class TestRender(unittest.TestCase):
 
     def test_resumen_evento(self):
         linea = resumen_evento(agregar(leer_sesiones(SESIONES), RAIZ))
-        self.assertIn("total 8000 tokens", linea)
+        self.assertIn("total 20350 tokens ponderados (8000 crudo)", linea)
         self.assertIn("harness=6500", linea)
         self.assertLessEqual(len(linea.split("; ")), 6)
 
@@ -297,6 +332,7 @@ class TestCli(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stderr)
             data = json.loads(p.stdout)
         self.assertEqual(data["total"]["total"], 8000)
+        self.assertEqual(data["ponderado"], 20350.0)
         self.assertEqual(data["por_modelo"]["fable"]["total"], 300)
         self.assertEqual(data["pico_5h"]["claude-opus-5"][0], 3500)
         self.assertEqual(data["harness"]["total"], 6500)
@@ -327,7 +363,7 @@ class TestCli(unittest.TestCase):
         e = lineas[0]
         self.assertEqual(e["tipo"], "quota")
         self.assertEqual(e["origen"], "harness")
-        self.assertIn("total 8000 tokens", e["cuerpo"])
+        self.assertIn("total 20350 tokens ponderados (8000 crudo)", e["cuerpo"])
         self.assertTrue(e["timestamp"].endswith("Z"))
 
     def test_offline_no_escribe_eventos(self):
