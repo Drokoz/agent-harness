@@ -178,10 +178,14 @@ def prompt_de(issue):
     """El trabajo de un agente, en una línea. En inglés: es machine-facing."""
     return una_linea(
         "Read AGENTS.md and CONTEXT.md, then implement GitHub issue {} in this "
-        "worktree (branch ticket/{}). Rules: open the PR only if "
-        "./scripts/gate.sh exits 0 in this worktree; the PR body MUST contain "
-        "'Closes {}'; never merge and never force-push; stop once the PR is "
-        "open.".format("#" + str(issue), issue, "#" + str(issue))
+        "worktree (branch ticket/{}). Follow this sequence to the end: write the "
+        "code; commit every change, so that `git status --porcelain` is empty; "
+        "run ./scripts/gate.sh; and only if it exits 0, push the branch and open "
+        "the PR with 'Closes {}' in the body. Finishing with uncommitted changes, "
+        "or without an open PR, counts as failure and the work is discarded: the "
+        "worktree is deleted and only the branch survives. Never merge and never "
+        "force-push. Stop once the PR is open.".format(
+            "#" + str(issue), issue, "#" + str(issue))
     )
 
 
