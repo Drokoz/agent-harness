@@ -1,4 +1,4 @@
-"""La cuota de Claude, medida leyendo las sesiones locales (ticket #39).
+"""La cuota de Claude, medida leyendo las sesiones locales (ticket #39, #54).
 
 La fuente es `~/.claude/projects/**/*.jsonl` —la misma que lee el `/usage`
 de Claude Code. Cada línea de mensaje asistente trae el modelo y el `usage`
@@ -7,6 +7,9 @@ que la cuota se mide sola, sin anotar nada a mano.
 
 De ahí salen:
 
+- el total ponderado por costo relativo (`PESOS`), no la suma cruda de los
+  cuatro componentes: `cache_read` sola, sin ponderar, no es comparable con
+  nada (ticket #54). Los componentes crudos siguen enteros en `--json`
 - el total por modelo, para que un ticket corrido con `--model fable` se vea
   con su propio 5h y sepa si come su bucket y también el general
 - el pico por modelo dentro de cualquier ventana de 5h (la ventana rodante
@@ -49,6 +52,16 @@ WORKTREES_DIR = ".worktrees"
 # dos veces), así que no se suma al total.
 CAMPOS = ("input", "cache_creation", "cache_read", "output", "thinking")
 
+# El peso de cada componente contra el costo de un token de entrada (ticket
+# #54): la primera corrida real de `harness quota` dio 13.617.021.213 tokens
+# porque el total sumaba `cache_read` crudo, que se re-cuenta entero en cada
+# mensaje y no es comparable con nada —ni con `/usage`, donde pesa una
+# fracción de un token de salida. Los ratios salen del precio por millón de
+# tokens de la API de Claude (Sonnet/Opus): input=1x de referencia,
+# cache write (5m)≈1.25x, cache read≈0.1x, output≈5x. Son estables entre
+# modelos aunque el precio base cambie.
+PESOS = {"input": 1.0, "cache_creation": 1.25, "cache_read": 0.1, "output": 5.0}
+
 # Patrón de ticket en el nombre del worktree: `...-ticket-<n>` o `...-t<n>`.
 TICKET_RE = re.compile(r"[-_.]?ticket[-_.]?(\d+)$")
 TICKET_CORTO_RE = re.compile(r"[-_.]t(\d+)$")
@@ -65,6 +78,13 @@ def sumar_en(base, otros):
         base[c] += otros[c]
     base["total"] += otros["total"]
     return base
+
+
+def ponderar(c):
+    """El total pesado por costo relativo (`PESOS`), no la suma cruda: la
+    vista comparable contra `/usage`. `c` es cualquier contador con las claves
+    de `PESOS` (p.ej. `total` o una entrada de `por_modelo`)."""
+    return sum(c[campo] * peso for campo, peso in PESOS.items())
 
 
 # ------------------------------------------------------------------------ parseo
@@ -189,7 +209,12 @@ def atribuir(dir_name, raices):
                 proyecto = comp[:m.start()].strip("-_.") or root.name
                 return (proyecto, int(m.group(1)), True)
             return (comp or root.name, None, True)
-        return (rest.split("-")[-1] or rest, None, False)
+        # Un repo no-harness bajo el root puede estar anidado (el caso
+        # `entrevestidos/*`: `docs/harness/config.md`), así que `rest` puede
+        # traer más de un tramo de path codificado (`f7league-app-calendario`).
+        # Cortar en el último `-` perdía el proyecto real y dejaba el último
+        # tramo suelto como si fuera uno (`calendario`, `mesa`, `bugs`...).
+        return (rest, None, False)
     return (dir_name.lstrip("-"), None, False)
 
 
@@ -258,6 +283,7 @@ def agregar(registros, raices):
         "archivos": len({r["archivo"] for r in registros}),
         "mensajes": len(registros),
         "total": total,
+        "ponderado": ponderar(total),
         "por_modelo": por_modelo,
         "pico_5h": {m: pico_5h(pts) for m, pts in puntos.items()},
         "por_semana": semanas,
@@ -293,9 +319,15 @@ def render_quota(agg):
     out = []
     a = out.append
     total = agg["total"]["total"]
+    t = agg["total"]
     a(f"Cuota · sesiones locales ({agg['archivos']} archivo(s), "
       f"{agg['mensajes']} mensaje(s))")
-    a(f"  total {_fmt(total)} tokens")
+    a(f"  total ponderado {_fmt(round(agg['ponderado']))} tokens "
+      f"(por costo relativo, ver PESOS)")
+    a(f"    crudo: input {_fmt(t['input'])} · cache_creation "
+      f"{_fmt(t['cache_creation'])} · cache_read {_fmt(t['cache_read'])} · "
+      f"output {_fmt(t['output'])} · thinking {_fmt(t['thinking'])} "
+      f"(suma cruda {_fmt(total)})")
     a("")
     a("  por modelo:")
     if not agg["por_modelo"]:
@@ -332,7 +364,8 @@ def render_quota(agg):
 
 def resumen_evento(agg):
     """La línea para el log de eventos: una corrida, una línea."""
-    partes = [f"total {agg['total']['total']} tokens",
+    partes = [f"total {round(agg['ponderado'])} tokens ponderados "
+              f"({agg['total']['total']} crudo)",
               f"{agg['archivos']} archivo(s)", f"{agg['mensajes']} mensaje(s)"]
     picos = sorted(agg["pico_5h"].items(), key=lambda kv: -kv[1][0])
     partes.append("pico5h " + ", ".join(f"{m}={v[0]}" for m, v in picos[:3]))
