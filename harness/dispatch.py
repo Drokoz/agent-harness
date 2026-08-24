@@ -32,7 +32,6 @@ ORIGEN = "harness"
 
 # Línea de estado de la TUI de pi: "↑78k ↓5.9k R34k CH0.0% $0.056 11.4%/262k"
 CTX_RE = re.compile(r"(\d+(?:\.\d+)?)%/\d+k")
-COSTO_RE = re.compile(r"\$(\d+(?:\.\d+)?)")
 
 
 # --------------------------------------------------------------------- puros
@@ -256,7 +255,9 @@ class Job:
     agent: str = ""
     estado: str = "pendiente"   # pendiente | hecho | abandonado
     motivo: str = ""
-    costo: float = 0.0
+    # None = no medido todavía. 0.0 = medido y es cero (nunca prendió agente).
+    # Un cero por default se confunde con "no costó nada"; ver `_repartir_costo`.
+    costo: Optional[float] = None
     attempt: int = 1  # el intento global: lo numera el dispatcher con el historial
 
 
@@ -310,15 +311,20 @@ class Dispatcher:
         with cf.ThreadPoolExecutor(max_workers=max(1, self.spec.max_parallel)) as ex:
             resultados = list(ex.map(self.run_job, jobs))
         despues = self.credits()
+        self._repartir_costo(resultados, antes, despues)
         if antes is not None and despues is not None:
             self.log.write("costo", ref,
                            "creditos antes {} / despues {} / delta ${:.4f}".format(
                                antes, despues, despues - antes))
         hechas = [j for j in resultados if j.estado == "hecho"]
+        conocidos = [j.costo for j in resultados if j.costo is not None]
+        costo_txt = "${:.4f}".format(sum(conocidos)) if conocidos else "desconocido"
+        sin_medir = len(resultados) - len(conocidos)
+        if sin_medir:
+            costo_txt += " ({} sin medir)".format(sin_medir)
         self.log.write("corrida", ref,
-                       "fin: {} hecho(s), {} abandonado(s), costo de jobs ${:.4f}".format(
-                           len(hechas), len(resultados) - len(hechas),
-                           sum(j.costo for j in resultados)))
+                       "fin: {} hecho(s), {} abandonado(s), costo de jobs {}".format(
+                           len(hechas), len(resultados) - len(hechas), costo_txt))
         return resultados
 
     # ------------------------------------------------------------- un job
@@ -344,9 +350,6 @@ class Dispatcher:
             else:
                 self._pr_abierto(job, ref)
         finally:
-            job.costo = self._costo_pane(job)
-            if job.costo:
-                self._log(job, "costo", ref, "${:.4f}".format(job.costo))
             self._limpiar(job, ref)
         return job
 
@@ -633,20 +636,38 @@ class Dispatcher:
                       "ready-for-human", "-R", job.slug])
 
     # --------------------------------------------------------------- limpieza
-    def _costo_pane(self, job):
-        """El costo de la sesión, de la línea de estado de la TUI ($ antes
-        del porcentaje de contexto)."""
-        if not job.pane:
-            return 0.0
-        ok, out = self.run_cmd(["herdr", "pane", "read", job.pane,
-                                "--source", "recent", "--lines", "12"], timeout=30)
-        if not ok:
-            return 0.0
-        for linea in reversed(out.splitlines()):
-            if CTX_RE.search(linea):
-                costos = COSTO_RE.findall(linea)
-                return float(costos[-1]) if costos else 0.0
-        return 0.0
+    def _repartir_costo(self, jobs, antes, despues):
+        """El costo por job, después de que la corrida entera terminó.
+
+        Leer el costo de la línea de estado de la TUI (pane por pane) no es
+        confiable: esa línea es de la TUI de pi y ni siquiera ahí se puede
+        garantizar que siga visible cuando el job ya terminó (ver #53 — una
+        corrida real midió $1.7085 de delta de créditos con los cuatro jobs
+        en $0.0000). En vez de scrapear la pantalla, se reparte el delta de
+        créditos de la corrida (medido una sola vez, al principio y al final)
+        entre los jobs que sí prendieron un pane —los únicos que pudieron
+        haber gastado algo.
+
+        Un job que nunca llegó a tener pane cuesta $0.0000 de verdad: no hay
+        nada que estimar. Un job que sí prendió pane pero no hay créditos
+        para medir el delta (falta la key, la API no contestó) queda con
+        costo desconocido —`None`, no 0.0— porque un cero ahí sería
+        indistinguible de un gasto real de cero."""
+        medibles = [j for j in jobs if j.pane]
+        for j in jobs:
+            if not j.pane:
+                j.costo = 0.0
+        if not medibles:
+            return
+        if antes is None or despues is None:
+            for j in medibles:
+                self._log(j, "costo", "ticket/{}".format(j.issue), "desconocido")
+            return
+        share = (despues - antes) / len(medibles)
+        for j in medibles:
+            j.costo = share
+            self._log(j, "costo", "ticket/{}".format(j.issue),
+                      "${:.4f}".format(share))
 
     def _limpiar(self, job, ref):
         """Cierra el pane y quita el worktree: un pane que queda abierto para
