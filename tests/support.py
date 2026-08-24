@@ -112,11 +112,16 @@ def raw_personal():
                    "credits": openrouter_credits(), "total": 0.0, "used": 0.0},
         "repos": [
             # agent-harness con la fixture real de GraphQL: la frontera por
-            # dependencias nativas, que es el camino de por defecto.
+            # dependencias nativas, que es el camino de por defecto. La
+            # readiness se mira en main, aunque el working tree esté en
+            # ticket/3: el caso que engañaba a la tabla (issue #22).
             {"name": "agent-harness", "tracker": "github", "slug": "Drokoz/agent-harness",
-             "branch": "ticket/3", "status_porcelain": " M bin/harness\n?? harness/\n",
+             "branch": "ticket/3", "default_branch": "main",
+             "readiness_source": "default-branch",
+             "status_porcelain": " M bin/harness\n?? harness/\n",
              "exists": dict(READY_TODO), "issues": gh_issues_native(), "prs": gh_prs()},
             {"name": "koku", "tracker": "github", "slug": "Drokoz/koku", "branch": "main",
+             "default_branch": "main", "readiness_source": "default-branch",
              "status_porcelain": "",
              "exists": {"gate": True, "skills": False, "context": False},
              "issues": KOKU_ISSUES, "prs": KOKU_PRS},
@@ -140,7 +145,8 @@ def raw_trabajo():
                    "total": 200.0, "used": 128.4},
         "repos": [
             {"name": "groceries-wl", "tracker": "jira", "slug": "wl/groceries",
-             "branch": "develop", "status_porcelain": " M pom.xml\n",
+             "branch": "develop", "default_branch": "main",
+             "readiness_source": "default-branch", "status_porcelain": " M pom.xml\n",
              "exists": {"gate": True, "skills": False, "context": True},
              "issues": None, "prs": None},
         ],

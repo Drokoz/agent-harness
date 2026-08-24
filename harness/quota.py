@@ -1,0 +1,344 @@
+"""La cuota de Claude, medida leyendo las sesiones locales (ticket #39).
+
+La fuente es `~/.claude/projects/**/*.jsonl` —la misma que lee el `/usage`
+de Claude Code. Cada línea de mensaje asistente trae el modelo y el `usage`
+completo (`input`, `cache_creation`, `cache_read`, `output`, `thinking`), así
+que la cuota se mide sola, sin anotar nada a mano.
+
+De ahí salen:
+
+- el total por modelo, para que un ticket corrido con `--model fable` se vea
+  con su propio 5h y sepa si come su bucket y también el general
+- el pico por modelo dentro de cualquier ventana de 5h (la ventana rodante
+  de la cuota)
+- el total por semana, con el reset de viernes 17:00 America/Santiago
+- la atribución por proyecto y por ticket: el path de la sesión codifica el
+  worktree (`...--worktrees-<repo>-ticket-<n>`), que es lo que permite separar
+  el consumo del harness del resto
+
+Es aproximado, a propósito: sólo ve las sesiones de este usuario de esta
+máquina —ni otros dispositivos ni otros usuarios. Está documentado en el
+`--help` del CLI y en `docs/harness/quota.md`.
+
+Acá vive la lógica pura (parsear, atribuir, agregar, dibujar). El que toca el
+disco es `leer_sesiones`; el que escribe el evento lo hace el CLI.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Dict
+from zoneinfo import ZoneInfo
+
+from harness.summary import parse_fecha
+
+# El reset de la semana de la cuota: viernes 17:00 America/Santiago.
+SEMANA_TZ = ZoneInfo("America/Santiago")
+RESET_HORA = 17
+RESET_WEEKDAY = 4  # viernes
+VENTANA_5H = timedelta(hours=5)
+
+# Worktrees del harness: la carpeta bajo la que herdr clava cada ticket.
+WORKTREES_DIR = ".worktrees"
+
+# Los contadores de un uso: el `total` suma los cuatro que entran a la cuota.
+# `thinking` va DENTRO de `output` (Claude lo reporta aparte pero no suma
+# dos veces), así que no se suma al total.
+CAMPOS = ("input", "cache_creation", "cache_read", "output", "thinking")
+
+# Patrón de ticket en el nombre del worktree: `...-ticket-<n>` o `...-t<n>`.
+TICKET_RE = re.compile(r"[-_.]?ticket[-_.]?(\d+)$")
+TICKET_CORTO_RE = re.compile(r"[-_.]t(\d+)$")
+
+
+def vacio():
+    """Un bloque de contadores a cero, en la forma que sale por `--json`."""
+    return {c: 0 for c in CAMPOS + ("total",)}
+
+
+def sumar_en(base, otros):
+    """Suma `otros` (contadores) sobre `base`, en el lugar."""
+    for c in CAMPOS:
+        base[c] += otros[c]
+    base["total"] += otros["total"]
+    return base
+
+
+# ------------------------------------------------------------------------ parseo
+def _num(v):
+    """Un contador de `usage`: número, o la suma de un dict (p.ej. la forma
+    `cache_creation` con sus tokens efímeros por duración)."""
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, dict):
+        return sum(x for x in v.values()
+                   if isinstance(x, (int, float)) and not isinstance(x, bool))
+    return 0
+
+
+def decodificar_uso(usage):
+    """El `usage` de un mensaje (nombres largos reales o cortos) como
+    contadores, o None si no coopera."""
+    if not isinstance(usage, dict):
+        return None
+
+    def tomar(*nombres):
+        for n in nombres:
+            if n in usage:
+                return _num(usage[n])
+        return 0
+
+    thinking = tomar("thinking_tokens")
+    if not thinking:
+        det = usage.get("output_tokens_details")
+        if isinstance(det, dict):
+            thinking = _num(det.get("thinking_tokens"))
+    c = {
+        "input": tomar("input_tokens", "input"),
+        "cache_creation": tomar("cache_creation_input_tokens", "cache_creation"),
+        "cache_read": tomar("cache_read_input_tokens", "cache_read"),
+        "output": tomar("output_tokens", "output"),
+        "thinking": thinking,
+    }
+    c["total"] = c["input"] + c["cache_creation"] + c["cache_read"] + c["output"]
+    return c
+
+
+def parsear_linea(linea):
+    """Una línea JSONL de sesión con consumo: el modelo, el timestamp (UTC) y
+    los contadores. None si no es un mensaje asistente con `usage` válido."""
+    try:
+        d = json.loads(linea)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    msg = d.get("message")
+    if not isinstance(msg, dict):
+        return None
+    tokens = decodificar_uso(msg.get("usage"))
+    if tokens is None:
+        return None
+    modelo = msg.get("model")
+    if not isinstance(modelo, str) or not modelo:
+        modelo = "?"
+    dt = parse_fecha(str(d.get("timestamp", "")))
+    if dt is None:
+        return None
+    if tokens["total"] == 0:
+        return None  # mensaje sintético sin consumo
+    return {"modelo": modelo, "timestamp": dt, "tokens": tokens}
+
+
+def leer_sesiones(projects):
+    """Todos los mensajes con consumo de `projects/**/*.jsonl`, en orden.
+
+    Cada registro trae `dir` (el nombre codificado de la carpeta del proyecto)
+    y `archivo`. Directorio inexistente = sin registros: no hay sesiones, no
+    hay error. Las líneas rotas se saltan, igual que el log de eventos."""
+    out = []
+    base = Path(projects).expanduser()
+    if not base.is_dir():
+        return out
+    for f in sorted(base.rglob("*.jsonl")):
+        try:
+            handle = f.open("r", encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for linea in handle:
+                r = parsear_linea(linea)
+                if r is not None:
+                    out.append({**r, "dir": f.parent.name, "archivo": str(f)})
+    return out
+
+
+# ------------------------------------------------------------------ atribución
+def codificar_path(p):
+    """La codificación de Claude Code para nombres de carpeta: el path con `/`
+    y puntos por `-`. `/u/docs/.worktrees` → `-u-docs--worktrees`."""
+    return str(p).replace("/", "-").replace(".", "-")
+
+
+def atribuir(dir_name, raices):
+    """(proyecto, ticket, es_harness) de una carpeta de sesiones codificada.
+
+    `raices` son los `repos.root` de la config (Path, ya expandidos). Un path
+    bajo `<root>/.worktrees/` es del harness, y de ahí se saca el proyecto y el
+    ticket cuando el nombre lo permite; lo demás es "resto"."""
+    raices = sorted((Path(r) for r in raices), key=str, reverse=True)
+    for root in raices:
+        enc = codificar_path(root)
+        if dir_name == enc:
+            return (root.name, None, False)
+        if not dir_name.startswith(enc + "-"):
+            continue
+        rest = dir_name[len(enc) + 1:]
+        enc_wt = codificar_path(Path(root) / WORKTREES_DIR)
+        if dir_name.startswith(enc_wt + "-"):
+            # El resto es el nombre del worktree (puede traer guiones:
+            # `f7league-ticket-256`).
+            comp = dir_name[len(enc_wt) + 1:]
+            m = TICKET_RE.search(comp) or TICKET_CORTO_RE.search(comp)
+            if m:
+                proyecto = comp[:m.start()].strip("-_.") or root.name
+                return (proyecto, int(m.group(1)), True)
+            return (comp or root.name, None, True)
+        return (rest.split("-")[-1] or rest, None, False)
+    return (dir_name.lstrip("-"), None, False)
+
+
+# ------------------------------------------------------------------------ tiempo
+def semana_inicio(dt, tz=SEMANA_TZ):
+    """El inicio de la semana de la cuota que contiene `dt`: el último viernes
+    17:00 America/Santiago (inclusive)."""
+    s = dt.astimezone(tz)
+    ref = s.replace(hour=RESET_HORA, minute=0, second=0, microsecond=0)
+    if s < ref:
+        ref -= timedelta(days=1)
+    ref -= timedelta(days=(ref.weekday() - RESET_WEEKDAY) % 7)
+    return ref
+
+
+def pico_5h(puntos, ventana=VENTANA_5H):
+    """El máximo total dentro de CUALQUIER ventana de `ventana` sobre
+    `puntos` [(datetime, tokens)]. Devuelve (total, inicio, inicio+ventana)
+    o None si no hay puntos. El máximo se alcanza con la ventana anclada en un
+    punto, así que basta mirar esas."""
+    pts = sorted(puntos)
+    if not pts:
+        return None
+    ts = [p[0] for p in pts]
+    pref = [0]
+    for _, t in pts:
+        pref.append(pref[-1] + t)
+    mejor, inicio = None, None
+    j = 0
+    for i in range(len(pts)):
+        while j < len(pts) and ts[j] <= ts[i] + ventana:
+            j += 1
+        v = pref[j] - pref[i]
+        if mejor is None or v > mejor:
+            mejor, inicio = v, ts[i]
+    return (mejor, inicio, inicio + ventana)
+
+
+# ----------------------------------------------------------------------- agregar
+def agregar(registros, raices):
+    """El agregado crudo (la forma de `--json`, con los timestamps como
+    datetime, que `as_dict` convierte a ISO)."""
+    total = vacio()
+    por_modelo: Dict[str, dict] = {}
+    puntos: Dict[str, list] = {}
+    semanas: Dict[str, Dict[str, int]] = {}
+    proyectos: Dict[str, dict] = {}
+    harness = vacio()
+    resto = vacio()
+    for r in registros:
+        t, m, dt = r["tokens"], r["modelo"], r["timestamp"]
+        sumar_en(total, t)
+        sumar_en(por_modelo.setdefault(m, vacio()), t)
+        por_modelo[m]["mensajes"] = por_modelo[m].get("mensajes", 0) + 1
+        puntos.setdefault(m, []).append((dt, t["total"]))
+        wk = semanas.setdefault(semana_inicio(dt).isoformat(), {})
+        wk[m] = wk.get(m, 0) + t["total"]
+        proyecto, ticket, es_h = atribuir(r["dir"], raices)
+        clave = proyecto + (" [harness]" if es_h else "")
+        p = proyectos.setdefault(clave, {"harness": es_h, **vacio(), "tickets": {}})
+        sumar_en(p, t)
+        if ticket is not None:
+            p["tickets"][str(ticket)] = p["tickets"].get(str(ticket), 0) + t["total"]
+        sumar_en(harness if es_h else resto, t)
+    return {
+        "archivos": len({r["archivo"] for r in registros}),
+        "mensajes": len(registros),
+        "total": total,
+        "por_modelo": por_modelo,
+        "pico_5h": {m: pico_5h(pts) for m, pts in puntos.items()},
+        "por_semana": semanas,
+        "por_proyecto": proyectos,
+        "harness": harness,
+        "resto": resto,
+    }
+
+
+def as_dict(agg):
+    """El agregado serializable: los timestamps de los picos a ISO."""
+    d = json.loads(json.dumps(agg, default=lambda o: o.isoformat()
+                              if isinstance(o, datetime) else str(o),
+                              ensure_ascii=False))
+    return d
+
+
+# ----------------------------------------------------------------------- dibujo
+def _fmt(n):
+    return f"{n:,}"
+
+
+def _pct(n, tot):
+    return f"{int(round(100.0 * n / tot))}%" if tot else "0%"
+
+
+def _utc(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def render_quota(agg):
+    """La tabla corta: sin flags, esto es lo que se imprime."""
+    out = []
+    a = out.append
+    total = agg["total"]["total"]
+    a(f"Cuota · sesiones locales ({agg['archivos']} archivo(s), "
+      f"{agg['mensajes']} mensaje(s))")
+    a(f"  total {_fmt(total)} tokens")
+    a("")
+    a("  por modelo:")
+    if not agg["por_modelo"]:
+        a("    (sin sesiones)")
+    for m in sorted(agg["por_modelo"], key=lambda m: -agg["por_modelo"][m]["total"]):
+        d = agg["por_modelo"][m]
+        a(f"    {m:<28} {_fmt(d['total']):>12}  ({_pct(d['total'], total)})")
+    a("")
+    a("  pico en 5h (ventana rodante):")
+    for m in sorted(agg["pico_5h"], key=lambda m: -agg["pico_5h"][m][0]):
+        v, desde, hasta = agg["pico_5h"][m]
+        a(f"    {m:<28} {_fmt(v):>12}  ({_utc(desde)} → {_utc(hasta)})")
+    a("")
+    a("  por semana (reset vie 17:00, America/Santiago):")
+    for iso in sorted(agg["por_semana"], reverse=True):
+        a(f"    {iso[:10]}   {_fmt(sum(agg['por_semana'][iso].values()))}")
+    a("")
+    a("  por proyecto:")
+    for clave in sorted(agg["por_proyecto"],
+                        key=lambda n: -agg["por_proyecto"][n]["total"]):
+        d = agg["por_proyecto"][clave]
+        nombre = clave[:-len(" [harness]")] if d["harness"] else clave
+        tickets = ", ".join(f"ticket {k} {_fmt(v)}"
+                            for k, v in sorted(d["tickets"].items(),
+                                               key=lambda kv: -kv[1]))
+        marca = " [harness]" if d["harness"] else ""
+        sufijo = f"  ({tickets})" if tickets else ""
+        a(f"    {nombre}{marca:<10} {_fmt(d['total']):>12}{sufijo}")
+    h, r = agg["harness"]["total"], agg["resto"]["total"]
+    a(f"  harness {_fmt(h)} ({_pct(h, total)}) · resto {_fmt(r)} ({_pct(r, total)})")
+    a("  (aproximado: solo este usuario de esta máquina)")
+    return "\n".join(out) + "\n"
+
+
+def resumen_evento(agg):
+    """La línea para el log de eventos: una corrida, una línea."""
+    partes = [f"total {agg['total']['total']} tokens",
+              f"{agg['archivos']} archivo(s)", f"{agg['mensajes']} mensaje(s)"]
+    picos = sorted(agg["pico_5h"].items(), key=lambda kv: -kv[1][0])
+    partes.append("pico5h " + ", ".join(f"{m}={v[0]}" for m, v in picos[:3]))
+    semanas = sorted(agg["por_semana"].items(), reverse=True)
+    partes.append("semanas " + ", ".join(
+        f"{iso[:10]}={sum(v.values())}" for iso, v in semanas[:3]))
+    partes.append(f"harness={agg['harness']['total']} "
+                  f"({_pct(agg['harness']['total'], agg['total']['total'])})")
+    return "; ".join(partes)

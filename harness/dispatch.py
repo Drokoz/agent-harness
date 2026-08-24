@@ -22,6 +22,7 @@ import concurrent.futures as cf
 import json
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -206,21 +207,31 @@ class EventLog:
     """Log de eventos append-only, una línea JSONL por acción.
 
     Los campos fijos: timestamp, contexto, origen, tipo, referencia (ref) y
-    cuerpo. `origen` existe y hoy siempre vale `harness`: es la marca de quién
+    cuerpo, más las tres claves del historial (ticket #35): `run_id` (una
+    instancia del log es una corrida: dos tandas sobre el mismo archivo se
+    distinguen), `ticket` ("repo#issue"; None en las líneas que no son de
+    un ticket) y `attempt` (el intento global del ticket, que el
+    dispatcher numera leyendo el historial antes de despachar).
+
+    `origen` existe y hoy siempre vale `harness`: es la marca de quién
     escribió la línea, para que un observador futuro no invalide lo escrito.
     """
 
-    def __init__(self, path, contexto, reloj=None):
+    def __init__(self, path, contexto, reloj=None, run_id=None):
         self.path = Path(path).expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.contexto = contexto
         self.reloj = reloj or _ahora
+        self.run_id = run_id or uuid.uuid4().hex[:12]
 
-    def write(self, tipo, ref, cuerpo):
+    def write(self, tipo, ref, cuerpo, ticket=None, attempt=None):
         linea = {
             "timestamp": self.reloj(),
             "contexto": self.contexto,
             "origen": ORIGEN,
+            "run_id": self.run_id,
+            "ticket": ticket,
+            "attempt": attempt,
             "tipo": tipo,
             "ref": ref,
             "cuerpo": cuerpo,
@@ -246,6 +257,7 @@ class Job:
     estado: str = "pendiente"   # pendiente | hecho | abandonado
     motivo: str = ""
     costo: float = 0.0
+    attempt: int = 1  # el intento global: lo numera el dispatcher con el historial
 
 
 @dataclass
@@ -276,6 +288,14 @@ class Dispatcher:
         self.run_cmd = run_cmd                 # (args, cwd=None, timeout=30) -> (ok, out)
         self.credits = credits or (lambda: None)  # () -> usado (float) | None
         self.dormir = dormir
+
+    def _log(self, job, tipo, ref, cuerpo):
+        """Evento de un job: además de lo fijo, el ticket ("repo#issue") y
+        el intento global, para que el historial sepa qué se intentó y
+        cuántas veces."""
+        self.log.write(tipo, ref, cuerpo,
+                       ticket="{}#{}".format(job.repo, job.issue),
+                       attempt=job.attempt)
 
     # ----------------------------------------------------------- nivel corrida
     def dispatch(self, jobs):
@@ -326,7 +346,7 @@ class Dispatcher:
         finally:
             job.costo = self._costo_pane(job)
             if job.costo:
-                self.log.write("costo", ref, "${:.4f}".format(job.costo))
+                self._log(job, "costo", ref, "${:.4f}".format(job.costo))
             self._limpiar(job, ref)
         return job
 
@@ -353,12 +373,12 @@ class Dispatcher:
             args += ["-b", job.branch, job.worktree]
         ok, out = self.run_cmd(args, timeout=120)
         if not ok:
-            self.log.write("worktree", ref, "fallo: " + out.strip()[-200:])
+            self._log(job, "worktree", ref, "fallo: " + out.strip()[-200:])
         return ok
 
     def _worktree_ok(self, job, ref):
         if self._worktree(job, ref):
-            self.log.write("worktree", ref, job.worktree)
+            self._log(job, "worktree", ref, job.worktree)
             return True
         self._abandonar(job, ref, "no se pudo crear el worktree")
         return False
@@ -371,9 +391,9 @@ class Dispatcher:
         pane = _json_field(out, ("result", "pane", "pane_id"))
         if ok and pane:
             job.pane = pane
-            self.log.write("pane", ref, pane)
+            self._log(job, "pane", ref, pane)
             return True
-        self.log.write("pane", ref, "fallo: " + out.strip()[:200])
+        self._log(job, "pane", ref, "fallo: " + out.strip()[:200])
         return False
 
     def _agente(self, job, ref):
@@ -391,17 +411,17 @@ class Dispatcher:
         for intento in range(1, self.spec.start_retries + 1):
             ok, out = self.run_cmd(args, timeout=150)
             if ok:
-                self.log.write("agente", ref,
-                               "{} (kind {}, pane {})".format(job.agent,
-                                                              self.spec.kind,
-                                                              job.pane))
+                self._log(job, "agente", ref,
+                          "{} (kind {}, pane {})".format(job.agent,
+                                                        self.spec.kind,
+                                                        job.pane))
                 return True
             if _json_field(out, ("error", "code")) != "agent_pane_busy":
                 break
-            self.log.write("agente", ref,
-                           "pane sin shell todavia, intento {}".format(intento))
+            self._log(job, "agente", ref,
+                      "pane sin shell todavia, intento {}".format(intento))
             self.dormir(self.spec.start_wait_s)
-        self.log.write("agente", ref, "fallo: " + out.strip()[:200])
+        self._log(job, "agente", ref, "fallo: " + out.strip()[:200])
         return False
 
     def _prompt_verificado(self, job, ref):
@@ -421,7 +441,7 @@ class Dispatcher:
                  "--timeout", str(int(self.spec.verify_wait_s * 1000))],
                 timeout=int(self.spec.verify_wait_s) + 60)
             estado = _json_field(out, ("result", "agent", "agent_status"))
-            self.log.write("prompt", ref, "intento {}: {}".format(
+            self._log(job, "prompt", ref, "intento {}: {}".format(
                 intento, estado or _json_field(out, ("error", "code")) or "sin respuesta"))
             if ok and estado in ("working", "blocked"):
                 return True
@@ -471,7 +491,7 @@ class Dispatcher:
             self._abandonar(job, ref, "agente bloqueado (aprobacion o pregunta pendiente)")
             return True
         if ok and status:
-            self.log.write("agente", ref, "se asieto: {}".format(status))
+            self._log(job, "agente", ref, "se asieto: {}".format(status))
             return False
         error = _json_field(out, ("error", "code"))
         if error == "timeout":
@@ -498,12 +518,12 @@ class Dispatcher:
         if cmd and not (wt / "node_modules").exists():
             ok, out = self.run_cmd(cmd, cwd=job.worktree,
                                    timeout=self.spec.install_timeout)
-            self.log.write("worktree", ref, "instalar con {}: {}".format(
+            self._log(job, "worktree", ref, "instalar con {}: {}".format(
                 cmd[0], "ok" if ok else "fallo: " + out.strip()[-160:]))
 
         copiados = copiar_entorno(job.repo_path, job.worktree)
         if copiados:
-            self.log.write("worktree", ref, "entorno: " + ", ".join(copiados))
+            self._log(job, "worktree", ref, "entorno: " + ", ".join(copiados))
 
     def _arbol_limpio(self, job, ref):
         """Antes de correr el gate: el worktree tiene que estar limpio.
@@ -516,7 +536,7 @@ class Dispatcher:
         if ok and not out.strip():
             return True
         detalle = out.strip()[:200] if out and out.strip() else "git status fallo"
-        self.log.write("gate", ref, "arbol sucio: " + detalle)
+        self._log(job, "gate", ref, "arbol sucio: " + detalle)
         if ok:
             self._abandonar(job, ref, "arbol sucio en el worktree: hay cambios "
                                        "sin commitear que no entran al PR; sin "
@@ -533,9 +553,9 @@ class Dispatcher:
         ok, out = self.run_cmd(["./scripts/gate.sh"], cwd=job.worktree,
                                timeout=self.spec.gate_timeout)
         if ok:
-            self.log.write("gate", ref, "verde")
+            self._log(job, "gate", ref, "verde")
             return True
-        self.log.write("gate", ref, "rojo: " + out.strip()[-200:])
+        self._log(job, "gate", ref, "rojo: " + out.strip()[-200:])
         self._abandonar(job, ref, "gate rojo en el worktree: sin PR")
         return False
 
@@ -564,7 +584,7 @@ class Dispatcher:
         if not self._pr_no_toca_protegido(job, ref, num):
             return
         job.estado = "hecho"
-        self.log.write("pr", ref, "PR #{} abierto (gate verde)".format(num))
+        self._log(job, "pr", ref, "PR #{} abierto (gate verde)".format(num))
 
     def _pr_mide_el_head(self, job, ref, num):
         """El gate midió el HEAD de la rama. Si el PR apunta a otro commit,
@@ -576,7 +596,7 @@ class Dispatcher:
         oid = _json_field(out, ("headRefOid",))
         if head and oid and head == oid:
             return True
-        self.log.write("gate", ref,
+        self._log(job, "gate", ref,
                        "head del PR {} != HEAD de la rama {}".format(oid, head))
         self._abandonar(job, ref, "el head del PR no coincide con el HEAD de la "
                                    "rama: el gate midio algo que no va en el PR")
@@ -599,7 +619,7 @@ class Dispatcher:
         if not tocada:
             return True
         ruta, que_protege = tocada
-        self.log.write("gate", ref, "el PR toca {} ({})".format(que_protege, ruta))
+        self._log(job, "gate", ref, "el PR toca {} ({})".format(que_protege, ruta))
         self._abandonar(job, ref, "el PR toca {} ({}): no se acepta; el ticket "
                                    "queda para humano".format(que_protege, ruta))
         self._marcar_para_humano(job, ref)
@@ -640,13 +660,13 @@ class Dispatcher:
         if job.worktree:
             self.run_cmd(["git", "-C", job.repo_path, "worktree", "remove",
                           "--force", job.worktree], timeout=120)
-        self.log.write("limpieza", ref,
-                       "{}worktree removido, rama {} quedo".format(cerrado, job.branch))
+        self._log(job, "limpieza", ref,
+                  "{}worktree removido, rama {} quedo".format(cerrado, job.branch))
 
     def _abandonar(self, job, ref, motivo):
         job.estado = "abandonado"
         job.motivo = motivo
-        self.log.write("abandono", ref, motivo)
+        self._log(job, "abandono", ref, motivo)
 
 
 # ---------------------------------------------------------------- cosecha

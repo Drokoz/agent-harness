@@ -132,8 +132,10 @@ def spec(**kw):
     return DispatchSpec(contexto="personal", **kw)
 
 
-def job(issue=7, repo="koku", path="/repos/koku", slug="Drokoz/koku"):
-    return Job(repo=repo, repo_path=path, slug=slug, issue=issue)
+def job(issue=7, repo="koku", path="/repos/koku", slug="Drokoz/koku",
+        attempt=1):
+    return Job(repo=repo, repo_path=path, slug=slug, issue=issue,
+               attempt=attempt)
 
 
 def despachar(mundo, jobs, **kw):
@@ -187,11 +189,30 @@ class TestEventLog(unittest.TestCase):
             self.assertEqual(len(lineas), 2)
             for linea in lineas:
                 self.assertEqual(
-                    sorted(linea), ["contexto", "cuerpo", "origen", "ref",
+                    sorted(linea), ["attempt", "contexto", "cuerpo",
+                                    "origen", "ref", "run_id", "ticket",
                                     "timestamp", "tipo"])
                 self.assertEqual(linea["origen"], "harness")
             self.assertEqual(lineas[0]["contexto"], "personal")
             self.assertEqual(lineas[1]["timestamp"], "otra-timestamp")
+            # una instancia es una corrida: el run_id distingue tandas
+            self.assertNotEqual(lineas[0]["run_id"], lineas[1]["run_id"])
+
+    def test_lleva_run_id_ticket_y_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "e.jsonl"
+            log = EventLog(p, "personal",
+                           reloj=lambda: "2026-08-22T12:00:00Z",
+                           run_id="r1")
+            log.write("corrida", "corrida", "inicio: 1 ticket(s)")
+            log.write("gate", "ticket/7", "verde", ticket="koku#7",
+                      attempt=2)
+            lineas = [json.loads(l) for l in p.read_text().splitlines()]
+            self.assertEqual(lineas[0]["run_id"], "r1")
+            self.assertIsNone(lineas[0]["ticket"])
+            self.assertIsNone(lineas[0]["attempt"])
+            self.assertEqual(lineas[1]["ticket"], "koku#7")
+            self.assertEqual(lineas[1]["attempt"], 2)
 
 
 class TestCicloDeVida(unittest.TestCase):
@@ -219,6 +240,19 @@ class TestCicloDeVida(unittest.TestCase):
             self.assertIn("--cwd", a)
             cwds.append(a[a.index("--cwd") + 1])
         self.assertEqual(len(set(cwds)), 2)
+
+    def test_el_job_deja_sus_marcas_en_el_log(self):
+        m = Mundo()
+        res, lineas = despachar(m, [job(attempt=3)])
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        self.assertEqual(len({l["run_id"] for l in lineas}), 1)
+        for l in lineas:
+            if l["ref"] == "ticket/7":
+                self.assertEqual(l["ticket"], "koku#7")
+                self.assertEqual(l["attempt"], 3)
+            else:
+                self.assertIsNone(l["ticket"])
+                self.assertIsNone(l["attempt"])
 
     def test_nunca_merge(self):
         m = Mundo()
