@@ -13,11 +13,12 @@ import support  # noqa: F401  (pone la raíz del repo en sys.path)
 from harness import state
 
 
-def ev(tipo, ref, cuerpo, ts, run_id="r1", ticket="koku#7", attempt=1):
+def ev(tipo, ref, cuerpo, ts, run_id="r1", ticket="koku#7", attempt=1,
+       clase=None):
     """Una línea del esquema nuevo."""
     return {"timestamp": ts, "contexto": "personal", "origen": "harness",
             "run_id": run_id, "ticket": ticket, "attempt": attempt,
-            "tipo": tipo, "ref": ref, "cuerpo": cuerpo}
+            "tipo": tipo, "ref": ref, "cuerpo": cuerpo, "clase": clase}
 
 
 def vieja(tipo, ref, cuerpo, ts):
@@ -249,6 +250,49 @@ class TestDuracionMedia(unittest.TestCase):
         # claude: 14:00 (primer evento) -> 14:11 (pr) = 11 min
         self.assertEqual(state.duracion_media(evs, "claude"), 11.0)
         self.assertEqual(state.duracion_media(evs, "codex"), 0.0)
+
+
+class TestIntentosQueEscalan(unittest.TestCase):
+    """Cuántos intentos de un ticket consumen un peldaño de la escalera de
+    reintentos (#38): todos los que terminan en abandono, salvo los
+    clasificados `infra` -- esos se reintentan en el acto (#37) y no
+    cuentan."""
+
+    def test_infra_no_escala_pero_modelo_si(self):
+        evs = [
+            ev("abandono", "ticket/7", "no se pudo crear el worktree",
+               "2026-08-22T12:00:00Z", run_id="r1", clase="infra"),
+            ev("abandono", "ticket/7", "gate rojo en el worktree: sin PR",
+               "2026-08-23T12:00:00Z", run_id="r2", clase="modelo"),
+        ]
+        self.assertEqual(state.intentos_que_escalan(evs, "koku", 7), 1)
+
+    def test_humano_tambien_escala(self):
+        evs = [ev("abandono", "ticket/7",
+                  "agente bloqueado (aprobacion o pregunta pendiente)",
+                  "2026-08-22T12:00:00Z", run_id="r1", clase="humano")]
+        self.assertEqual(state.intentos_que_escalan(evs, "koku", 7), 1)
+
+    def test_lineas_viejas_sin_clase_cuentan_como_modelo(self):
+        """El default conservador: una causa desconocida gasta peldaño,
+        no lo reintenta gratis."""
+        evs = [vieja("abandono", "ticket/7",
+                     "gate rojo en el worktree: sin PR",
+                     "2026-08-22T12:00:00Z")]
+        self.assertEqual(state.intentos_que_escalan(evs, "koku", 7), 1)
+
+    def test_una_corrida_sin_abandono_no_escala(self):
+        evs = [ev("pr", "ticket/7", "PR #35 abierto (gate verde)",
+                  "2026-08-22T12:00:00Z", run_id="r1")]
+        self.assertEqual(state.intentos_que_escalan(evs, "koku", 7), 0)
+
+    def test_vacio(self):
+        self.assertEqual(state.intentos_que_escalan([], "koku", 7), 0)
+
+    def test_no_se_mecha_con_otro_repo(self):
+        evs = [ev("abandono", "ticket/7", "gate rojo", "2026-08-22T12:00:00Z",
+                  run_id="r9", ticket="otro#7", clase="modelo")]
+        self.assertEqual(state.intentos_que_escalan(evs, "koku", 7), 0)
 
 
 if __name__ == "__main__":

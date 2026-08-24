@@ -201,10 +201,11 @@ class TestEventLog(unittest.TestCase):
             self.assertEqual(len(lineas), 2)
             for linea in lineas:
                 self.assertEqual(
-                    sorted(linea), ["attempt", "contexto", "cuerpo",
+                    sorted(linea), ["attempt", "clase", "contexto", "cuerpo",
                                     "origen", "ref", "run_id", "ticket",
                                     "timestamp", "tipo"])
                 self.assertEqual(linea["origen"], "harness")
+                self.assertIsNone(linea["clase"])
             self.assertEqual(lineas[0]["contexto"], "personal")
             self.assertEqual(lineas[1]["timestamp"], "otra-timestamp")
             # una instancia es una corrida: el run_id distingue tandas
@@ -225,6 +226,15 @@ class TestEventLog(unittest.TestCase):
             self.assertIsNone(lineas[0]["attempt"])
             self.assertEqual(lineas[1]["ticket"], "koku#7")
             self.assertEqual(lineas[1]["attempt"], 2)
+
+    def test_lleva_clase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "e.jsonl"
+            log = EventLog(p, "personal", reloj=lambda: "2026-08-22T12:00:00Z")
+            log.write("abandono", "ticket/7", "algo", ticket="koku#7",
+                      attempt=1, clase="infra")
+            linea = json.loads(p.read_text().splitlines()[0])
+            self.assertEqual(linea["clase"], "infra")
 
 
 class TestCicloDeVida(unittest.TestCase):
@@ -873,3 +883,169 @@ class TestElGateMideLoQueVaEnElPR(unittest.TestCase):
         self.assertIsNone(dispatch.ruta_protegida("README.md"))
         self.assertIsNone(dispatch.ruta_protegida("docs/scripts/gate.sh"),
                           "sólo el gate del repo, no uno homónimo en otro path")
+
+
+class TestClasificacionDeAbandonos(unittest.TestCase):
+    """Cada abandono lleva una clase -- infra, modelo o humano -- en el
+    evento (#37). `infra` es la única que reintenta en el acto (hasta
+    `infra_retries` veces) antes de rendirse; las otras dos son
+    abandonos definitivos de ese intento, sin reintento local.
+    """
+
+    def _clase(self, lineas, ref="ticket/7"):
+        (abandono,) = [l for l in lineas
+                       if l["tipo"] == "abandono" and l["ref"] == ref]
+        return abandono["clase"]
+
+    def test_worktree_es_infra_y_reintenta(self):
+        intentos = []
+        m = Mundo()
+
+        def add(args):
+            intentos.append(1)
+            return (False, "fatal: no pathspec")
+
+        m.responder(lambda a: a[0] == "git" and "worktree" in a and "add" in a, add)
+        res, lineas = despachar(m, [job()], infra_retries=2, infra_retry_wait_s=0)
+        self.assertEqual(res[0].estado, "abandonado")
+        self.assertEqual(res[0].clase_abandono, "infra")
+        self.assertEqual(self._clase(lineas), "infra")
+        self.assertEqual(len(intentos), 3)  # 1 + 2 reintentos
+
+    def test_worktree_se_recupera_con_el_reintento(self):
+        intentos = []
+        m = Mundo()
+
+        def add(args):
+            intentos.append(1)
+            if len(intentos) < 2:
+                return (False, "fatal: no pathspec")
+            return (True, "")
+
+        m.responder(lambda a: a[0] == "git" and "worktree" in a and "add" in a, add)
+        res, lineas = despachar(m, [job()], infra_retries=2, infra_retry_wait_s=0)
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        self.assertNotIn("abandono", [l["tipo"] for l in lineas])
+        self.assertEqual(len(intentos), 2)
+
+    def test_pane_es_infra_y_reintenta(self):
+        m = Mundo()
+        m.responder(lambda a: a[:2] == ["herdr", "pane"] and "split" in a,
+                    (False, "fallo de pane"))
+        res, lineas = despachar(m, [job()], infra_retries=1, infra_retry_wait_s=0)
+        self.assertEqual(res[0].estado, "abandonado")
+        self.assertEqual(res[0].clase_abandono, "infra")
+        self.assertEqual(self._clase(lineas), "infra")
+        self.assertEqual(len(m.llamo("herdr", "pane", "split")), 2)  # 1 + 1 reintento
+
+    def test_arranque_del_agente_es_infra(self):
+        m = Mundo()
+        m.responder(lambda a: a[:3] == ["herdr", "agent", "start"],
+                    (False, '{"error":{"code":"algo raro"}}'))
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "abandonado")
+        self.assertEqual(self._clase(lineas), "infra")
+
+    def test_prompt_perdido_es_infra(self):
+        m = Mundo(pane_out=PANE_CERO)
+        res, lineas = despachar(m, [job()], verify_wait_s=0.01,
+                                verify_poll_s=0.01, verify_retries=1)
+        self.assertEqual(res[0].estado, "abandonado")
+        self.assertEqual(self._clase(lineas), "infra")
+
+    def test_agente_bloqueado_es_humano(self):
+        m = Mundo(wait_out='{"result":{"agent":{"agent_status":"blocked"}}}')
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "abandonado")
+        self.assertEqual(res[0].clase_abandono, "humano")
+        self.assertEqual(self._clase(lineas), "humano")
+
+    def test_timeout_de_espera_es_modelo(self):
+        m = Mundo()
+        m.wait_out = '{"error":{"code":"timeout"},"id":"cli:agent:wait"}'
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].clase_abandono, "modelo")
+        self.assertEqual(self._clase(lineas), "modelo")
+
+    def test_fallo_al_esperar_es_infra_y_reintenta(self):
+        llamadas = []
+        m = Mundo()
+
+        def wait(args):
+            llamadas.append(1)
+            return (False, '{"error":{"code":"conexion perdida"}}')
+
+        m.responder(lambda a: a[:3] == ["herdr", "agent", "wait"], wait)
+        res, lineas = despachar(m, [job()], infra_retries=2, infra_retry_wait_s=0)
+        self.assertEqual(res[0].estado, "abandonado")
+        self.assertEqual(self._clase(lineas), "infra")
+        self.assertEqual(len(llamadas), 3)
+
+    def test_gate_rojo_es_modelo(self):
+        m = Mundo(gate=(False, "ROJO: unittest"))
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].clase_abandono, "modelo")
+        self.assertEqual(self._clase(lineas), "modelo")
+
+    def test_arbol_sucio_es_modelo(self):
+        m = Mundo()
+        m.responder(lambda a: a[0] == "git" and "status" in a,
+                    (True, " M harness/dispatch.py\n"))
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].clase_abandono, "modelo")
+        self.assertEqual(self._clase(lineas), "modelo")
+
+    def test_git_status_fallido_es_infra_y_reintenta(self):
+        llamadas = []
+        m = Mundo()
+
+        def status(args):
+            llamadas.append(1)
+            return (False, "git: error")
+
+        m.responder(lambda a: a[0] == "git" and "status" in a, status)
+        res, lineas = despachar(m, [job()], infra_retries=2, infra_retry_wait_s=0)
+        self.assertEqual(res[0].estado, "abandonado")
+        self.assertEqual(self._clase(lineas), "infra")
+        self.assertEqual(len(llamadas), 3)
+
+    def test_sin_pr_es_modelo(self):
+        m = Mundo(prs=[{"number": 31, "headRefName": "otra-rama"}])
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].clase_abandono, "modelo")
+        self.assertEqual(self._clase(lineas), "modelo")
+
+    def test_head_no_coincide_es_modelo(self):
+        m = Mundo(pr_head_oid="b" * 40)
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].clase_abandono, "modelo")
+        self.assertEqual(self._clase(lineas), "modelo")
+
+    def test_pr_toca_protegido_es_modelo(self):
+        m = Mundo(pr_files=["scripts/gate.sh"])
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].clase_abandono, "modelo")
+        self.assertEqual(self._clase(lineas), "modelo")
+
+    def test_no_leer_archivos_del_pr_es_infra_y_reintenta(self):
+        llamadas = []
+        m = Mundo()
+
+        def ver_archivos(args):
+            llamadas.append(1)
+            return (False, "")
+
+        m.responder(lambda a: a[:2] == ["gh", "pr"] and "view" in a and "files" in a,
+                    ver_archivos)
+        res, lineas = despachar(m, [job()], infra_retries=2, infra_retry_wait_s=0)
+        self.assertEqual(res[0].estado, "abandonado")
+        self.assertEqual(self._clase(lineas), "infra")
+        self.assertEqual(len(llamadas), 3)
+
+    def test_causa_desconocida_por_default_es_modelo(self):
+        """El default conservador: sin clase explicita, gasta peldaño."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Dispatcher(spec(), log_en(tmp), Mundo().cmd)
+            j = job()
+            d._abandonar(j, "ticket/7", "algo que no se anticipo")
+        self.assertEqual(j.clase_abandono, "modelo")

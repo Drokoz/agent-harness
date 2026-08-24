@@ -4,10 +4,12 @@ El log de `harness.dispatch` ya es un event store append-only, pero hasta
 hoy sólo se escribe: sin leerlo no hay forma de saber que un ticket ya
 falló dos veces ni con qué runner. Este módulo lo lee y contesta las
 preguntas sobre el historial: `de_ticket` (qué le pasó a un ticket),
-`tasas` (éxito/abandono por runner y por repo) y `duracion_media`
-(minutos por ticket cerrado, por runner); y da el estado de la frontera
-(`estado_frontier`, ticket #43): qué tickets fueron despachados, y cuáles
-de esa marca siguen vivos (con agente en el worktree) y cuáles no.
+`tasas` (éxito/abandono por runner y por repo), `duracion_media`
+(minutos por ticket cerrado, por runner) e `intentos_que_escalan`
+(cuántos abandonos consumen un peldaño de la escalera de reintentos,
+#38); y da el estado de la frontera (`estado_frontier`, ticket #43): qué
+tickets fueron despachados, y cuáles de esa marca siguen vivos (con
+agente en el worktree) y cuáles no.
 
 Puro: los eventos entran como la lista de dicts que da
 `harness.summary.leer_eventos`, y no se toca nada más — ni disco, ni red,
@@ -148,6 +150,26 @@ def de_ticket(eventos, repo, issue):
                         ultimo_runner=ultimo_runner,
                         duracion_min=duracion,
                         costo=costo)
+
+
+def intentos_que_escalan(eventos, repo, issue):
+    """Cuántos intentos de este ticket consumen un peldaño de la escalera
+    de reintentos (#38): los que terminan en abandono, salvo los
+    clasificados `infra` -- esos se reintentan en el acto (#37) y no
+    cuentan. Una corrida sin línea `abandono` (todavía en curso, o
+    cerrada con `pr`) tampoco cuenta: nada que escalar.
+
+    La clase de una línea vieja (sin `clase`, escrita antes de #37) se
+    lee como `modelo`: el default conservador es el que gasta, no el
+    que reintenta gratis.
+    """
+    clase_por_run = {}
+    for e in eventos:
+        if not _es_de(e, repo, issue) or e.get("tipo") != "abandono":
+            continue
+        run = e.get("run_id") or _SIN_RUN
+        clase_por_run[run] = e.get("clase") or "modelo"
+    return sum(1 for clase in clase_por_run.values() if clase != "infra")
 
 
 def _agregar(tabla, grupo, clave):
