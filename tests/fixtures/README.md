@@ -11,6 +11,7 @@ tests de snapshot lo acusan.
 | `gh_pr_list.json` | `gh pr list --state all --limit 3 --json number,title,isDraft,headRefName -R Drokoz/agent-harness` |
 | `herdr_agent_list.json` | `herdr agent list` |
 | `openrouter_credits.json` | `GET https://openrouter.ai/api/v1/credits` |
+| `claude_sessions/` | layout sintético de `~/.claude/projects/` (una carpeta por proyecto con el path codificado, `<sesion>.jsonl` por sesión), para `harness quota`; las líneas asistente tienen el schema real de `message.usage` |
 
 Capturadas el 2026-08-22, reindentadas (`json.dumps(..., indent=2, sort_keys=True)`)
 para que un diff se lea; el contenido no se tocó, con una excepción: los montos de
