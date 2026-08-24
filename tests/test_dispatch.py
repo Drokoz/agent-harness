@@ -160,7 +160,19 @@ class TestPuros(unittest.TestCase):
         self.assertIn("#7", p)
         self.assertIn("Closes #7", p)
         self.assertIn("./scripts/gate.sh", p)
-        self.assertIn("never merge", p)
+        # Sin distinguir mayusculas: la regla puede caer al inicio de oracion.
+        self.assertIn("never merge", p.lower())
+
+    def test_prompt_exige_commitear_y_empujar(self):
+        """Cinco de seis tickets de la tanda del 2026-08-24 se abandonaron con
+        cero commits en la rama: el prompt presentaba el PR como condicional
+        ("open the PR only if...") y nunca decia que commitear era obligatorio.
+        El trabajo sin commitear no entra al PR y la limpieza lo borra."""
+        p = prompt_de(7)
+        self.assertIn("commit", p)
+        self.assertIn("push", p)
+        # Que quede dicho que no terminar asi es un fracaso, no una opcion.
+        self.assertIn("discarded", p)
 
     def test_nombre_agente_es_valido_y_distingue(self):
         for n in (nombre_agente("koku", 7), nombre_agente("ERP-IphoneUp", 7),
@@ -394,12 +406,50 @@ class TestLimpieza(unittest.TestCase):
 
 
 class TestCosto(unittest.TestCase):
-    def test_costo_por_job_de_la_linea_de_estado(self):
-        m = Mundo()
+    """El costo por job (#53): la línea de estado de la TUI de pi no es una
+    fuente confiable —una corrida real midió $1.7085 de delta de créditos con
+    los cuatro jobs en $0.0000— así que el costo sale de repartir el delta de
+    créditos de la corrida entre los jobs que prendieron un pane.
+    """
+
+    def test_costo_por_job_se_reparte_el_delta_de_creditos(self):
+        m = Mundo(credits=[100.0, 100.25])
         res, lineas = despachar(m, [job()])
-        self.assertAlmostEqual(res[0].costo, 0.056)
+        self.assertAlmostEqual(res[0].costo, 0.25)
         costo = [l for l in lineas if l["tipo"] == "costo" and l["ref"] == "ticket/7"]
-        self.assertIn("0.056", costo[0]["cuerpo"])
+        self.assertIn("0.25", costo[0]["cuerpo"])
+
+    def test_costo_se_reparte_entre_varios_jobs(self):
+        m = Mundo(credits=[100.0, 100.30])
+        res, _ = despachar(m, [job(7), job(8)], max_parallel=2)
+        for r in res:
+            self.assertAlmostEqual(r.costo, 0.15)
+        self.assertAlmostEqual(sum(r.costo for r in res), 0.30)
+
+    def test_una_linea_de_estado_real_de_pi_no_se_usa_para_el_costo(self):
+        """Aunque el pane muestre una línea de estado real de pi con costo
+        (la evidencia de que el prompt llegó, ver `_llego`), el costo del job
+        sale del delta de créditos, no de leerla."""
+        real = ("⠏ Working...\n~/repo (ticket/7)\n"
+                "↑78k ↓5.9k R34k CH0.0% $0.056 11.4%/262k ...\n")
+        m = Mundo(pane_out=real, credits=[100.0, 101.7085])
+        res, _ = despachar(m, [job()])
+        self.assertAlmostEqual(res[0].costo, 1.7085)
+
+    def test_costo_desconocido_no_es_cero_sin_creditos(self):
+        m = Mundo(credits=[None, None])
+        res, lineas = despachar(m, [job()])
+        self.assertIsNone(res[0].costo)
+        costo = [l for l in lineas if l["tipo"] == "costo" and l["ref"] == "ticket/7"]
+        self.assertEqual(costo[0]["cuerpo"], "desconocido")
+
+    def test_costo_es_cero_si_el_job_nunca_prendio_pane(self):
+        m = Mundo(credits=[100.0, 100.25]).responder(
+            lambda a: a[0] == "git" and "worktree" in a and "add" in a,
+            (False, "fatal: no pathspec"))
+        res, _ = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "abandonado")
+        self.assertEqual(res[0].costo, 0.0)
 
     def test_costo_de_la_corrida_por_diferencia_de_creditos(self):
         m = Mundo(credits=[100.0, 100.25])
@@ -793,7 +843,8 @@ class TestElGateMideLoQueVaEnElPR(unittest.TestCase):
         res, lineas = despachar(m, [job()])
         self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
         self.assertIn("gate.sh", res[0].motivo)
-        (marco,) = m.llamo("gh", "issue", "edit", "--add-label", "ready-for-human")
+        (marco,) = m.llamo("gh", "issue", "edit", "--add-label", "ready-for-human",
+                           "--remove-label", "ready-for-agent")
         self.assertEqual(marco[0][3], "7")
         self.assertNotIn("pr", [l["tipo"] for l in lineas])
 
@@ -802,6 +853,25 @@ class TestElGateMideLoQueVaEnElPR(unittest.TestCase):
             m = Mundo(pr_files=[ruta])
             res, _ = despachar(m, [job()])
             self.assertEqual(res[0].estado, "abandonado", (ruta, res[0].motivo))
+
+    def test_marcar_para_humano_saca_ready_for_agent(self):
+        """`_marcar_para_humano` no sólo agrega `ready-for-human`: tiene que
+        sacar `ready-for-agent` en la misma llamada, o el ticket sigue en la
+        frontera y la próxima corrida lo vuelve a despachar (#52)."""
+        m = Mundo()
+        d = Dispatcher(spec(), log_en(tempfile.mkdtemp()), m.cmd, dormir=m.dormir)
+        j = job()
+
+        d._marcar_para_humano(j, "ticket/7")
+
+        (llamada,) = m.llamo("gh", "issue", "edit")
+        args = llamada[0]
+        self.assertIn("7", args)
+        self.assertIn("Drokoz/koku", args)
+        i_add = args.index("--add-label")
+        self.assertEqual(args[i_add + 1], "ready-for-human")
+        i_remove = args.index("--remove-label")
+        self.assertEqual(args[i_remove + 1], "ready-for-agent")
 
     def test_ruta_protegida(self):
         self.assertEqual(dispatch.ruta_protegida("scripts/gate.sh"), "el gate")

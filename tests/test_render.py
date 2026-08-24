@@ -135,6 +135,74 @@ class TestResumen(unittest.TestCase):
         self.assertIn("Resumen", salida)
         self.assertIn(OFFLINE_HINT, salida)
 
+    def test_mergeado_y_cerrado_son_grupos_distintos(self):
+        """Un PR mergeado y uno cerrado sin mergear son resultados opuestos:
+        no pueden compartir línea (ticket #55)."""
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z", tickets=[
+            Ticket(contexto="personal", ref="ticket/3",
+                  detalle="PR #19 abierto (gate verde)", estado="mergeado", en_vivo=True),
+            Ticket(contexto="personal", ref="ticket/9",
+                  detalle="PR #20 abierto (gate verde)", estado="cerrado", en_vivo=True),
+        ])
+        salida = self.pantalla(r)
+        self.assertIn("1 tickets mergeados", salida)
+        self.assertIn("1 tickets cerrados sin mergear", salida)
+        self.assertNotIn("tickets con PR abierto (gate verde)", salida)
+
+    def test_sin_confirmar_en_vivo_se_marca_como_tal(self):
+        """Sin red, el ticket se muestra con lo que dice el log, pero
+        distinguido de un estado confirmado en vivo (ticket #55)."""
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z", tickets=[
+            Ticket(contexto="personal", ref="ticket/3",
+                  detalle="PR #19 abierto (gate verde)"),
+        ])
+        salida = self.pantalla(r)
+        self.assertIn("según el log", salida)
+
+    def test_confirmado_en_vivo_no_lleva_la_marca(self):
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z", tickets=[
+            Ticket(contexto="personal", ref="ticket/3",
+                  detalle="PR #19 abierto (gate verde)", en_vivo=True),
+        ])
+        salida = self.pantalla(r)
+        self.assertNotIn("según el log", salida)
+
+
+class TestEstadoFrontera(unittest.TestCase):
+    """El ticket #43: la línea de cada ticket de la frontera muestra su estado."""
+
+    def test_la_frontera_del_golden_tiene_pr_abierto(self):
+        """koku #7 tiene un PR abierto sobre ticket/7 (la fixture lo trae)."""
+        koku = SNAP.contexts[0].repos[1]
+        self.assertEqual([(i.number, i.estado) for i in koku.frontier],
+                         [(7, "pr-abierto"), (9, "libre")])
+        ah = SNAP.contexts[0].repos[0]
+        self.assertEqual([i.estado for i in ah.frontier],
+                         ["libre", "libre", "libre", "libre"])
+
+    def test_el_estado_sale_en_la_linea(self):
+        lineas = render(SNAP, color=False).splitlines()
+        self.assertTrue(any("#7 Cerrar caja del dia sin doble conteo  pr-abierto" in l
+                            for l in lineas))
+        self.assertTrue(any("#9 Exportar a CSV  libre" in l for l in lineas))
+
+    def test_despachado_tambien_se_ve(self):
+        crudo = support.golden_raw("personal")
+        crudo["eventos"] = [{"timestamp": "2026-08-24T02:00:00Z",
+                             "contexto": "personal", "origen": "harness",
+                             "run_id": "r1", "ticket": "koku#9", "attempt": 1,
+                             "tipo": "agente", "ref": "ticket/9",
+                             "cuerpo": "koku-9 (kind pi, pane w9:p2)"}]
+        crudo["agents"] = [{"cwd": "/x/.worktrees/koku-ticket-9"}]
+        for l in render(snapshot(crudo), color=False).splitlines():
+            if "#9 Exportar a CSV" in l:
+                self.assertIn("despachado", l)
+                return
+        self.fail("falta la línea de #9")
+
 
 class TestColor(unittest.TestCase):
     def test_sin_color_no_hay_escapes(self):

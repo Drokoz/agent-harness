@@ -15,10 +15,10 @@
  Trabajo
 
    agent-harness ticket/3 · 2 sin commitear (frontera: dependencias nativas)
-     ▸ #1 Spec: harness — una superficie común para trabajo autónomo en va
-     ▸ #4 Contextos configurables, --context y --json
-     ▸ #12 CI: correr el gate en GitHub Actions
-     ▸ #15 Frontera: usar las dependencias nativas de GitHub en vez de pars
+     ▸ #1 Spec: harness — una superficie común para tr  libre
+     ▸ #4 Contextos configurables, --context y --json  libre
+     ▸ #12 CI: correr el gate en GitHub Actions  libre
+     ▸ #15 Frontera: usar las dependencias nativas de G  libre
      ⊘ #5 Adaptador de Jira: el contexto trabajo en sólo lectura (bloqueado)
      ⊘ #6 Dispatch local con worktrees y log de eventos (bloqueado)
      ⊘ #7 Qué pasó desde la última vez que miré (bloqueado)
@@ -26,8 +26,8 @@
      review #10 Gate y arnés de tests para el propio harness
 
    koku main (frontera: parseo del body)
-     ▸ #7 Cerrar caja del dia sin doble conteo
-     ▸ #9 Exportar a CSV
+     ▸ #7 Cerrar caja del dia sin doble conteo  pr-abierto
+     ▸ #9 Exportar a CSV  libre
      ⊘ #8 Reporte mensual por sucursal (bloqueado)
      draft #21 WIP: cierre de caja
      review #22 Migrar el schema de ventas

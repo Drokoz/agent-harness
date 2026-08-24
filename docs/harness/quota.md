@@ -15,10 +15,21 @@ thinking va dentro del output y no suma dos veces).
 
 Qué dice la tabla:
 
-- **por modelo**: el total histórico de cada modelo. Cada modelo se mide por
-  separado, así que un ticket corrido con `--model fable` queda medido con su
-  propio total y su propia ventana de 5h: se ve si Fable consume su bucket
-  (la semana de Fable que muestra `/usage`) y cuánto queda del general.
+- **total ponderado**: no la suma cruda de los cuatro componentes —
+  `input`, `cache_creation`, `cache_read`, `output`— sino cada uno pesado por
+  su costo relativo (`PESOS` en `harness/quota.py`, comentario ahí de dónde
+  salen los ratios: input=1x, cache write≈1.25x, cache read≈0.1x, output≈5x,
+  del precio por millón de tokens de la API de Claude). Es la línea que
+  arregla el ticket #54: la primera corrida real dio 13.617.021.213 tokens
+  porque sumaba `cache_read` crudo —que se re-cuenta entero en cada
+  mensaje— como si pesara lo mismo que un `input`. Abajo del ponderado, la
+  tabla muestra el desglose crudo de los cuatro componentes; `--json` los
+  trae siempre completos, sin perder el dato: la ponderación es una vista.
+- **por modelo**: el total histórico de cada modelo (crudo, sin ponderar).
+  Cada modelo se mide por separado, así que un ticket corrido con `--model
+  fable` queda medido con su propio total y su propia ventana de 5h: se ve
+  si Fable consume su bucket (la semana de Fable que muestra `/usage`) y
+  cuánto queda del general.
 - **pico en 5h**: el máximo de tokens dentro de *cualquier* ventana de 5
   horas, por modelo. Es la ventana rodante de la cuota de 5h: es lo comparable
   contra el "% used · resets ..." de `/usage`.
@@ -86,7 +97,9 @@ para Tomás o para la próxima corrida de agentes.
 
 ## Forma del `--json`
 
-`harness quota --json` devuelve el agregado crudo: `total`, `por_modelo`
-(con `mensajes`), `pico_5h` (total + inicio y fin de la ventana), `por_semana`
-(clave = inicio de semana en ISO con offset SCL), `por_proyecto` (claves
-`[harness]` para los worktrees), `harness`, `resto`, `archivos`, `mensajes`.
+`harness quota --json` devuelve el agregado crudo: `total` (con sus cuatro
+componentes intactos), `ponderado` (el mismo total pesado por `PESOS`),
+`por_modelo` (con `mensajes`), `pico_5h` (total + inicio y fin de la
+ventana), `por_semana` (clave = inicio de semana en ISO con offset SCL),
+`por_proyecto` (claves `[harness]` para los worktrees), `harness`, `resto`,
+`archivos`, `mensajes`.
