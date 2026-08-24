@@ -17,17 +17,17 @@ from pathlib import Path
 
 import support  # noqa: F401  (pone la raíz en sys.path)
 
-from harness.summary import (PrAbierto, construir, filtrar, guardar_marca,
+from harness.summary import (PrAbierto, Ticket, construir, filtrar, guardar_marca,
                              leer_eventos, leer_marca, parse_evento, parse_fecha,
-                             resumir)
+                             reconciliar, resumir)
 
 HARNESS = support.ROOT / "bin" / "harness"
 
 
-def evento(timestamp, tipo, ref="?", contexto="personal", cuerpo=""):
+def evento(timestamp, tipo, ref="?", contexto="personal", cuerpo="", ticket=None):
     return json.dumps({"timestamp": timestamp, "contexto": contexto,
                        "origen": "harness", "tipo": tipo, "ref": ref,
-                       "cuerpo": cuerpo}, ensure_ascii=False)
+                       "ticket": ticket, "cuerpo": cuerpo}, ensure_ascii=False)
 
 
 LOG_NORMAL = [
@@ -41,7 +41,7 @@ LOG_NORMAL = [
     evento("2026-08-22T01:14:00Z", "prompt", "ticket/3", cuerpo="intento 1"),
     evento("2026-08-22T03:00:00Z", "gate", "ticket/3", cuerpo="verde"),
     evento("2026-08-22T03:00:10Z", "pr", "ticket/3",
-           cuerpo="PR #19 abierto (gate verde)"),
+           cuerpo="PR #19 abierto (gate verde)", ticket="agent-harness#3"),
     evento("2026-08-22T03:00:20Z", "costo", "ticket/3", cuerpo="$0.0560"),
     evento("2026-08-22T03:01:00Z", "limpieza", "ticket/3",
            cuerpo="pane w1:p9 cerrado; worktree removido, rama ticket/3 quedo"),
@@ -49,7 +49,7 @@ LOG_NORMAL = [
            cuerpo="gate rojo en el worktree: sin PR"),
     evento("2026-08-22T02:05:00Z", "costo", "ticket/11", cuerpo="$0.2840"),
     evento("2026-08-22T05:00:00Z", "pr", "ticket/9",
-           cuerpo="PR #20 abierto (gate verde)"),
+           cuerpo="PR #20 abierto (gate verde)", ticket="agent-harness#9"),
     evento("2026-08-22T05:10:00Z", "costo", "ticket/9", cuerpo="$0.4300"),
     evento("2026-08-22T05:11:00Z", "costo", "corrida",
            cuerpo="creditos antes 25.0 / despues 24.18 / delta $0.8200"),
@@ -139,10 +139,64 @@ class TestResumir(unittest.TestCase):
         # entra (mediría el mismo gasto dos veces).
         self.assertAlmostEqual(costo, 0.0560 + 0.2840 + 0.4300)
 
+    def test_extrae_repo_y_numero_del_pr(self):
+        """El repo sale de `ticket` ("repo#issue"), el número del cuerpo:
+        son la clave que necesita `reconciliar` para consultar en vivo."""
+        eventos = [json.loads(l) for l in LOG_NORMAL]
+        tickets, _, _ = resumir(eventos)
+        self.assertEqual([(t.repo, t.numero) for t in tickets],
+                         [("agent-harness", 19), ("agent-harness", 20)])
+        self.assertEqual([t.estado for t in tickets], ["abierto", "abierto"])
+        self.assertFalse(any(t.en_vivo for t in tickets))
+
+    def test_pr_sin_ticket_ni_numero_queda_sin_repo(self):
+        eventos = [json.loads(evento("2026-08-22T01:00:00Z", "pr", "ticket/3",
+                                     cuerpo="PR abierto"))]
+        tickets, _, _ = resumir(eventos)
+        self.assertIsNone(tickets[0].repo)
+        self.assertIsNone(tickets[0].numero)
+
     def test_eventos_sin_tipo_no_cuentan(self):
         eventos = [json.loads(evento("2026-08-22T01:00:00Z", "gate",
                                      "ticket/3", cuerpo="verde"))]
         self.assertEqual(resumir(eventos), ([], [], 0.0))
+
+
+class TestReconciliar(unittest.TestCase):
+    """`reconciliar` corrige el estado de cada ticket contra GitHub: el
+    merge es humano y el log nunca se entera solo."""
+
+    def _ticket(self, repo="agent-harness", numero=19):
+        return Ticket(contexto="personal", ref="ticket/3",
+                     detalle="PR #19 abierto (gate verde)", repo=repo, numero=numero)
+
+    def test_mergeado(self):
+        out = reconciliar([self._ticket()], lambda repo, num: "MERGED")
+        self.assertEqual(out[0].estado, "mergeado")
+        self.assertTrue(out[0].en_vivo)
+
+    def test_cerrado_sin_mergear_es_distinto_de_mergeado(self):
+        out = reconciliar([self._ticket()], lambda repo, num: "CLOSED")
+        self.assertEqual(out[0].estado, "cerrado")
+        self.assertTrue(out[0].en_vivo)
+
+    def test_sigue_abierto_pero_confirmado_en_vivo(self):
+        out = reconciliar([self._ticket()], lambda repo, num: "OPEN")
+        self.assertEqual(out[0].estado, "abierto")
+        self.assertTrue(out[0].en_vivo)
+
+    def test_resolver_sin_respuesta_cae_al_log(self):
+        out = reconciliar([self._ticket()], lambda repo, num: None)
+        self.assertEqual(out[0].estado, "abierto")
+        self.assertFalse(out[0].en_vivo)
+
+    def test_sin_repo_o_numero_no_llama_al_resolver(self):
+        llamado = []
+        resolver = lambda repo, num: llamado.append((repo, num)) or "MERGED"
+        out = reconciliar([self._ticket(repo=None), self._ticket(numero=None)], resolver)
+        self.assertEqual(llamado, [])
+        self.assertFalse(out[0].en_vivo)
+        self.assertFalse(out[1].en_vivo)
 
 
 class TestFiltrar(unittest.TestCase):
@@ -174,6 +228,25 @@ class TestConstruir(unittest.TestCase):
         self.assertTrue(r.paso_algo)
         self.assertEqual(len(r.prs), 2)
         self.assertAlmostEqual(r.costo, 0.77)
+
+    def test_sin_resolver_pr_no_reconcilia(self):
+        """Sin `resolver_pr` (el default), los tickets quedan como los deja
+        el log: abierto, sin confirmar en vivo."""
+        r = construir([json.loads(l) for l in LOG_NORMAL], [])
+        self.assertTrue(all(t.estado == "abierto" and not t.en_vivo
+                            for t in r.tickets))
+
+    def test_resolver_pr_reconcilia_cada_ticket(self):
+        """`ticket/3` (PR #19) aparece mergeado en vivo; `ticket/9` (PR #20)
+        sigue abierto: son estados que hay que poder distinguir."""
+        estados = {19: "MERGED", 20: "OPEN"}
+        resolver = lambda repo, numero: estados.get(numero)
+        r = construir([json.loads(l) for l in LOG_NORMAL], [], resolver_pr=resolver)
+        por_numero = {t.numero: t for t in r.tickets}
+        self.assertEqual(por_numero[19].estado, "mergeado")
+        self.assertTrue(por_numero[19].en_vivo)
+        self.assertEqual(por_numero[20].estado, "abierto")
+        self.assertTrue(por_numero[20].en_vivo)
 
 
 class TestMarca(unittest.TestCase):

@@ -228,7 +228,20 @@ def resumen_de(args, snap):
         guardar_marca(mark_path, _ahora_str)
     return construir(eventos, prs,
                      desde=None if desde_dt is None else _iso_utc(desde_dt),
-                     hasta=_ahora_str())
+                     hasta=_ahora_str(), resolver_pr=_resolver_pr(snap))
+
+
+def _resolver_pr(snap):
+    """`resolver_pr` de `construir`: el repo de un ticket (nombre, no slug)
+    a su estado en vivo, vía `adapters.pr_state`. Se llama sólo cuando no
+    estamos offline (`resumen_de` ya cortó antes); un repo sin slug en el
+    snapshot deja el ticket con lo que dice el log."""
+    slugs = {r.name: r.slug for ctx in snap.contexts for r in ctx.repos if r.slug}
+
+    def resolver(repo, numero):
+        slug = slugs.get(repo)
+        return adapters.pr_state(slug, numero) if slug else None
+    return resolver
 
 
 def _iso_utc(dt):

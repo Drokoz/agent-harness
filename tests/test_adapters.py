@@ -60,6 +60,38 @@ class TestGhJson(unittest.TestCase):
             self.assertIsNone(adapters.gh_json("o/r", ["pr", "list"]))
 
 
+class TestPrState(unittest.TestCase):
+    def test_mergeado(self):
+        run = fake_run({"gh pr view": (True, json.dumps({"state": "MERGED"}))})
+        with mock.patch.object(adapters, "run", run):
+            self.assertEqual(adapters.pr_state("o/r", 19), "MERGED")
+        self.assertEqual(run.llamadas[0][-2:], ["-R", "o/r"])
+
+    def test_abierto(self):
+        run = fake_run({"gh pr view": (True, json.dumps({"state": "OPEN"}))})
+        with mock.patch.object(adapters, "run", run):
+            self.assertEqual(adapters.pr_state("o/r", 19), "OPEN")
+
+    def test_cerrado(self):
+        run = fake_run({"gh pr view": (True, json.dumps({"state": "CLOSED"}))})
+        with mock.patch.object(adapters, "run", run):
+            self.assertEqual(adapters.pr_state("o/r", 19), "CLOSED")
+
+    def test_gh_caido_es_none(self):
+        with mock.patch.object(adapters, "run", fake_run({})):
+            self.assertIsNone(adapters.pr_state("o/r", 19))
+
+    def test_json_roto_es_none(self):
+        run = fake_run({"gh pr view": (True, "no soy json")})
+        with mock.patch.object(adapters, "run", run):
+            self.assertIsNone(adapters.pr_state("o/r", 19))
+
+    def test_estado_desconocido_es_none(self):
+        run = fake_run({"gh pr view": (True, json.dumps({"state": "DRAFT"}))})
+        with mock.patch.object(adapters, "run", run):
+            self.assertIsNone(adapters.pr_state("o/r", 19))
+
+
 class TestHerdr(unittest.TestCase):
     def test_fuera_de_herdr_es_none(self):
         with mock.patch.dict("os.environ", {"HERDR_ENV": "0"}):

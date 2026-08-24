@@ -135,6 +135,41 @@ class TestResumen(unittest.TestCase):
         self.assertIn("Resumen", salida)
         self.assertIn(OFFLINE_HINT, salida)
 
+    def test_mergeado_y_cerrado_son_grupos_distintos(self):
+        """Un PR mergeado y uno cerrado sin mergear son resultados opuestos:
+        no pueden compartir línea (ticket #55)."""
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z", tickets=[
+            Ticket(contexto="personal", ref="ticket/3",
+                  detalle="PR #19 abierto (gate verde)", estado="mergeado", en_vivo=True),
+            Ticket(contexto="personal", ref="ticket/9",
+                  detalle="PR #20 abierto (gate verde)", estado="cerrado", en_vivo=True),
+        ])
+        salida = self.pantalla(r)
+        self.assertIn("1 tickets mergeados", salida)
+        self.assertIn("1 tickets cerrados sin mergear", salida)
+        self.assertNotIn("tickets con PR abierto (gate verde)", salida)
+
+    def test_sin_confirmar_en_vivo_se_marca_como_tal(self):
+        """Sin red, el ticket se muestra con lo que dice el log, pero
+        distinguido de un estado confirmado en vivo (ticket #55)."""
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z", tickets=[
+            Ticket(contexto="personal", ref="ticket/3",
+                  detalle="PR #19 abierto (gate verde)"),
+        ])
+        salida = self.pantalla(r)
+        self.assertIn("según el log", salida)
+
+    def test_confirmado_en_vivo_no_lleva_la_marca(self):
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z", tickets=[
+            Ticket(contexto="personal", ref="ticket/3",
+                  detalle="PR #19 abierto (gate verde)", en_vivo=True),
+        ])
+        salida = self.pantalla(r)
+        self.assertNotIn("según el log", salida)
+
 
 class TestColor(unittest.TestCase):
     def test_sin_color_no_hay_escapes(self):

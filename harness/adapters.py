@@ -201,6 +201,23 @@ def vault_decision_files(vault):
     return _markdown_files(Path(vault).expanduser() / "decisiones")
 
 
+def pr_state(slug, number):
+    """El estado en vivo de un PR: OPEN, MERGED o CLOSED. None si no se pudo
+    consultar (sin red, sin gh, PR inexistente): el merge es humano y no deja
+    evento en el log del dispatcher, así que esto es lo único que reconcilia
+    qué pasó después de lo último que hizo el harness.
+    """
+    ok, out = run(["gh", "pr", "view", str(number), "--json", "state", "-R", slug])
+    if not ok or not out:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    estado = data.get("state") if isinstance(data, dict) else None
+    return estado if estado in ("OPEN", "MERGED", "CLOSED") else None
+
+
 def gh_json(slug, args):
     ok, out = run(["gh", *args, "-R", slug])
     if not ok or not out:
