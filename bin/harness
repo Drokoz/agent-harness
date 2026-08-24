@@ -157,7 +157,11 @@ def main(argv=None):
     if args.command == "run":
         return run_main(args, contexts)
 
-    snap = snapshot(collect(contexts, offline=OFFLINE))
+    raw = collect(contexts, offline=OFFLINE)
+    if not OFFLINE:
+        # El log de eventos da el estado `despachado` de la frontera (ticket #43).
+        raw["eventos"] = leer_eventos(_estado_dir() / "harness" / "events.jsonl")
+    snap = snapshot(raw)
     if args.since and parse_fecha(args.since) is None:
         sys.stderr.write("harness: --since inválido: se espera YYYY-MM-DD o ISO "
                          "8601 (p.ej. 2026-08-21)\n")
@@ -264,11 +268,15 @@ def run_main(args, contexts):
             sys.stderr.write("harness: run necesita adaptadores y una sesión de "
                              "herdr (sin HARNESS_OFFLINE, con HERDR_ENV=1)\n")
             return 2
-        snap = snapshot(collect([ctx]))
         # El intento global de cada ticket: cuántas veces quedó intentado en
         # el historial del log, más uno (ticket #35).
         eventos_previos = leer_eventos(log_path)
         log = EventLog(log_path, ctx.name)
+        crudo = collect([ctx])
+        # El mismo log que da el historial da el estado de la frontera
+        # (ticket #43): un ticket despachado no se re-despacha.
+        crudo["eventos"] = eventos_previos
+        snap = snapshot(crudo)
         jobs = []
         for r in snap.contexts[0].repos:
             if not r.slug:
@@ -278,6 +286,10 @@ def run_main(args, contexts):
             if not r.ready.get("gate"):
                 continue
             for i in r.frontier:
+                # Sólo los libres: un ticket con PR abierto, mergeado,
+                # despachado o parkeado no se re-trabaja (ticket #43).
+                if i.estado != "libre":
+                    continue
                 jobs.append(Job(repo=r.name, repo_path=r.path, slug=r.slug,
                                 issue=i.number,
                                 attempt=intentos(eventos_previos, r.name,

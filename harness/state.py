@@ -5,7 +5,9 @@ hoy sólo se escribe: sin leerlo no hay forma de saber que un ticket ya
 falló dos veces ni con qué runner. Este módulo lo lee y contesta las
 preguntas sobre el historial: `de_ticket` (qué le pasó a un ticket),
 `tasas` (éxito/abandono por runner y por repo) y `duracion_media`
-(minutos por ticket cerrado, por runner).
+(minutos por ticket cerrado, por runner); y da el estado de la frontera
+(`estado_frontier`, ticket #43): qué tickets fueron despachados, y cuáles
+de esa marca siguen vivos (con agente en el worktree) y cuáles no.
 
 Puro: los eventos entran como la lista de dicts que da
 `harness.summary.leer_eventos`, y no se toca nada más — ni disco, ni red,
@@ -203,3 +205,73 @@ def duracion_media(eventos, runner):
         if fin is not None and ini is not None:
             durs.append((fin - ini).total_seconds() / 60.0)
     return sum(durs) / len(durs) if durs else 0.0
+
+
+# ------------------------------------------------------------------ frontera
+# Estados de un ticket de la frontera (ticket #43): la frontera es un estado,
+# no un booleano. `libre` es el único que se despacha.
+LIBRE = "libre"
+DESPACHADO = "despachado"
+PR_ABIERTO = "pr-abierto"
+MERGEADO = "mergeado"
+PARKEADO = "parkeado"
+
+# Etiquetas del triage que parcean un ticket: un humano lo toma, la flota no.
+# `ready-for-human` es la que el dispatcher marca cuando el PR no se acepta;
+# `wontfix` es el "no se hace" explícito. Un ticket parkeado no vuelve, aunque
+# siga abierto.
+PARKEADOS = ("ready-for-human", "wontfix")
+
+
+def rama_de(issue):
+    """La rama que el dispatcher crea para un ticket: `ticket/<n>`."""
+    return "ticket/{}".format(issue)
+
+
+def despachado(eventos, repo, issue):
+    """¿El log registra que un agente ARRANCÓ sobre este ticket?
+
+    La marca es la línea `agente` exitosa (la que trae el kind, `KIND_RE`):
+    "koku-7 (kind pi, pane w9:p1)". Las fallas de arranque ("fallo: ...") no
+    cuentan: sobre ese ticket nunca hubo trabajo.
+    """
+    for e in eventos or []:
+        if (e.get("tipo") == "agente" and _es_de(e, repo, issue)
+                and KIND_RE.search(str(e.get("cuerpo", "")))):
+            return True
+    return False
+
+
+def agente_vivo(agentes, repo, issue):
+    """¿Un agente de herdr vive ahora en el worktree del ticket?
+
+    El worktree de un ticket se llama `<repo>-ticket-<n>`
+    (`harness.dispatch.worktree_path`), y herdr trae el cwd de cada agente:
+    no hay que adivinar por nombres.
+    """
+    objetivo = "{}-ticket-{}".format(repo, issue)
+    for a in agentes or []:
+        if not isinstance(a, dict):
+            continue
+        cwd = str(a.get("cwd") or "").rstrip("/")
+        if cwd.rsplit("/", 1)[-1] == objetivo:
+            return True
+    return False
+
+
+def estado_frontier(labels, despachado_en_log, vivo, pr_abierto, pr_merged):
+    """El estado de un ticket de la frontera.
+
+    `parkeado` es definitivo (un humano lo tiene); `pr-abierto` y `mergeado`
+    salen de los PRs sobre `ticket/<n>`; `despachado` sale del log de eventos
+    y de un agente vivo — despachado en una corrida muerta (sin PR y sin
+    agente) no queda colgado: vuelve a `libre`."""
+    if set(labels or ()) & set(PARKEADOS):
+        return PARKEADO
+    if pr_abierto:
+        return PR_ABIERTO
+    if pr_merged:
+        return MERGEADO
+    if despachado_en_log and vivo:
+        return DESPACHADO
+    return LIBRE

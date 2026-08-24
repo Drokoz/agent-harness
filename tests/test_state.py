@@ -160,6 +160,69 @@ class TestTasas(unittest.TestCase):
         self.assertEqual(state.tasas([]), {"por_runner": {}, "por_repo": {}})
 
 
+class TestEstadoFrontera(unittest.TestCase):
+    """La frontera es un estado, no un booleano (ticket #43)."""
+
+    def agente(self, run_id="r1", ticket="koku#7", kind="pi"):
+        return ev("agente", "ticket/7", "koku-7 (kind {}, pane w9:p1)".format(kind),
+                  "2026-08-24T02:01:00Z", run_id=run_id, ticket=ticket)
+
+    def test_libre_sin_nada(self):
+        self.assertEqual(state.estado_frontier(("ready-for-agent",), False, False,
+                                                False, False), state.LIBRE)
+
+    def test_despachado_sale_del_log_y_del_agente_vivo(self):
+        self.assertEqual(state.estado_frontier(("ready-for-agent",), True, True,
+                                                False, False), state.DESPACHADO)
+
+    def test_corrida_muerta_vuelve_a_libre(self):
+        """Despachado en una corrida anterior, sin PR y sin agente vivo:
+        vuelve a libre, no queda colgado para siempre."""
+        self.assertEqual(state.estado_frontier(("ready-for-agent",), True, False,
+                                                False, False), state.LIBRE)
+
+    def test_pr_abierto_gana_al_despacho(self):
+        self.assertEqual(state.estado_frontier(("ready-for-agent",), True, True,
+                                                True, False), state.PR_ABIERTO)
+
+    def test_pr_abierto_gana_al_merge(self):
+        self.assertEqual(state.estado_frontier(("ready-for-agent",), False, False,
+                                                True, True), state.PR_ABIERTO)
+
+    def test_mergeado(self):
+        self.assertEqual(state.estado_frontier(("ready-for-agent",), False, False,
+                                                False, True), state.MERGEADO)
+
+    def test_parkeado_es_definitivo(self):
+        for etiqueta in ("ready-for-human", "wontfix"):
+            with self.subTest(etiqueta=etiqueta):
+                self.assertEqual(state.estado_frontier(
+                    ("ready-for-agent", etiqueta), True, True, True, True),
+                    state.PARKEADO)
+
+    def test_despachado_solo_con_linea_de_agente_exitosa(self):
+        fallido = [vieja("worktree", "ticket/7", "/x", "2026-08-24T02:00:00Z"),
+                   vieja("agente", "ticket/7", "fallo: no se pudo arrancar",
+                         "2026-08-24T02:01:00Z")]
+        self.assertFalse(state.despachado(fallido, "koku", 7))
+        self.assertTrue(state.despachado([self.agente()], "koku", 7))
+
+    def test_despachado_no_se_mecha_con_otros_tickets(self):
+        self.assertFalse(state.despachado([self.agente(ticket="koku#8")], "koku", 7))
+        self.assertFalse(state.despachado([self.agente(ticket="otro#7")], "koku", 7))
+        self.assertFalse(state.despachado([self.agente()], "otro", 7))
+        self.assertFalse(state.despachado(None, "koku", 7))
+
+    def test_agente_vivo_por_el_worktree(self):
+        vivo = {"cwd": "/x/.worktrees/koku-ticket-7", "agent": "claude"}
+        self.assertTrue(state.agente_vivo([vivo], "koku", 7))
+        self.assertFalse(state.agente_vivo([vivo], "koku", 8))
+        self.assertFalse(state.agente_vivo([vivo], "koku2", 7))
+        self.assertFalse(state.agente_vivo([{"cwd": "/x/koku"}], "koku", 7))
+        self.assertFalse(state.agente_vivo([{}, "no-dict", None], "koku", 7))
+        self.assertFalse(state.agente_vivo(None, "koku", 7))
+
+
 class TestDuracionMedia(unittest.TestCase):
     def test_minutos_por_ticket_cerrado(self):
         evs = [
