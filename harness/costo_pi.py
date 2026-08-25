@@ -41,6 +41,20 @@ RUTA_TICKET = re.compile(r"[-.]worktrees[-/](.+?)-ticket-(\d+)(?:[-/]|$)")
 # suma que hace pi, y sumar sumas re-cuenta.
 CAMPOS = ("input", "output", "cacheRead", "cacheWrite", "reasoning")
 
+# Por qué se cortó la sesión (#98). El dispatcher sólo ve el síntoma —"el
+# agente terminó sin PR abierto"— y lo clasifica `modelo`. La causa la guarda
+# pi en `stopReason` + `errorMessage`, y las tres clases de #37 tienen
+# consecuencias distintas: `infra` se reintenta gratis, `modelo` quema un
+# peldaño de la escalera, `humano` sale de la frontera.
+#
+# El 2026-08-24, entre las 11:48 y las 11:55, cinco agentes murieron con
+# "Connection error.": no fueron cinco fracasos del modelo, fue un corte de red.
+
+# Reintentar no lo arregla: hace falta que una persona ponga plata o arregle
+# la cuenta. Se mira antes que la familia de infra, que es más ancha.
+HUMANO = ("402", "out of credits", "insufficient credit", "insufficient_quota",
+          "billing", "payment required", "subscription", "add credits")
+
 
 def ticket_de_cwd(cwd) -> Optional[Tuple[str, int]]:
     """`(repo, issue)` si esa ruta es el worktree de un ticket; si no, None."""
@@ -65,6 +79,8 @@ def parsear_sesion(path) -> Optional[dict]:
     cwd = ""
     inicio = ""
     modelo = ""
+    stop = ""
+    error = ""
     costo = None
     tokens = _tokens_vacios()
     mensajes = 0
@@ -94,6 +110,11 @@ def parsear_sesion(path) -> Optional[dict]:
             continue
         mensajes += 1
         modelo = m.get("model") or modelo
+        # La última salida es la que cuenta: una sesión puede recuperarse de
+        # un error y seguir, y entonces ese error no la explica.
+        if m.get("stopReason"):
+            stop = m["stopReason"]
+            error = str(m.get("errorMessage") or "")
         for c in CAMPOS:
             tokens[c] += int(_num(uso.get(c)))
         precio = uso.get("cost")
@@ -112,6 +133,7 @@ def parsear_sesion(path) -> Optional[dict]:
         "cwd": cwd,
         "inicio": inicio or _inicio_del_nombre(path.name),
         "modelo": modelo,
+        "salida": {"stop": stop, "error": error},
         "costo": costo,
         "tokens": tokens,
         "mensajes": mensajes,
@@ -165,6 +187,31 @@ def costo_de(sesiones, repo, issue, desde=None) -> Optional[float]:
     conocidos = [s["costo"] for s in intentos_de(sesiones, repo, issue, desde)
                  if s["costo"] is not None]
     return sum(conocidos) if conocidos else None
+
+
+def salida_de(sesiones, repo, issue, desde=None) -> Optional[dict]:
+    """Cómo terminó el ÚLTIMO intento de ese ticket. Los anteriores ya se
+    contaron en su momento; el que explica este abandono es el de ahora."""
+    ints = intentos_de(sesiones, repo, issue, desde)
+    return ints[-1]["salida"] if ints else None
+
+
+def clasificar_salida(salida) -> Tuple[Optional[str], str]:
+    """`(clase, detalle)` según cómo cortó pi, en las clases de #37.
+
+    Sin opinión (`None`) cuando la sesión terminó bien: si pi no se cayó, el
+    que sabe por qué no hubo PR es el dispatcher, y su clasificación queda."""
+    if not isinstance(salida, dict):
+        return (None, "")
+    stop = (salida.get("stop") or "").strip()
+    error = (salida.get("error") or "").strip()
+    if stop == "error":
+        bajo = error.lower()
+        clase = "humano" if any(t in bajo for t in HUMANO) else "infra"
+        return (clase, error or "pi cortó con error, sin mensaje")
+    if stop == "length":
+        return ("modelo", "se quedó sin contexto (stopReason: length)")
+    return (None, "")
 
 
 def por_ticket(sesiones) -> Dict[str, dict]:

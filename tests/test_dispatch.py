@@ -150,11 +150,12 @@ def job_de_peldano(escalados, **kw):
     return job(kind=p["kind"], model=p["model"], extra_args=p["extra_args"], **kw)
 
 
-def despachar(mundo, jobs, costo_real=None, **kw):
+def despachar(mundo, jobs, costo_real=None, salida_real=None, **kw):
     with tempfile.TemporaryDirectory() as tmp:
         log = log_en(tmp)
         d = Dispatcher(spec(**kw), log, mundo.cmd, credits=mundo.credits,
-                       dormir=mundo.dormir, costo_real=costo_real)
+                       dormir=mundo.dormir, costo_real=costo_real,
+                       salida_real=salida_real)
         res = d.dispatch(jobs)
         lineas = [json.loads(l) for l in log.path.read_text().splitlines()]
     return res, lineas
@@ -484,6 +485,72 @@ class TestLimpieza(unittest.TestCase):
         despachar(m, [job()])
         self.assertEqual(len(m.llamo("herdr", "pane", "close")), 1)
         self.assertEqual(len(m.llamo("git", "worktree", "remove")), 1)
+
+
+class TestClaseDeAbandono(unittest.TestCase):
+    """La clase de un abandono decide si se quema un peldaño de la escalera.
+    El dispatcher sólo ve el síntoma ("el agente terminó sin PR abierto") y
+    lo clasifica `modelo`; la causa la guarda pi (#98). El 2026-08-24, entre
+    las 11:48 y las 11:55, cinco agentes murieron con "Connection error.":
+    no fueron cinco fracasos del modelo, fue un corte de red, y la escalera
+    les cobró un peldaño a los cinco."""
+
+    def _abandonar(self, salida):
+        """Un mundo donde el agente termina sin PR: el `modelo` por default."""
+        m = Mundo(credits=[100.0, 100.10]).responder(
+            lambda a: a[0] == "gh" and a[1] == "pr" and a[2] == "list",
+            (True, "[]"))
+        res, lineas = despachar(m, [job()], salida_real=lambda *a, **k: salida)
+        self.assertTrue([l for l in lineas if l["tipo"] == "abandono"],
+                        "el escenario tiene que terminar en abandono")
+        return res, lineas
+
+    def test_un_corte_de_red_es_infra_y_no_quema_peldano(self):
+        res, lineas = self._abandonar({"stop": "error",
+                                       "error": "Connection error."})
+        self.assertEqual(res[0].estado, "abandonado")
+        ab = [l for l in lineas if l["tipo"] == "abandono"][0]
+        self.assertEqual(ab["clase"], "infra")
+        self.assertIn("Connection error", ab["cuerpo"],
+                      "el motivo tiene que llevar la causa, no solo el sintoma")
+        self.assertEqual(state.intentos_que_escalan(lineas, "koku", 7), 0)
+
+    def test_sin_creditos_es_humano_y_sale_de_la_frontera(self):
+        """Reintentar contra una pared es gastar de gusto: sale de la
+        frontera en el acto, sin esperar a que se agote la escalera."""
+        m = Mundo(credits=[100.0, 100.10]).responder(
+            lambda a: a[0] == "gh" and a[1] == "pr" and a[2] == "list",
+            (True, "[]"))
+        _, lineas = despachar(m, [job()], salida_real=lambda *a, **k: {
+            "stop": "error", "error": '402 "You have run out of credits"'})
+        ab = [l for l in lineas if l["tipo"] == "abandono"][0]
+        self.assertEqual(ab["clase"], "humano")
+        (edit,) = m.llamo("gh", "issue", "edit")
+        self.assertIn("ready-for-human", edit[0])
+        self.assertIn("ready-for-agent", edit[0])
+
+    def test_sin_sesion_en_el_disco_no_cambia_nada(self):
+        _, lineas = self._abandonar(None)
+        ab = [l for l in lineas if l["tipo"] == "abandono"][0]
+        self.assertEqual(ab["clase"], "modelo")
+        self.assertEqual(state.intentos_que_escalan(lineas, "koku", 7), 1)
+
+    def test_una_sesion_que_termino_bien_deja_la_clasificacion_del_dispatcher(self):
+        """pi no se cayó: el que sabe por qué no hubo PR es el dispatcher."""
+        _, lineas = self._abandonar({"stop": "stop", "error": ""})
+        ab = [l for l in lineas if l["tipo"] == "abandono"][0]
+        self.assertEqual(ab["clase"], "modelo")
+
+    def test_la_evidencia_de_pi_no_pisa_un_infra_que_ya_estaba_clasificado(self):
+        """Un abandono que el dispatcher ya sabe que es infra (nunca arrancó
+        el agente) no tiene sesión que consultar, y no se toca."""
+        m = Mundo(credits=[100.0, 100.10]).responder(
+            lambda a: a[:3] == ["herdr", "agent", "start"],
+            (False, '{"error":{"code":"boom"}}'))
+        _, lineas = despachar(m, [job()],
+                              salida_real=lambda *a, **k: {"stop": "stop"})
+        ab = [l for l in lineas if l["tipo"] == "abandono"][0]
+        self.assertEqual(ab["clase"], "infra")
 
 
 class TestCosto(unittest.TestCase):

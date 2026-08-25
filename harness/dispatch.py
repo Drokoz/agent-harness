@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
+from harness.costo_pi import clasificar_salida
+
 ORIGEN = "harness"
 
 # Línea de estado de la TUI de pi: "↑78k ↓5.9k R34k CH0.0% $0.056 11.4%/262k"
@@ -399,7 +401,7 @@ class Dispatcher:
     para que los tests no necesiten herdr ni git de verdad."""
 
     def __init__(self, spec, log, run_cmd, credits=None, dormir=time.sleep,
-                 costo_real=None):
+                 costo_real=None, salida_real=None):
         self.spec = spec
         self.log = log
         self.run_cmd = run_cmd                 # (args, cwd=None, timeout=30) -> (ok, out)
@@ -407,6 +409,12 @@ class Dispatcher:
         # de las sesiones de pi (#90). Sin inyectar, se cae al reparto del
         # delta de créditos de siempre.
         self.costo_real = costo_real
+        # (repo, issue, desde) -> {"stop","error"} | None: cómo cortó pi
+        # (#98). Sin inyectar, la clasificación es la del dispatcher sola.
+        self.salida_real = salida_real
+        # Desde cuándo mirar sesiones: lo fija `dispatch` al arrancar la
+        # corrida, para no leer los intentos de anoche.
+        self._desde = None
         self.credits = credits or (lambda: None)  # () -> usado (float) | None
         self.dormir = dormir
 
@@ -430,7 +438,7 @@ class Dispatcher:
         antes = self.credits()
         # Desde acá miran las sesiones de pi: un ticket reintentado ya tiene
         # sesiones de anoche en el disco y ese costo no es de esta corrida.
-        desde = self.log.reloj()
+        desde = self._desde = self.log.reloj()
         with cf.ThreadPoolExecutor(max_workers=max(1, self.spec.max_parallel)) as ex:
             resultados = list(ex.map(self.run_job, jobs))
         despues = self.credits()
@@ -1254,10 +1262,38 @@ class Dispatcher:
         ningún llamador clasifica cae en `modelo`: el default conservador
         es el que gasta peldaño de escalada, no el que reintenta gratis.
         """
+        # El dispatcher ve el síntoma; pi guarda la causa (#98). Su veredicto
+        # sólo pisa el default `modelo`: un `infra` o un `humano` que el
+        # llamador ya sabe no se discute, y encima esos casos ni siquiera
+        # llegan a tener sesión que consultar.
+        sacar = False
+        if clase == "modelo":
+            real, detalle = self._salida_de_pi(job)
+            if real:
+                clase = real
+                motivo = "{} (pi: {})".format(motivo, detalle)
+                # Reintentar contra una pared es gastar de gusto. Sólo acá:
+                # los `humano` que el llamador ya sabía (un rebase que
+                # conflictúa) se rutean ellos mismos, y marcar dos veces
+                # es una llamada de más a la API por cada abandono.
+                sacar = clase == "humano"
         job.estado = "abandonado"
         job.motivo = motivo
         job.clase_abandono = clase
         self._log(job, "abandono", ref, motivo, clase=clase)
+        if sacar:
+            self._marcar_para_humano(job, ref)
+
+    def _salida_de_pi(self, job):
+        """Cómo cortó la sesión de pi, si hay una. Nunca puede tumbar una
+        corrida: leer el disco es mejor esfuerzo."""
+        if not self.salida_real:
+            return (None, "")
+        try:
+            return clasificar_salida(self.salida_real(job.repo, job.issue,
+                                                      self._desde))
+        except Exception:
+            return (None, "")
 
     def _reintentar_infra(self, job, ref, motivo, intentar):
         """Reintenta `intentar()` (sin argumentos, devuelve bool) en el
