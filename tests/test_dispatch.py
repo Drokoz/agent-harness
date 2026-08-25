@@ -83,6 +83,8 @@ class Mundo:
     def _default(self, args, cwd):
         a = args[0]
         if a == "git":
+            if "rev-list" in args:
+                return (True, "1\n")  # la rama lleva un commit por delante
             if "rev-parse" in args:
                 if args[-1] == "HEAD":
                     return (True, self.head_oid + "\n")
@@ -962,6 +964,54 @@ class TestElGateMideLoQueVaEnElPR(unittest.TestCase):
         self.assertIsNone(dispatch.ruta_protegida("README.md"))
         self.assertIsNone(dispatch.ruta_protegida("docs/scripts/gate.sh"),
                           "sólo el gate del repo, no uno homónimo en otro path")
+
+
+class TestRamaSinCommits(unittest.TestCase):
+    """#67: una rama con cero commits sobre su base produce exactamente el
+    mismo gate verde que una que trabajó bien (#52 pasó el gate así, y #45
+    otra vez). Verde significa "no rompe nada", no "hizo algo": sin commits
+    no se corre el gate, se abandona con motivo propio, no se escribe
+    `gate: verde` en el log y no se abre PR.
+    """
+
+    @staticmethod
+    def _mundo_sin_commits():
+        m = Mundo()
+        m.responder(lambda a: a[0] == "git" and "rev-list" in a, (True, "0\n"))
+        return m
+
+    def test_rama_sin_commits_no_corre_el_gate_y_no_abre_pr(self):
+        m = self._mundo_sin_commits()
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+        self.assertIn("commits", res[0].motivo)
+        self.assertEqual(res[0].clase_abandono, "modelo")
+        self.assertEqual(m.llamo("./scripts/gate.sh"), [],
+                         "no se corre el gate sobre una rama sin commits")
+        self.assertNotIn("pr", [l["tipo"] for l in lineas])
+
+    def test_rama_sin_commits_no_escribe_gate_verde(self):
+        """El evento `gate: verde` miente en el historial: #35 lo contaba
+        como gate pasado y #38 lo escalaba como trabajo hecho."""
+        _, lineas = despachar(self._mundo_sin_commits(), [job()])
+        self.assertFalse(any(l["tipo"] == "gate"
+                             and str(l["cuerpo"]).startswith("verde")
+                             for l in lineas))
+
+    def test_rama_sin_commits_no_se_confunde_con_sucio_ni_rojo(self):
+        """Tres problemas distintos, tres motivos distintos: el árbol
+        sucio (estado del worktree), la rama sin commits (no hay trabajo
+        que medir) y el gate rojo (el veredicto del gate)."""
+        (j,), _ = despachar(self._mundo_sin_commits(), [job()])
+        self.assertNotIn("sucio", j.motivo)
+        self.assertNotIn("gate", j.motivo,
+                         "el motivo sin commits no se mezcla con el del gate")
+        sucio = Mundo()
+        sucio.responder(lambda a: a[0] == "git" and "status" in a, (True, " M x\n"))
+        (j_sucio,), _ = despachar(sucio, [job()])
+        (j_rojo,), _ = despachar(Mundo(gate=(False, "ROJO")), [job()])
+        self.assertNotIn("commits", j_sucio.motivo)
+        self.assertNotIn("commits", j_rojo.motivo)
 
 
 class TestWatchdog(unittest.TestCase):

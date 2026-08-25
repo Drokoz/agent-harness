@@ -475,6 +475,8 @@ class Dispatcher:
                 pass  # ya se abandono con su motivo
             elif not self._arbol_limpio(job, ref):
                 pass  # ya se abandono con su motivo
+            elif not self._rama_con_commits(job, ref):
+                pass  # ya se abandono con su motivo
             elif not self._gate_verde(job, ref):
                 pass  # ya se abandono con su motivo
             else:
@@ -824,6 +826,50 @@ class Dispatcher:
         self._log(job, "gate", ref, "arbol sucio: " + out.strip()[:200])
         self._abandonar(job, ref, "arbol sucio en el worktree: hay cambios "
                                    "sin commitear que no entran al PR; sin "
+                                   "medicion, sin PR", clase="modelo")
+        return False
+
+    def _rama_con_commits(self, job, ref):
+        """Antes de correr el gate: la rama tiene que tener al menos un
+        commit por delante de su base.
+
+        La base es el HEAD del checkout principal, de donde nació el
+        worktree: cuenta cero significa que la rama no trae trabajo, y el
+        gate correría sobre el código de la base sin cambios -- el mismo
+        verde que uno que trabajó bien, escrito en el log como un logro
+        (#52 lo pasó así, y #45 otra vez). Verde significa "no rompe
+        nada", no "hizo algo". Cero commits = abandono (modelo), con
+        motivo propio: sin gate, sin `gate: verde` y sin PR. Que el propio
+        `git rev-list` falle es otra cosa -- infra, no el trabajo del
+        agente -- y se reintenta en el acto (#37).
+        """
+        salida = []
+
+        def intentar():
+            ok, out = self.run_cmd(["git", "-C", job.repo_path, "rev-parse",
+                                    "HEAD"])
+            base = out.strip().splitlines()[-1].strip() if ok and out.strip() else ""
+            if not base:
+                return False
+            ok, out = self.run_cmd(["git", "-C", job.worktree, "rev-list",
+                                    "--count", base + "..HEAD"])
+            salida[:] = [out]
+            return ok
+
+        if not self._reintentar_infra(
+                job, ref,
+                "no se pudo verificar si la rama trae commits (git fallo): "
+                "sin medicion, sin PR",
+                intentar):
+            return False
+        (out,) = salida
+        n = out.strip().splitlines()[-1].strip() if out.strip() else ""
+        if n.isdigit() and int(n) > 0:
+            return True
+        self._log(job, "gate", ref,
+                  "la rama no tiene commits por delante de la base")
+        self._abandonar(job, ref, "la rama no tiene commits por delante de "
+                                   "su base: no hay trabajo que medir; sin "
                                    "medicion, sin PR", clase="modelo")
         return False
 
