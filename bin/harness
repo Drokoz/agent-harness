@@ -72,6 +72,7 @@ from harness import adapters  # noqa: E402
 from harness.adapters import (adr_files, collect, load_config, openrouter_credits,
                               repo_paths, vault_decision_files)  # noqa: E402
 from harness.config import ConfigError  # noqa: E402
+from harness import costo_pi  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
 from harness.dispatch import (DispatchSpec, Dispatcher, EventLog, Job, cosechar,  # noqa: E402
                               peldano_de)
@@ -338,6 +339,20 @@ def _estado_dir():
     return Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
 
 
+def _costo_de_pi():
+    """La costura de costo real (#90): las sesiones de pi, leídas una sola vez
+    cuando se pregunta por el primer job —o sea después de la corrida, cuando
+    ya están escritas— y reusadas para el resto de la tanda."""
+    cache = {}
+
+    def leer(repo, issue, desde=None):
+        if "ses" not in cache:
+            cache["ses"] = costo_pi.leer_sesiones()
+        return costo_pi.costo_de(cache["ses"], repo, issue, desde)
+
+    return leer
+
+
 def _creditos_usado():
     """Cuánto se llevó usado OpenRouter, para medir el costo de la corrida."""
     data = openrouter_credits()
@@ -375,7 +390,8 @@ def run_main(args, contexts):
                             kind=args.kind, model=args.model)
         disp = Dispatcher(spec, log, run_cmd=adapters.run,
                           credits=_creditos_usado
-                          if ctx.budget.provider == "openrouter" else None)
+                          if ctx.budget.provider == "openrouter" else None,
+                          costo_real=_costo_de_pi())
         jobs, parkeados = [], 0
         for r in snap.contexts[0].repos:
             if not r.slug:

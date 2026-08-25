@@ -150,11 +150,11 @@ def job_de_peldano(escalados, **kw):
     return job(kind=p["kind"], model=p["model"], extra_args=p["extra_args"], **kw)
 
 
-def despachar(mundo, jobs, **kw):
+def despachar(mundo, jobs, costo_real=None, **kw):
     with tempfile.TemporaryDirectory() as tmp:
         log = log_en(tmp)
         d = Dispatcher(spec(**kw), log, mundo.cmd, credits=mundo.credits,
-                       dormir=mundo.dormir)
+                       dormir=mundo.dormir, costo_real=costo_real)
         res = d.dispatch(jobs)
         lineas = [json.loads(l) for l in log.path.read_text().splitlines()]
     return res, lineas
@@ -523,6 +523,60 @@ class TestCosto(unittest.TestCase):
         self.assertIsNone(res[0].costo)
         costo = [l for l in lineas if l["tipo"] == "costo" and l["ref"] == "ticket/7"]
         self.assertEqual(costo[0]["cuerpo"], "desconocido")
+
+    def test_el_costo_medido_por_pi_le_gana_al_reparto(self):
+        """El reparto es una estimación; la sesión de pi es el número."""
+        m = Mundo(credits=[100.0, 100.30])
+        res, lineas = despachar(m, [job()], costo_real=lambda *a, **k: 0.42)
+        self.assertAlmostEqual(res[0].costo, 0.42)
+        costo = [l for l in lineas if l["tipo"] == "costo" and l["ref"] == "ticket/7"]
+        self.assertIn("0.42", costo[0]["cuerpo"])
+        self.assertIn("pi", costo[0]["cuerpo"])
+
+    def test_lo_que_pi_no_midio_se_reparte_lo_que_sobra_del_delta(self):
+        """Si de dos jobs uno tiene medición real, el otro no puede llevarse
+        medio delta: se lleva lo que queda después de descontar la real."""
+        m = Mundo(credits=[100.0, 100.50])
+        reales = {7: 0.20, 8: None}
+        res, _ = despachar(m, [job(7), job(8)], max_parallel=2,
+                           costo_real=lambda repo, issue, desde=None: reales[issue])
+        por_issue = {r.issue: r.costo for r in res}
+        self.assertAlmostEqual(por_issue[7], 0.20)
+        self.assertAlmostEqual(por_issue[8], 0.30)
+
+    def test_una_medicion_mas_grande_que_el_delta_no_deja_costo_negativo(self):
+        """El delta de créditos se contamina con cualquier otra cosa que use
+        la misma key; la resta puede dar negativa y un costo negativo miente."""
+        m = Mundo(credits=[100.0, 100.10])
+        reales = {7: 0.90, 8: None}
+        res, _ = despachar(m, [job(7), job(8)], max_parallel=2,
+                           costo_real=lambda repo, issue, desde=None: reales[issue])
+        por_issue = {r.issue: r.costo for r in res}
+        self.assertAlmostEqual(por_issue[8], 0.0)
+
+    def test_sin_medicion_de_pi_sigue_el_reparto_de_siempre(self):
+        m = Mundo(credits=[100.0, 100.25])
+        res, _ = despachar(m, [job()], costo_real=lambda *a, **k: None)
+        self.assertAlmostEqual(res[0].costo, 0.25)
+
+    def test_pi_mide_aunque_no_haya_creditos_para_repartir(self):
+        """La medición real no depende de que la corrida termine bien."""
+        m = Mundo(credits=[None, None])
+        res, _ = despachar(m, [job()], costo_real=lambda *a, **k: 0.33)
+        self.assertAlmostEqual(res[0].costo, 0.33)
+
+    def test_a_pi_se_le_pregunta_solo_por_esta_corrida(self):
+        """Sin recorte, un ticket reintentado arrastra el costo de anoche."""
+        vistos = []
+        m = Mundo(credits=[100.0, 100.25])
+
+        def espia(repo, issue, desde=None):
+            vistos.append((repo, issue, desde))
+            return 0.1
+
+        despachar(m, [job()], costo_real=espia)
+        self.assertEqual(len(vistos), 1)
+        self.assertIsNotNone(vistos[0][2], "hay que pasarle desde cuando mirar")
 
     def test_costo_es_cero_si_el_job_nunca_prendio_pane(self):
         m = Mundo(credits=[100.0, 100.25]).responder(

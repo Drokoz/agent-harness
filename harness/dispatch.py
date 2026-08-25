@@ -398,10 +398,15 @@ class Dispatcher:
     """Lanza y cosecha la frontera. Todo el mundo entra por callables,
     para que los tests no necesiten herdr ni git de verdad."""
 
-    def __init__(self, spec, log, run_cmd, credits=None, dormir=time.sleep):
+    def __init__(self, spec, log, run_cmd, credits=None, dormir=time.sleep,
+                 costo_real=None):
         self.spec = spec
         self.log = log
         self.run_cmd = run_cmd                 # (args, cwd=None, timeout=30) -> (ok, out)
+        # (repo, issue, desde) -> float | None: el costo medido de verdad,
+        # de las sesiones de pi (#90). Sin inyectar, se cae al reparto del
+        # delta de créditos de siempre.
+        self.costo_real = costo_real
         self.credits = credits or (lambda: None)  # () -> usado (float) | None
         self.dormir = dormir
 
@@ -423,10 +428,13 @@ class Dispatcher:
                        "inicio: {} ticket(s), max {} en paralelo".format(
                            len(jobs), self.spec.max_parallel))
         antes = self.credits()
+        # Desde acá miran las sesiones de pi: un ticket reintentado ya tiene
+        # sesiones de anoche en el disco y ese costo no es de esta corrida.
+        desde = self.log.reloj()
         with cf.ThreadPoolExecutor(max_workers=max(1, self.spec.max_parallel)) as ex:
             resultados = list(ex.map(self.run_job, jobs))
         despues = self.credits()
-        self._repartir_costo(resultados, antes, despues)
+        self._repartir_costo(resultados, antes, despues, desde)
         if antes is not None and despues is not None:
             self.log.write("costo", ref,
                            "creditos antes {} / despues {} / delta ${:.4f}".format(
@@ -1143,8 +1151,17 @@ class Dispatcher:
             return
         self._log(job, "wip", ref, msg)
 
-    def _repartir_costo(self, jobs, antes, despues):
+    def _repartir_costo(self, jobs, antes, despues, desde=None):
         """El costo por job, después de que la corrida entera terminó.
+
+        La fuente primaria es la sesión de pi (#90): `message.usage.cost.total`
+        sumado por sesión es el número exacto, no una estimación, y sigue ahí
+        aunque la corrida no llegue a leer el crédito final. `desde` recorta a
+        los intentos de esta corrida —un ticket reintentado ya tiene sesiones
+        de anoche en el disco.
+
+        El reparto del delta de créditos queda de plan B, para los jobs que pi
+        no midió (un peldaño de Claude, una sesión que no quedó en el disco).
 
         Leer el costo de la línea de estado de la TUI (pane por pane) no es
         confiable: esa línea es de la TUI de pi y ni siquiera ahí se puede
@@ -1166,15 +1183,45 @@ class Dispatcher:
                 j.costo = 0.0
         if not medibles:
             return
+
+        # 1) Lo que pi midió de verdad. No es una estimación y no depende de
+        #    que la corrida llegue a leer el crédito final.
+        medidos = []
+        for j in medibles:
+            c = self._costo_de_pi(j, desde)
+            if c is None:
+                continue
+            j.costo = c
+            medidos.append(j)
+            self._log(j, "costo", "ticket/{}".format(j.issue),
+                      "${:.4f} (sesion de pi)".format(c))
+
+        # 2) El resto se reparte lo que sobra del delta. La resta puede dar
+        #    negativa (el delta se contamina con cualquier otra cosa que use
+        #    la misma key), y un costo negativo miente peor que un cero.
+        resto = [j for j in medibles if j not in medidos]
+        if not resto:
+            return
         if antes is None or despues is None:
-            for j in medibles:
+            for j in resto:
                 self._log(j, "costo", "ticket/{}".format(j.issue), "desconocido")
             return
-        share = (despues - antes) / len(medibles)
-        for j in medibles:
+        sobra = max(0.0, (despues - antes) - sum(j.costo for j in medidos))
+        share = sobra / len(resto)
+        for j in resto:
             j.costo = share
             self._log(j, "costo", "ticket/{}".format(j.issue),
                       "${:.4f}".format(share))
+
+    def _costo_de_pi(self, job, desde):
+        """El costo real del ticket, si hay con qué medirlo. Nunca puede tumbar
+        una corrida: leer el disco es mejor esfuerzo."""
+        if not self.costo_real:
+            return None
+        try:
+            return self.costo_real(job.repo, job.issue, desde)
+        except Exception:
+            return None
 
     def _limpiar(self, job, ref):
         """Cierra el pane y quita el worktree: un pane que queda abierto para
