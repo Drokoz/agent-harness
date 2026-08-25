@@ -32,6 +32,8 @@ ORIGEN = "harness"
 
 # Línea de estado de la TUI de pi: "↑78k ↓5.9k R34k CH0.0% $0.056 11.4%/262k"
 CTX_RE = re.compile(r"(\d+(?:\.\d+)?)%/\d+k")
+# El costo acumulado de esa misma línea: "$0.056".
+COSTO_RE = re.compile(r"\$(\d+(?:\.\d+)?)")
 
 
 # --------------------------------------------------------------------- puros
@@ -374,6 +376,8 @@ class DispatchSpec:
     kind: str = "pi"
     model: str = ""
     wait_ms: int = 3_600_000      # espera máxima por agente (una noche)
+    watchdog_check_min: int = 5   # cada N minutos se mide si el agente avanza (#41)
+    watchdog_kill_min: int = 12   # sin progreso X minutos: matar y abandonar (#41)
     gate_timeout: int = 1800      # segundos para gate.sh dentro del worktree
     install_timeout: int = 900    # segundos para instalar dependencias
     start_retries: int = 4        # reintentos de agent start (pane sin shell)
@@ -625,43 +629,148 @@ class Dispatcher:
         """Espera a que el agente se asiente. `blocked` = abrió un prompt de
         aprobación o una pregunta: se abandona (humano), se anota, y el
         dispatcher sigue con el siguiente; no se queda esperando a un
-        humano que no va a estar. Un timeout de espera es que el agente no
-        progresó (watchdog): eso es `modelo`, no infra -- reintentarlo no
-        va a cambiar nada. Pero si el comando de herdr en sí no contesta
-        con nada reconocible (ni un estado, ni "timeout"), eso sí es
+        humano que no va a estar.
+
+        Watchdog de progreso (#41): esperar una hora a un agente en bucle
+        gasta la noche sin una línea escrita. La espera se corta cada
+        `watchdog_check_min` minutos y en cada corte se mide si hay
+        progreso — un commit nuevo en la rama, el contexto que sube o el
+        costo que sube. Sin progreso durante `watchdog_kill_min` minutos,
+        se corta al agente y se abandona `modelo`: reintentarlo no va a
+        cambiar nada. Un agente corriendo el gate es la excepción
+        explícita: el gate de un worktree limpio puede pasar de los 12
+        minutos y su espera es legítima, así que el reloj se le reinicia.
+
+        El timeout del `agent wait` ya no es un veredicto: es el tick del
+        watchdog. El veredicto de antes (timeout de espera, `modelo`) se
+        mantiene al agotarse el presupuesto total `wait_ms`: el agente
+        avanzaba y nunca se asientó. Y si el comando de herdr en sí no
+        contesta con nada reconocible (ni un estado, ni "timeout"), eso es
         infra -- un problema del propio herdr, no del agente -- y se
         reintenta en el acto (#37)."""
-        wait_s = self.spec.wait_ms // 1000 + 120
-        args = ["herdr", "agent", "wait", job.agent,
-                # `done` va en la lista porque es donde se asienta claude
-                # cuando termina. Sin él, un agente que ya dejó el PR
-                # abierto no matchea ningún estado y el wait cuelga hasta
-                # el timeout —una hora de reloj por ticket terminado, con
-                # la corrida entera haciendo cola detrás.
-                "--until", "idle", "--until", "blocked", "--until", "done",
-                "--timeout", str(self.spec.wait_ms)]
-        for intento in range(self.spec.infra_retries + 1):
-            ok, out = self.run_cmd(args, timeout=wait_s)
-            status = _json_field(out, ("result", "agent", "agent_status"))
-            if status == "blocked":
+        check_ms = int(self.spec.watchdog_check_min * 60 * 1000)
+        rondas = max(1, int(self.spec.wait_ms // check_ms))
+        senal = self._senal(job)
+        sin_progreso = 0
+        for _ in range(rondas):
+            estado, error, out = self._wait_corto(job, check_ms)
+            if estado == "blocked":
                 self._abandonar(job, ref,
                                 "agente bloqueado (aprobacion o pregunta pendiente)",
                                 clase="humano")
                 return True
-            if ok and status:
-                self._log(job, "agente", ref, "se asieto: {}".format(status))
+            if estado:
+                self._log(job, "agente", ref, "se asieto: {}".format(estado))
                 return False
+            if error != "timeout":
+                self._abandonar(job, ref,
+                                "fallo al esperar al agente: " + out.strip()[:200],
+                                clase="infra")
+                return True
+            senal, sin_progreso, matado = self._watchdog(job, ref, senal,
+                                                         sin_progreso)
+            if matado:
+                return True
+        self._abandonar(job, ref,
+                        "timeout de espera ({} ms)".format(self.spec.wait_ms),
+                        clase="modelo")
+        return True
+
+    def _wait_corto(self, job, check_ms):
+        """Un `agent wait` acotado a un chequeo del watchdog (#41).
+
+        Devuelve `(estado, error, out)`: estado es el agente (`idle`,
+        `blocked`, `done`...) o None; error es el código de herdr o None.
+        None y None = herdr no dijo nada reconocible, que es una falla de
+        infraestructura, no un veredicto sobre el agente (se reintenta en
+        el acto, #37)."""
+        args = ["herdr", "agent", "wait", job.agent,
+                # `done` va en la lista porque es donde se asienta claude
+                # cuando termina. Sin él, un agente que ya dejó el PR
+                # abierto no matchea ningún estado y el wait cuelga hasta
+                # el timeout.
+                "--until", "idle", "--until", "blocked", "--until", "done",
+                "--timeout", str(check_ms)]
+        out = ""
+        for intento in range(self.spec.infra_retries + 1):
+            ok, out = self.run_cmd(args, timeout=check_ms // 1000 + 120)
+            estado = _json_field(out, ("result", "agent", "agent_status"))
+            if estado:
+                return estado, None, out
             error = _json_field(out, ("error", "code"))
             if error == "timeout":
-                self._abandonar(job, ref,
-                                "timeout de espera ({} ms)".format(self.spec.wait_ms),
-                                clase="modelo")
-                return True
+                return None, error, out
             if intento < self.spec.infra_retries:
                 self.dormir(self.spec.infra_retry_wait_s)
-        self._abandonar(job, ref, "fallo al esperar al agente: " + out.strip()[:200],
-                        clase="infra")
-        return True
+        return None, error, out
+
+    def _senal(self, job):
+        """Lo que el agente ha producido, para el watchdog de progreso
+        (#41): `(HEAD de la rama, contexto %, costo, corriendo el gate)`.
+
+        Que suba cualquiera de los tres primeros cuenta como progreso. El
+        gate se lleva aparte porque su espera es legítima y puede pasar
+        el umbral: un worktree limpio instala y corre el gate entero, y
+        mientras tanto no hay commits, ni contexto, ni costo que suban."""
+        head = ""
+        if job.worktree:
+            ok, out = self.run_cmd(["git", "-C", job.worktree, "rev-parse",
+                                    "HEAD"], timeout=30)
+            if ok and out.strip():
+                head = out.strip().splitlines()[-1].strip()
+        ctx = costo = 0.0
+        en_gate = False
+        if job.pane:
+            ok, out = self.run_cmd(["herdr", "pane", "read", job.pane,
+                                    "--source", "recent", "--lines", "40"],
+                                   timeout=30)
+            if ok:
+                m = CTX_RE.findall(out)
+                if m:
+                    ctx = float(m[-1])
+                c = COSTO_RE.findall(out)
+                if c:
+                    costo = float(c[-1])
+                en_gate = "gate.sh" in out
+        return (head, ctx, costo, en_gate)
+
+    def _watchdog(self, job, ref, senal, sin_progreso):
+        """Un tick del watchdog (#41): ¿el agente avanzó desde el corte
+        anterior? Devuelve `(senal, sin_progreso, matado)`. Cada corte sin
+        progreso anota sus minutos en el log, para calibrar el umbral con
+        datos después."""
+        nueva = self._senal(job)
+        if nueva != senal:
+            return nueva, 0, False
+        sin_progreso += self.spec.watchdog_check_min
+        if nueva[3]:
+            self._log(job, "watchdog", ref,
+                      "sin progreso {} min, pero el agente esta corriendo el "
+                      "gate: espera legitima, se lo deja".format(sin_progreso))
+            return nueva, 0, False
+        self._log(job, "watchdog", ref,
+                  "sin progreso {} min (commits, contexto y costo quietos)"
+                  .format(sin_progreso))
+        if sin_progreso >= self.spec.watchdog_kill_min:
+            self._matar(job, ref, sin_progreso)
+            return nueva, sin_progreso, True
+        return nueva, sin_progreso, False
+
+    def _matar(self, job, ref, sin_progreso):
+        """El watchdog decide (#41): sin progreso pasado el umbral, y sin
+        gate en marcha. Se corta al agente (ctrl+c) y se abandona `modelo`:
+        un bucle no se arregla esperándolo, y al peldaño siguiente de la
+        escalera se le da otra chance. El pane y el worktree los limpia
+        `_limpiar`; la rama queda con lo que haya."""
+        self.run_cmd(["herdr", "agent", "send-keys", job.agent, "ctrl+c"],
+                     timeout=60)
+        self._log(job, "watchdog", ref,
+                  "sin progreso {} min: agente matado".format(sin_progreso))
+        self._abandonar(job, ref,
+                        "watchdog: sin progreso durante {} min (sin commits "
+                        "nuevos, contexto quieto, costo quieto)"
+                        .format(sin_progreso),
+                        clase="modelo")
 
     def _preparar(self, job, ref):
         """Deja el worktree en condiciones de correr el gate.
