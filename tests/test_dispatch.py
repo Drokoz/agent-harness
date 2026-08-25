@@ -1375,6 +1375,102 @@ class TestParkear(unittest.TestCase):
         self.assertEqual(m.llamo("gh", "issue", "comment"), [])
 
 
+class TestReintentoSobreBase(unittest.TestCase):
+    """Rama reutilizada del reintento (#64): antes de despachar se rebasa
+    sobre la base, para que un ticket que vuelve a la frontera no arranque
+    sobre la base vieja. Si conflictúa, no se despacha a ciegas: se anota
+    y se manda a la cola de mantenimiento (#56), que hoy es la frontera de
+    humanos (etiqueta + comentario en el issue).
+    """
+
+    BASE_VIEJA = "b" * 40
+
+    def mundo_con_rama_existente(self):
+        m = Mundo()
+        m.responder(
+            lambda a: a[0] == "git" and "rev-parse" in a
+            and "refs/heads/ticket/7" in a,
+            (True, self.BASE_VIEJA + "\n"))
+        return m
+
+    def rebase_conflicto(self, m):
+        return m.responder(
+            lambda a: a[0] == "git" and "rebase" in a and "--abort" not in a,
+            (False, "CONFLICT (content): Merge conflict in x.py\n"
+                    "Rebasing (1/2)"))
+
+    def rebases(self, m):
+        return [c for c in m.llamo("git", "rebase") if "--abort" not in c[0]]
+
+    def test_rama_vieja_se_rebasa_antes_de_despachar(self):
+        m = self.mundo_con_rama_existente()
+        m.head_oid = "c" * 40  # el tip que deja el rebase
+        m.pr_head_oid = "c" * 40
+        res, _ = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "hecho")
+        self.assertEqual(len(self.rebases(m)), 1)
+        self.assertIn("origin/main", self.rebases(m)[0][0])
+        i_rebase = next(i for i, c in enumerate(m.llamadas) if "rebase" in c[0])
+        i_agente = next(i for i, c in enumerate(m.llamadas)
+                        if c[0][:3] == ("herdr", "agent", "start"))
+        self.assertLess(i_rebase, i_agente,
+                        "el rebase va antes de arrancar al agente")
+
+    def test_el_log_deja_la_base_vieja_y_sobre_que_se_actualizo(self):
+        m = self.mundo_con_rama_existente()
+        m.head_oid = "c" * 40
+        _, lineas = despachar(m, [job()])
+        reutilizadas = [l for l in lineas if l["tipo"] == "worktree"
+                        and "rama reutilizada" in l["cuerpo"]]
+        self.assertEqual(len(reutilizadas), 1)
+        self.assertIn(self.BASE_VIEJA[:8], reutilizadas[0]["cuerpo"])
+        self.assertIn("origin/main", reutilizadas[0]["cuerpo"])
+
+    def test_rama_nueva_no_cambia_de_comportamiento(self):
+        m = Mundo()  # default: la rama no existe
+        res, _ = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "hecho")
+        self.assertEqual(self.rebases(m), [])
+        (add,) = m.llamo("git", "worktree", "add")
+        self.assertIn("-b", add[0])
+
+    def test_rebase_que_conflictua_no_despacha(self):
+        m = self.mundo_con_rama_existente()
+        self.rebase_conflicto(m)
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "abandonado")
+        self.assertEqual(res[0].clase_abandono, "humano")
+        # El agente nunca arrancó.
+        self.assertEqual(m.llamo("herdr", "agent", "start"), [])
+        # No queda medio rebase en el worktree.
+        self.assertEqual(len(m.llamo("git", "rebase", "--abort")), 1)
+
+    def test_el_conflicto_manda_a_la_cola_de_mantenimiento(self):
+        m = self.mundo_con_rama_existente()
+        self.rebase_conflicto(m)
+        _, lineas = despachar(m, [job()])
+        # Fuera de la frontera de agentes, con el motivo en el issue (#56).
+        (edit,) = m.llamo("gh", "issue", "edit")
+        self.assertIn("ready-for-human", edit[0])
+        self.assertIn("ready-for-agent", edit[0])
+        self.assertEqual(len(m.llamo("gh", "issue", "comment")), 1)
+        # Y se anota en el log.
+        self.assertTrue(any(l["tipo"] == "park" for l in lineas))
+        trabajo = [l for l in lineas if l["tipo"] == "worktree"
+                   and "rama reutilizada" in l["cuerpo"]]
+        self.assertEqual(len(trabajo), 1)
+        self.assertIn(self.BASE_VIEJA[:8], trabajo[0]["cuerpo"])
+        self.assertIn("origin/main", trabajo[0]["cuerpo"])
+
+    def test_el_conflicto_no_gasta_reintento_de_infra(self):
+        """Un rebase que conflictúa no es infra: no hay que reintentarlo dos
+        veces más para volver a chocar con lo mismo, va directo a la cola."""
+        m = self.mundo_con_rama_existente()
+        self.rebase_conflicto(m)
+        despachar(m, [job()])
+        self.assertEqual(len(self.rebases(m)), 1)
+
+
 class TestElAbandonoDejaPistas(unittest.TestCase):
     """El abandono no borra ni el trabajo ni el porqué (#66).
 
