@@ -10,6 +10,8 @@
 #   caffeinate -imsu ./scripts/noche.sh
 #
 # Para frenarlo desde otra terminal:  touch /tmp/harness-stop
+# Un freno que quedó de una corrida vieja no arranca: sale != 0 y avisa por
+# stderr. Salir 0 al segundo se lee como "salió bien" y se come la noche.
 set -uo pipefail
 
 CONTEXTO="${CONTEXTO:-harness}"
@@ -25,7 +27,9 @@ cd "$(dirname "$0")/.." || exit 1
 
 decir() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 
+# CREDITO_FAKE es la costura para los tests: sin ella esto es una llamada de red.
 credito() {
+  if [[ -n "${CREDITO_FAKE:-}" ]]; then printf '%s\n' "$CREDITO_FAKE"; return; fi
   python3 - <<'PY' 2>/dev/null || echo 0
 import json, pathlib, urllib.request
 k = json.loads((pathlib.Path.home()/'.pi/agent/models.json').read_text())
@@ -36,6 +40,17 @@ d = json.load(urllib.request.urlopen(r, timeout=20))['data']
 print('%.2f' % (d.get('total_credits', 0) - d['total_usage']))
 PY
 }
+
+if [[ -e "$FRENO" ]]; then
+  {
+    echo "noche.sh: no arranco, hay un freno puesto."
+    echo "  archivo: $FRENO"
+    echo "  puesto:  $(date -r "$FRENO" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
+    echo "  si es de una corrida vieja:  rm $FRENO"
+  } >&2
+  decir "freno encontrado al arrancar ($FRENO): no arranco"
+  exit 2
+fi
 
 decir "inicio · contexto=$CONTEXTO max=$MAX piso=US\$$PISO_USD tope=$PASADAS_MAX pasadas"
 decir "log: $LOG"
