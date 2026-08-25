@@ -3,8 +3,9 @@ eventos que da `harness.summary.leer_eventos`. Sin herdr, sin git, sin
 red: los eventos son dicts que se construyen acá.
 
 Cubre el esquema nuevo del log —`run_id`, `ticket` y `attempt`— y las
-líneas viejas, escritas antes de esas claves, que tienen que leerse sin
-romper y cuentan como intento 1.
+líneas viejas, escritas antes de esas claves: se leen sin romper, pero
+sin `ticket` no se pueden atribuir a ningún repo, así que no cuentan
+en ningún lado (#72).
 """
 
 import unittest
@@ -33,7 +34,9 @@ def vieja(tipo, ref, cuerpo, ts):
 
 
 class TestIntentos(unittest.TestCase):
-    def test_lineas_viejas_cuentan_como_un_intento(self):
+    def test_lineas_viejas_no_cuentan_para_ningun_repo(self):
+        """#72: sin campo `ticket` no se pueden atribuir, ni al repo
+        del que parezcan."""
         evs = [vieja("worktree", "ticket/7", "/x", "2026-08-22T12:00:00Z"),
                vieja("agente", "ticket/7", "koku-7 (kind pi, pane w9:p1)",
                      "2026-08-22T12:01:00Z"),
@@ -41,7 +44,8 @@ class TestIntentos(unittest.TestCase):
                      "2026-08-22T12:10:00Z"),
                vieja("abandono", "ticket/7", "gate rojo en el worktree: sin PR",
                      "2026-08-22T12:10:00Z")]
-        self.assertEqual(state.intentos(evs, "koku", 7), 1)
+        self.assertEqual(state.intentos(evs, "koku", 7), 0)
+        self.assertEqual(state.intentos(evs, "otro", 7), 0)
 
     def test_un_run_id_distinto_es_otro_intento(self):
         evs = [ev("gate", "ticket/7", "rojo", "2026-08-22T12:00:00Z",
@@ -114,13 +118,15 @@ class TestDeTicket(unittest.TestCase):
         self.assertEqual(s.intentos, 0)
         self.assertIsNone(s.ultimo_motivo)
 
-    def test_lineas_viejas_entran(self):
+    def test_lineas_viejas_no_se_atribuyen(self):
+        """#72: sin `ticket` no se sabe de qué repo son, así que el
+        estado las ignora."""
         evs = [vieja("abandono", "ticket/7",
                      "timeout de espera (3600000 ms)",
                      "2026-08-22T12:10:00Z")]
         s = state.de_ticket(evs, "koku", 7)
-        self.assertEqual(s.intentos, 1)
-        self.assertEqual(s.ultimo_motivo, "timeout de espera (3600000 ms)")
+        self.assertEqual(s.intentos, 0)
+        self.assertIsNone(s.ultimo_motivo)
         self.assertIsNone(s.ultimo_runner)
 
 
@@ -177,15 +183,14 @@ class TestPasos(unittest.TestCase):
         self.assertIsNone(pasos[0].cuota)
         self.assertIsNone(pasos[1].cuota)
 
-    def test_lineas_viejas_dan_un_solo_peldano(self):
+    def test_lineas_viejas_no_dan_peldano(self):
+        """#72: sin `ticket` no se pueden atribuir, así que no aparecen
+        en la escalera: un peldaño fantasma haría escalar de más."""
         evs = [vieja("agente", "ticket/7", "koku-7 (kind pi, pane w9:p1)",
                      "2026-08-22T12:01:00Z"),
                vieja("abandono", "ticket/7", "timeout de espera (3600000 ms)",
                      "2026-08-22T12:10:00Z")]
-        pasos = state.pasos(evs, "koku", 7)
-        self.assertEqual(len(pasos), 1)
-        self.assertEqual(pasos[0].attempt, 1)
-        self.assertEqual(pasos[0].runner, "pi")
+        self.assertEqual(state.pasos(evs, "koku", 7), [])
 
     def test_vacio(self):
         self.assertEqual(state.pasos([], "koku", 7), [])
@@ -220,19 +225,17 @@ class TestTasas(unittest.TestCase):
                          {"koku": {"exito": 1, "abandono": 1},
                           "otro": {"exito": 1, "abandono": 0}})
 
-    def test_linea_vieja_entra_por_runner_no_por_repo(self):
-        """Las líneas viejas no traen repo en el ticket: cuentan en
-        `por_runner` (el kind está en la línea `agente`) y no en
-        `por_repo`."""
+    def test_linea_vieja_no_entra_a_nada(self):
+        """#72: sin `ticket` no hay repo al que atribuirla (ni corrida a
+        la que colgarle el runner), así que no cuenta."""
         evs = [
             vieja("agente", "ticket/7", "koku-7 (kind pi, pane p1)",
                   "2026-08-22T12:00:00Z"),
             vieja("abandono", "ticket/7", "gate rojo en el worktree: sin PR",
                   "2026-08-22T12:30:00Z"),
         ]
-        t = state.tasas(evs)
-        self.assertEqual(t["por_runner"], {"pi": {"exito": 0, "abandono": 1}})
-        self.assertEqual(t["por_repo"], {})
+        self.assertEqual(state.tasas(evs),
+                         {"por_runner": {}, "por_repo": {}})
 
     def test_vacia(self):
         self.assertEqual(state.tasas([]), {"por_runner": {}, "por_repo": {}})
@@ -350,13 +353,22 @@ class TestIntentosQueEscalan(unittest.TestCase):
                   "2026-08-22T12:00:00Z", run_id="r1", clase="humano")]
         self.assertEqual(state.intentos_que_escalan(evs, "koku", 7), 1)
 
-    def test_lineas_viejas_sin_clase_cuentan_como_modelo(self):
-        """El default conservador: una causa desconocida gasta peldaño,
-        no lo reintenta gratis."""
+    def test_linea_sin_clase_cuenta_como_modelo(self):
+        """El default conservador: una línea escrita entre #35 y #37
+        (con `ticket`, sin `clase`) gasta peldaño, no reintenta
+        gratis."""
+        evs = [ev("abandono", "ticket/7",
+                  "gate rojo en el worktree: sin PR",
+                  "2026-08-22T12:00:00Z", run_id="r1")]
+        self.assertEqual(state.intentos_que_escalan(evs, "koku", 7), 1)
+
+    def test_lineas_viejas_no_escalan(self):
+        """#72: sin `ticket` no se atribuyen a ningún repo."""
         evs = [vieja("abandono", "ticket/7",
                      "gate rojo en el worktree: sin PR",
                      "2026-08-22T12:00:00Z")]
-        self.assertEqual(state.intentos_que_escalan(evs, "koku", 7), 1)
+        self.assertEqual(state.intentos_que_escalan(evs, "koku", 7), 0)
+        self.assertEqual(state.intentos_que_escalan(evs, "otro", 7), 0)
 
     def test_una_corrida_sin_abandono_no_escala(self):
         evs = [ev("pr", "ticket/7", "PR #35 abierto (gate verde)",
@@ -422,6 +434,80 @@ class TestUltimoGateRojo(unittest.TestCase):
         evs = [ev("abandono", "ticket/7", "arbol sucio en el worktree",
                   "2026-08-22T12:00:00Z", clase="modelo")]
         self.assertIsNone(state.ultimo_gate_rojo(evs, "koku", 7))
+
+
+class TestReposQueCompartenNumeroDeIssue(unittest.TestCase):
+    """#72: dos repos que comparten el número de issue, con líneas de
+    ambos esquemas en el mismo log. Las viejas (sin `ticket`) no se
+    pueden atribuir a ningún repo, así que no contaminan el conteo ni
+    la escalera de ninguno."""
+
+    def historial(self):
+        """El repo `otro` tiene corridas viejas (esquema anterior, otro
+        contexto) y una nueva sobre #69; `koku` tiene una nueva."""
+        return [
+            vieja("agente", "ticket/69", "otro-69 (kind pi, pane w1:p1)",
+                  "2026-08-23T02:01:00Z"),
+            vieja("abandono", "ticket/69", "gate rojo en el worktree: sin PR",
+                  "2026-08-23T02:10:00Z"),
+            vieja("agente", "ticket/69", "otro-69 (kind pi, pane w1:p2)",
+                  "2026-08-23T03:01:00Z"),
+            vieja("abandono", "ticket/69", "timeout de espera (3600000 ms)",
+                  "2026-08-23T03:10:00Z"),
+            ev("agente", "ticket/69", "otro-69 (kind claude, pane w2:p1)",
+               "2026-08-24T21:01:00Z", run_id="r1", ticket="otro#69"),
+            ev("abandono", "ticket/69", "gate rojo",
+               "2026-08-24T21:30:00Z", run_id="r1", ticket="otro#69",
+               clase="modelo"),
+            ev("worktree", "ticket/69", "/x",
+               "2026-08-24T22:00:00Z", run_id="r2", ticket="koku#69"),
+            ev("agente", "ticket/69", "koku-69 (kind pi, pane w3:p1)",
+               "2026-08-24T22:01:00Z", run_id="r2", ticket="koku#69"),
+            ev("gate", "ticket/69", "rojo: unittest",
+               "2026-08-24T22:10:00Z", run_id="r2", ticket="koku#69"),
+            ev("abandono", "ticket/69", "gate rojo en el worktree: sin PR",
+               "2026-08-24T22:10:00Z", run_id="r2", ticket="koku#69",
+               clase="modelo"),
+        ]
+
+    def test_intentos_por_repo(self):
+        evs = self.historial()
+        self.assertEqual(state.intentos(evs, "koku", 69), 1)
+        self.assertEqual(state.intentos(evs, "otro", 69), 1)
+        self.assertEqual(state.intentos(evs, "tercero", 69), 0)
+
+    def test_escalera_por_repo(self):
+        """El peldaño se elige con `intentos_que_escalan`: un intento
+        fantasma haría arrancar en el peldaño 2 y gastar cuota."""
+        evs = self.historial()
+        self.assertEqual(state.intentos_que_escalan(evs, "koku", 69), 1)
+        self.assertEqual(state.intentos_que_escalan(evs, "otro", 69), 1)
+        self.assertEqual(state.intentos_que_escalan(evs, "tercero", 69), 0)
+
+    def test_de_ticket_no_pisa_el_motivo_del_otro_repo(self):
+        evs = self.historial()
+        s = state.de_ticket(evs, "koku", 69)
+        self.assertEqual(s.intentos, 1)
+        self.assertEqual(s.ultimo_motivo, "gate rojo en el worktree: sin PR")
+        self.assertEqual(s.ultimo_runner, "pi")
+        self.assertEqual(state.de_ticket(evs, "tercero", 69).intentos, 0)
+
+    def test_peldanos_no_se_mezclan(self):
+        evs = self.historial()
+        self.assertEqual([p.run_id for p in state.pasos(evs, "koku", 69)],
+                         ["r2"])
+        self.assertEqual([p.run_id for p in state.pasos(evs, "otro", 69)],
+                         ["r1"])
+
+    def test_tasas_por_repo(self):
+        evs = self.historial()
+        t = state.tasas(evs)
+        self.assertEqual(t["por_repo"],
+                         {"otro": {"exito": 0, "abandono": 1},
+                          "koku": {"exito": 0, "abandono": 1}})
+        self.assertEqual(t["por_runner"],
+                         {"claude": {"exito": 0, "abandono": 1},
+                          "pi": {"exito": 0, "abandono": 1}})
 
 
 if __name__ == "__main__":
