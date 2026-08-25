@@ -16,6 +16,8 @@ pendiente.
 | Lo que falta | issues abiertos, etiqueta `ready-for-agent` |
 | El gate | `./scripts/gate.sh` — única fuente de verdad de "esto mergea" |
 | El estado en vivo | `harness status --context harness` |
+| El bucle de la noche | `./scripts/noche.sh` (con `caffeinate -imsu`) |
+| El guard del agente | `extensions/harness-guard/` — copiado a `~/.pi/agent/extensions/` |
 
 ---
 
@@ -54,6 +56,12 @@ El repo pasó de 272 a 486 tests. Mergeado y verificado:
    búsqueda de GitHub ni contra el exit code de un comando que reporta éxito igual.
 6. **Los prompts van en una sola línea** y el primero después de `agent start` se pierde
    siempre: hay que verificar que el contexto suba de 0 % y reintentar.
+7. **Un prompt no es una ley.** Lo que tiene que ser imposible se hace imposible, no se
+   pide. `extensions/harness-guard/` bloquea merge, force-push, `reset --hard` y escrituras
+   fuera del worktree desde la tool, antes de que se ejecuten. El prompt sigue diciéndolo,
+   pero ya no es lo único que lo sostiene.
+8. **Fallar en silencio con código 0 es peor que fallar.** Un `/tmp/harness-stop` viejo se
+   comió la noche del 25 y el log parecía una corrida normal. Ver #91.
 
 ---
 

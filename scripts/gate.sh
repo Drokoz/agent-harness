@@ -50,7 +50,19 @@ echo "$out"
 echo "$out" | grep -Eq 'Ran [1-9][0-9]* tests?' \
   || fail "la suite no corrió ningún test (¿descubrimiento roto?)"
 
-# 3) Corrida real del CLI, punta a punta y sin red: modo sin adaptadores.
+# 3) Las reglas del guard son TypeScript y viven fuera de la suite de Python.
+#    Node es dependencia dura del harness (pi y herdr son node), así que si no
+#    está, es rojo: un guard sin testear es peor que no tener guard.
+echo "== harness-guard (node)"
+command -v node >/dev/null 2>&1 \
+  || fail "no hay node y las reglas de extensions/harness-guard no se pueden testear"
+out=$(node --experimental-strip-types --test extensions/harness-guard/reglas.test.ts extensions/harness-guard/index.test.ts 2>&1) \
+  || { echo "$out"; fail "tests de harness-guard"; }
+echo "$out" | grep -Eq '^# pass [1-9][0-9]*' \
+  || { echo "$out"; fail "los tests de harness-guard no corrieron ninguno"; }
+echo "$out" | grep -E '^# (pass|fail)'
+
+# 4) Corrida real del CLI, punta a punta y sin red: modo sin adaptadores.
 echo "== harness status (offline)"
 HARNESS_OFFLINE=1 ./bin/harness status >/dev/null || fail "harness status (offline) no sale 0"
 
