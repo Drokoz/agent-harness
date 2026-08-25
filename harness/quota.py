@@ -258,17 +258,20 @@ def agregar(registros, raices):
     """El agregado crudo (la forma de `--json`, con los timestamps como
     datetime, que `as_dict` convierte a ISO).
 
-    `por_semana_cuota` y `por_dia` (#47) son la vista ponderada, partida
-    harness/resto, que necesita el resumen de la mañana ("cuota de la
-    semana, cuánto es del harness") y la evolución por noche del reporte
-    HTML: `por_semana` sigue crudo y por modelo, sin tocar, porque
-    `test_por_semana` ya lo fija así. `por_dia` bucketea por fecha
-    calendario en `SEMANA_TZ`: es la "noche" del harness, no UTC."""
+    `por_semana_cuota`, `por_semana_ponderado` y `por_dia` (#47) son las
+    vistas ponderadas —la semana partida harness/resto para el resumen de la
+    mañana ("cuota de la semana, cuánto es del harness"), la semana y el
+    modelo ponderados que dibuja la tabla (#74: la misma unidad que el total),
+    y la evolución por noche del reporte HTML—: `por_semana` sigue crudo y por
+    modelo, sin tocar, porque `test_por_semana` ya lo fija así y `--json` no
+    pierde el crudo. `por_dia` bucketea por fecha calendario en `SEMANA_TZ`:
+    es la "noche" del harness, no UTC."""
     total = vacio()
     por_modelo: Dict[str, dict] = {}
     puntos: Dict[str, list] = {}
     semanas: Dict[str, Dict[str, int]] = {}
     por_semana_cuota: Dict[str, Dict[str, float]] = {}
+    por_semana_ponderado: Dict[str, Dict[str, float]] = {}
     por_dia: Dict[str, Dict[str, float]] = {}
     proyectos: Dict[str, dict] = {}
     harness = vacio()
@@ -276,13 +279,16 @@ def agregar(registros, raices):
     for r in registros:
         t, m, dt = r["tokens"], r["modelo"], r["timestamp"]
         sumar_en(total, t)
-        sumar_en(por_modelo.setdefault(m, vacio()), t)
+        sumar_en(por_modelo.setdefault(m, {**vacio(), "ponderado": 0.0}), t)
         por_modelo[m]["mensajes"] = por_modelo[m].get("mensajes", 0) + 1
         puntos.setdefault(m, []).append((dt, t["total"]))
         wk = semanas.setdefault(semana_inicio(dt).isoformat(), {})
         wk[m] = wk.get(m, 0) + t["total"]
         proyecto, ticket, es_h = atribuir(r["dir"], raices)
         peso = ponderar(t)
+        por_modelo[m]["ponderado"] += peso
+        wkp = por_semana_ponderado.setdefault(semana_inicio(dt).isoformat(), {})
+        wkp[m] = wkp.get(m, 0.0) + peso
         wkc = por_semana_cuota.setdefault(semana_inicio(dt).isoformat(),
                                           {"harness": 0.0, "resto": 0.0})
         wkc["harness" if es_h else "resto"] += peso
@@ -291,8 +297,10 @@ def agregar(registros, raices):
         pd["harness" if es_h else "resto"] += peso
         clave = proyecto + (" [harness]" if es_h else "")
         p = proyectos.setdefault(clave, {"harness": es_h, **vacio(),
+                                         "ponderado": 0.0,
                                          "tickets": {}, "tickets_ponderado": {}})
         sumar_en(p, t)
+        p["ponderado"] += peso
         if ticket is not None:
             p["tickets"][str(ticket)] = p["tickets"].get(str(ticket), 0) + t["total"]
             p["tickets_ponderado"][str(ticket)] = (
@@ -307,6 +315,7 @@ def agregar(registros, raices):
         "pico_5h": {m: pico_5h(pts) for m, pts in puntos.items()},
         "por_semana": semanas,
         "por_semana_cuota": por_semana_cuota,
+        "por_semana_ponderado": por_semana_ponderado,
         "por_dia": por_dia,
         "por_proyecto": proyectos,
         "harness": harness,
@@ -376,50 +385,83 @@ def _utc(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def render_quota(agg):
-    """La tabla corta: sin flags, esto es lo que se imprime."""
+def render_quota(agg, tope_semanal=None):
+    """La tabla corta: sin flags, esto es lo que se imprime.
+
+    Todo ponderado, en la misma unidad que el total (ticket #74): los crudos
+    se quedaron bajo la línea del total y en `--json`. `tope_semanal` (la
+    constante de calibración de la config, #74) agrega el porcentaje estimado
+    del tope semanal a cada corte; sin ella no se inventa un porcentaje: se
+    muestran los tokens y se dice que falta calibrar."""
     out = []
     a = out.append
     total = agg["total"]["total"]
     t = agg["total"]
+    total_w = agg["ponderado"]
     a(f"Cuota · sesiones locales ({agg['archivos']} archivo(s), "
       f"{agg['mensajes']} mensaje(s))")
-    a(f"  total ponderado {_fmt(round(agg['ponderado']))} tokens "
+    a(f"  total ponderado {_fmt(round(total_w))} tokens "
       f"(por costo relativo, ver PESOS)")
     a(f"    crudo: input {_fmt(t['input'])} · cache_creation "
       f"{_fmt(t['cache_creation'])} · cache_read {_fmt(t['cache_read'])} · "
       f"output {_fmt(t['output'])} · thinking {_fmt(t['thinking'])} "
       f"(suma cruda {_fmt(total)})")
     a("")
-    a("  por modelo:")
+
+    def del_tope(n):
+        return f" · {100.0 * n / tope_semanal:.1f}% del tope" \
+            if tope_semanal else ""
+
+    a(f"  por modelo (ponderado):{del_tope(total_w)}")
     if not agg["por_modelo"]:
         a("    (sin sesiones)")
-    for m in sorted(agg["por_modelo"], key=lambda m: -agg["por_modelo"][m]["total"]):
+    for m in sorted(agg["por_modelo"], key=lambda m: -agg["por_modelo"][m]["ponderado"]):
         d = agg["por_modelo"][m]
-        a(f"    {m:<28} {_fmt(d['total']):>12}  ({_pct(d['total'], total)})")
+        a(f"    {m:<28} {_fmt(round(d['ponderado'])):>12}  "
+          f"({_pct(d['ponderado'], total_w)})")
     a("")
-    a("  pico en 5h (ventana rodante):")
+    a("  pico en 5h (ventana rodante, crudo):")
     for m in sorted(agg["pico_5h"], key=lambda m: -agg["pico_5h"][m][0]):
         v, desde, hasta = agg["pico_5h"][m]
         a(f"    {m:<28} {_fmt(v):>12}  ({_utc(desde)} → {_utc(hasta)})")
     a("")
-    a("  por semana (reset vie 17:00, America/Santiago):")
-    for iso in sorted(agg["por_semana"], reverse=True):
-        a(f"    {iso[:10]}   {_fmt(sum(agg['por_semana'][iso].values()))}")
+    a("  por semana (ponderado, reset vie 17:00, America/Santiago):")
+    if not agg["por_semana_ponderado"]:
+        a("    (sin sesiones)")
+    for iso in sorted(agg["por_semana_ponderado"], reverse=True):
+        n = sum(agg["por_semana_ponderado"][iso].values())
+        a(f"    {iso[:10]}   {_fmt(round(n)):>12}{del_tope(n)}")
     a("")
-    a("  por proyecto:")
+    a("  por día (ponderado, últimos 10, America/Santiago):")
+    dias = sorted(agg["por_dia"], reverse=True)[:10]
+    if not dias:
+        a("    (sin sesiones)")
+    for dia in dias:
+        n = agg["por_dia"][dia]["harness"] + agg["por_dia"][dia]["resto"]
+        a(f"    {dia}   {_fmt(round(n)):>12}{del_tope(n)}")
+    a("")
+    a(f"  por proyecto (ponderado):{del_tope(total_w)}")
+    if not agg["por_proyecto"]:
+        a("    (sin sesiones)")
     for clave in sorted(agg["por_proyecto"],
-                        key=lambda n: -agg["por_proyecto"][n]["total"]):
+                        key=lambda n: -agg["por_proyecto"][n]["ponderado"]):
         d = agg["por_proyecto"][clave]
         nombre = clave[:-len(" [harness]")] if d["harness"] else clave
-        tickets = ", ".join(f"ticket {k} {_fmt(v)}"
-                            for k, v in sorted(d["tickets"].items(),
+        tickets = ", ".join(f"ticket {k} {_fmt(round(v))}"
+                            for k, v in sorted(d["tickets_ponderado"].items(),
                                                key=lambda kv: -kv[1]))
         marca = " [harness]" if d["harness"] else ""
         sufijo = f"  ({tickets})" if tickets else ""
-        a(f"    {nombre}{marca:<10} {_fmt(d['total']):>12}{sufijo}")
-    h, r = agg["harness"]["total"], agg["resto"]["total"]
-    a(f"  harness {_fmt(h)} ({_pct(h, total)}) · resto {_fmt(r)} ({_pct(r, total)})")
+        a(f"    {nombre}{marca:<10} {_fmt(round(d['ponderado'])):>12}{sufijo}")
+    hw, rw = ponderar(agg["harness"]), ponderar(agg["resto"])
+    a(f"  harness {_fmt(round(hw))} ({_pct(hw, total_w)}) · "
+      f"resto {_fmt(round(rw))} ({_pct(rw, total_w)})")
+    if tope_semanal:
+        a(f"  (tope semanal estimado: {_fmt(round(tope_semanal))} tokens "
+          f"ponderados; el % es aproximado)")
+    else:
+        a("  (sin calibración: fijar \"quota\": {\"tope_semanal\": N} en la "
+          "config para estimar el tope semanal)")
     a("  (aproximado: solo este usuario de esta máquina)")
     return "\n".join(out) + "\n"
 

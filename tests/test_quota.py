@@ -18,7 +18,7 @@ import os
 import subprocess
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import support  # noqa: F401  (pone la raíz en sys.path)
@@ -254,13 +254,20 @@ class TestAgregar(unittest.TestCase):
         self.assertEqual(self.agg["ponderado"], ponderar(self.agg["total"]))
 
     def test_por_modelo(self):
+        # Los componentes crudos siguen enteros (ticket #74: `--json` no
+        # pierde nada), y `ponderado` es la vista que se muestra en tabla.
         self.assertEqual(self.agg["por_modelo"]["claude-opus-5"],
                          {"input": 600, "cache_creation": 1200,
                           "cache_read": 1800, "output": 2900,
-                          "thinking": 250, "total": 6500, "mensajes": 3})
+                          "thinking": 250, "total": 6500, "mensajes": 3,
+                          "ponderado": 16780.0})
         self.assertEqual(self.agg["por_modelo"]["fable"]["total"], 300)
+        self.assertEqual(self.agg["por_modelo"]["fable"]["ponderado"], 714.0)
         self.assertEqual(self.agg["por_modelo"]["claude-sonnet-4-20250514"]["total"],
                          1200)
+        self.assertEqual(
+            self.agg["por_modelo"]["claude-sonnet-4-20250514"]["ponderado"],
+            2856.0)
 
     def test_pico_5h(self):
         p = self.agg["pico_5h"]
@@ -286,7 +293,8 @@ class TestAgregar(unittest.TestCase):
         self.assertEqual(p["f7league [harness]"],
                          {"harness": True, "input": 600, "cache_creation": 1200,
                           "cache_read": 1800, "output": 2900, "thinking": 250,
-                          "total": 6500, "tickets": {"256": 6500},
+                          "total": 6500, "ponderado": 16780.0,
+                          "tickets": {"256": 6500},
                           "tickets_ponderado": {"256": 16780.0}})
         self.assertEqual(p["koku"]["harness"], False)
         self.assertEqual(p["koku"]["total"], 1200)
@@ -321,6 +329,41 @@ class TestAgregar(unittest.TestCase):
 
     def test_por_dia_vacio_sin_registros(self):
         self.assertEqual(agregar([], RAIZ)["por_dia"], {})
+
+    def test_por_semana_ponderado(self):
+        """Ticket #74: como `por_semana` pero ponderado (la vista que se
+        muestra). El crudo sigue en `por_semana`, sin tocar."""
+        self.assertEqual(self.agg["por_semana_ponderado"], {
+            "2026-08-14T17:00:00-04:00": {"claude-sonnet-4-20250514": 1190.0},
+            "2026-08-21T17:00:00-04:00": {"claude-opus-5": 7140.0,
+                                          "claude-sonnet-4-20250514": 1666.0,
+                                          "fable": 714.0},
+            "2026-08-28T17:00:00-04:00": {"claude-opus-5": 9640.0},
+        })
+
+    def test_por_proyecto_ponderado(self):
+        p = self.agg["por_proyecto"]
+        self.assertEqual(p["koku"]["ponderado"], 2856.0)
+        self.assertEqual(p["otro-lugar"]["ponderado"], 714.0)
+
+    def test_la_suma_de_los_desgloses_es_el_total_ponderado(self):
+        """Ticket #74: los desgloses se muestran en la misma unidad que el
+        total, así que cada suma tiene que coincidir con `ponderado` —
+        no dos escalas distintas en la misma pantalla."""
+        self.assertEqual(sum(d["ponderado"]
+                             for d in self.agg["por_modelo"].values()),
+                         self.agg["ponderado"])
+        self.assertAlmostEqual(
+            sum(sum(m.values())
+                for m in self.agg["por_semana_ponderado"].values()),
+            self.agg["ponderado"])
+        self.assertAlmostEqual(
+            sum(d["ponderado"]
+                for d in self.agg["por_proyecto"].values()),
+            self.agg["ponderado"])
+        self.assertAlmostEqual(
+            sum(v["harness"] + v["resto"] for v in self.agg["por_dia"].values()),
+            self.agg["ponderado"])
 
     def test_as_dict_es_serializable(self):
         texto = json.dumps(as_dict(self.agg), sort_keys=True)
@@ -401,8 +444,48 @@ class TestRender(unittest.TestCase):
         self.assertIn("[harness]", texto)
         self.assertIn("ticket 256", texto)
         self.assertIn("2026-08-21", texto)
-        self.assertIn("harness 6,500", texto)
+        # Ticket #74: los desgloses van ponderados, en la misma unidad que
+        # el total —los crudos se quedaron abajo del total y en `--json`.
+        self.assertIn("16,780", texto)      # opus ponderado
+        self.assertIn("2,856", texto)       # sonnet ponderado
+        self.assertIn("9,520", texto)       # semana 08-21 ponderada
+        self.assertIn("9,640", texto)       # semana y día 08-28
+        self.assertIn("harness 16,780", texto)
+        self.assertNotIn("6,500", texto)    # el crudo de opus no está en la tabla
+        # Sin constante de calibración no se inventa porcentaje: se dicen
+        # los tokens y se dice que falta calibrar.
+        self.assertIn("sin calibración", texto)
+        self.assertNotIn("del tope", texto)
         self.assertNotIn("\033", texto)
+
+    def test_tabla_calibrada_muestra_el_pct_del_tope(self):
+        """Ticket #74: con `tope_semanal` cada corte muestra además su
+        porcentaje estimado del tope semanal."""
+        texto = render_quota(agregar(leer_sesiones(SESIONES), RAIZ),
+                             tope_semanal=100000)
+        self.assertIn("9.5% del tope", texto)   # semana 08-21: 9,520/100,000
+        self.assertIn("9.6% del tope", texto)   # semana/día 08-28: 9,640
+        self.assertIn("1.2% del tope", texto)   # semana 08-14: 1,190
+        self.assertNotIn("sin calibración", texto)
+
+    def test_por_dia_muestra_solo_los_ultimos_diez(self):
+        """Ticket #74: el corte por día se limita a los últimos 10 días."""
+        def registro(dia):
+            return {"modelo": "m",
+                    "timestamp": datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
+                    + timedelta(days=dia),
+                    "tokens": {"input": 100, "cache_creation": 0,
+                               "cache_read": 0, "output": 0, "thinking": 0,
+                               "total": 100},
+                    "dir": "-u-docs-koku", "archivo": "a.jsonl"}
+        regs = [registro(i) for i in range(12)]  # 2026-09-01 .. 2026-09-12
+        texto = render_quota(agregar(regs, RAIZ))
+        self.assertIn("\n    2026-09-12 ", texto)
+        self.assertIn("\n    2026-09-03 ", texto)
+        self.assertNotIn("\n    2026-09-02 ", texto)
+        self.assertNotIn("\n    2026-09-01 ", texto)
+        # El dato no se trunca: `--json` sigue trayendo los 12 días.
+        self.assertEqual(len(agregar(regs, RAIZ)["por_dia"]), 12)
 
     def test_resumen_evento(self):
         linea = resumen_evento(agregar(leer_sesiones(SESIONES), RAIZ))
@@ -427,6 +510,16 @@ class TestCli(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertIn("Cuota · sesiones locales", p.stdout)
             self.assertNotIn("\033", p.stdout)
+
+    def test_config_calibrada_dibuja_el_pct_del_tope(self):
+        """Ticket #74: la constante de calibración vive en config, no en el
+        código: con `quota.tope_semanal` la tabla lleva el % del tope."""
+        config = json.loads(CONFIG_QUOTA)
+        config["contexts"]["personal"]["quota"] = {"tope_semanal": 100000}
+        with correr_quota(config=json.dumps(config)) as p:
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("9.5% del tope", p.stdout)
+            self.assertNotIn("sin calibración", p.stdout)
 
     def test_escribe_un_evento_por_corrida(self):
         with tempfile.TemporaryDirectory() as tmp:

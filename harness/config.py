@@ -42,7 +42,8 @@ POLARITIES = ("remaining", "spent")
 PROVIDERS = ("openrouter", "manual", "none")
 RUNNERS = ("local", "ssh")
 
-CONTEXT_KEYS = ("tracker", "repos", "autonomy", "budget", "vault", "run")
+CONTEXT_KEYS = ("tracker", "repos", "autonomy", "budget", "vault", "run",
+                "quota")
 
 
 class ConfigError(Exception):
@@ -81,6 +82,18 @@ class BudgetSpec:
 
 
 @dataclass
+class QuotaSpec:
+    """Calibración de `harness quota` (#74), opcional.
+
+    `tope_semanal` es el tope semanal estimado en tokens PONDERADOS. No lo
+    inventa el código: sale de medir `/usage` (interactivo) y va en config
+    para poder re-medirlo sin tocar nada más.
+    """
+
+    tope_semanal: Optional[float] = None
+
+
+@dataclass
 class Run:
     """Cómo se ejecuta el trabajo de este contexto: acá o por SSH en otro usuario."""
 
@@ -97,6 +110,7 @@ class Context:
     budget: BudgetSpec
     run: Run
     vault: Optional[str] = None
+    quota: QuotaSpec = field(default_factory=QuotaSpec)
 
 
 @dataclass
@@ -234,6 +248,24 @@ def _run(raw, donde):
     return Run(kind=kind, host=host)
 
 
+def _quota(raw, donde):
+    """Opcional: la constante de calibración de `harness quota` (#74). Sin la
+    sección, sin `tope_semanal`, o `quota` vacío: sin tope — la tabla no
+    inventa porcentajes y dice que falta calibrar."""
+    if raw is None:
+        return QuotaSpec()
+    raw = _obj(raw, donde + ' → "quota"')
+    donde = donde + ' → "quota"'
+    _keys(raw, ("tope_semanal",), donde)
+    if "tope_semanal" in raw:
+        tope = _num(raw["tope_semanal"], '"tope_semanal"', donde)
+        if tope <= 0:
+            raise ConfigError(
+                '{}: "tope_semanal" tiene que ser mayor que cero'.format(donde))
+        return QuotaSpec(tope_semanal=tope)
+    return QuotaSpec()
+
+
 def _context(name, raw):
     donde = 'contexto "{}"'.format(name)
     raw = _obj(raw, donde)
@@ -249,6 +281,7 @@ def _context(name, raw):
         budget=_budget(_required(raw, "budget", donde), donde),
         run=_run(_required(raw, "run", donde), donde),
         vault=vault,
+        quota=_quota(raw.get("quota"), donde),
     )
 
 
