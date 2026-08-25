@@ -498,7 +498,9 @@ class Dispatcher:
     # -------------------------------------------------- pasos del ciclo de vida
     def _worktree(self, job, ref):
         """Worktree aislado por ticket. Si la rama ya existe (un intento
-        anterior la dejo), se reutiliza en vez de chocar."""
+        anterior la dejo), se reutiliza en vez de chocar — pero antes se
+        actualiza sobre la base, para que el reintento no arranque viejo
+        (#64)."""
         job.branch = "ticket/{}".format(job.issue)
         job.worktree = str(worktree_path(job.repo_path, job.issue))
         self.run_cmd(["git", "-C", job.repo_path, "worktree", "prune"])
@@ -506,8 +508,9 @@ class Dispatcher:
             self.run_cmd(["git", "-C", job.repo_path, "worktree", "remove",
                           "--force", job.worktree])
         args = ["git", "-C", job.repo_path, "worktree", "add"]
-        existe, _ = self.run_cmd(["git", "-C", job.repo_path, "rev-parse",
-                                  "--verify", "--quiet", "refs/heads/" + job.branch])
+        existe, base_vieja = self.run_cmd(["git", "-C", job.repo_path,
+                                           "rev-parse", "--verify", "--quiet",
+                                           "refs/heads/" + job.branch])
         if existe:
             # La rama ya está (un intento anterior la dejó): se reutiliza.
             args += [job.worktree, job.branch]
@@ -519,7 +522,52 @@ class Dispatcher:
         ok, out = self.run_cmd(args, timeout=120)
         if not ok:
             self._log(job, "worktree", ref, "fallo: " + out.strip()[-200:])
-        return ok
+            return False
+        if existe:
+            # La rama venia del intento anterior: su base puede estar vieja.
+            return self._actualizar_sobre_base(job, ref, base_vieja.strip())
+        return True
+
+    def _rama_base(self, job):
+        """Sobre qué se actualiza una rama reutilizada (#64): la rama por
+        defecto del remote (a qué apunta `origin/HEAD`), una consulta local
+        que no toca la red. Sin remote resuelto, `main`."""
+        ok, out = self.run_cmd(["git", "-C", job.repo_path, "symbolic-ref",
+                                "refs/remotes/origin/HEAD"])
+        prefijo = "refs/remotes/origin/"
+        if ok and out.strip().startswith(prefijo):
+            return out.strip()[len(prefijo):]
+        return "main"
+
+    def _actualizar_sobre_base(self, job, ref, base_vieja):
+        """El reintento no arranca sobre la base vieja (#64): la rama
+        reutilizada se rebasa sobre la rama por defecto del remote antes de
+        despachar, y queda en el log qué base tenía y sobre qué se
+        actualizó.
+
+        Si conflictúa, el ticket no se despacha a ciegas: se anota y se
+        manda a la cola de mantenimiento (#56), y el rebase se aborta para
+        que no quede medio rebase en el worktree."""
+        ref_base = "origin/" + self._rama_base(job)
+        ok, out = self.run_cmd(["git", "-C", job.worktree, "rebase", ref_base],
+                               timeout=120)
+        if not ok:
+            self.run_cmd(["git", "-C", job.worktree, "rebase", "--abort"],
+                         timeout=60)
+            motivo = "rebase sobre {} conflictua: {}".format(
+                ref_base, out.strip()[-200:])
+            self._log(job, "worktree", ref,
+                      "rama reutilizada: base vieja {}, {}".format(
+                          base_vieja[:8], motivo))
+            self._sacar_a_mantenimiento(job, ref, motivo)
+            return False
+        _, ahora = self.run_cmd(["git", "-C", job.worktree, "rev-parse",
+                                 "HEAD"])
+        self._log(job, "worktree", ref,
+                  "rama reutilizada: base vieja {} actualizada sobre {} "
+                  "(ahora {})".format(base_vieja[:8], ref_base,
+                                      ahora.strip()[:8]))
+        return True
 
     def _worktree_ok(self, job, ref):
         ok = self._reintentar_infra(job, ref, "no se pudo crear el worktree",
@@ -981,6 +1029,17 @@ class Dispatcher:
                       "--remove-label", "ready-for-agent",
                       "-R", job.slug])
 
+    def _para_humano(self, job, ref, comentario, log_cuerpo):
+        """Fuera de la frontera de la flota, con el motivo en el issue
+        (#38, #64): `ready-for-human` lo saca de la cola de agentes, y el
+        comentario evita que un humano (o el mantenedor de conflictos, #56)
+        tenga que releer el log de eventos para entender por qué."""
+        self._marcar_para_humano(job, ref)
+        if job.slug:
+            self.run_cmd(["gh", "issue", "comment", str(job.issue),
+                          "--body", comentario, "-R", job.slug])
+        self._log(job, "park", ref, log_cuerpo)
+
     def parkear(self, job, ref, motivos):
         """Agota la escalera de reintentos (#38): saca `ready-for-agent`,
         pone `ready-for-human` -- la etiqueta canónica de "para humano"
@@ -992,15 +1051,27 @@ class Dispatcher:
         #43 -- `PARKEADOS` incluye `ready-for-human`): la etiqueta ya lo saca,
         no hace falta nada más acá.
         """
-        self._marcar_para_humano(job, ref)
-        if job.slug:
-            cuerpo = "Escalera de reintentos agotada tras {} intento(s):\n".format(
-                len(motivos)) + "\n".join(
-                    "{}. {}".format(i, m) for i, m in enumerate(motivos, 1))
-            self.run_cmd(["gh", "issue", "comment", str(job.issue),
-                          "--body", cuerpo, "-R", job.slug])
-        self._log(job, "park", ref,
-                  "escalera agotada tras {} intento(s)".format(len(motivos)))
+        comentario = "Escalera de reintentos agotada tras {} intento(s):\n".format(
+            len(motivos)) + "\n".join(
+                "{}. {}".format(i, m) for i, m in enumerate(motivos, 1))
+        self._para_humano(job, ref, comentario,
+                          "escalera agotada tras {} intento(s)".format(
+                              len(motivos)))
+
+    def _sacar_a_mantenimiento(self, job, ref, motivo):
+        """Un ticket que no se despacha a ciegas (#64): a la cola de
+        mantenimiento (#56), que hoy es la frontera de humanos — la etiqueta
+        `ready-for-human` lo saca de la flota para siempre y el comentario
+        dice qué conflicto hay que resolver."""
+        comentario = ("Cola de mantenimiento (#56): la rama `ticket/{}` no "
+                      "se puede actualizar sobre la base y no se despacha a "
+                      "ciegas. {}. La rama queda como quedó, con sus commits; "
+                      "hay que resolverlo a mano sobre la base."
+                      ).format(job.issue, motivo)
+        self._para_humano(job, ref, comentario,
+                          "cola de mantenimiento (#56): " + motivo)
+        self._abandonar(job, ref, "no despachable a ciegas: " + motivo,
+                        clase="humano")
 
     # --------------------------------------------------------------- limpieza
     def _rescate(self, job, ref):
@@ -1152,6 +1223,11 @@ class Dispatcher:
         for intento in range(self.spec.infra_retries + 1):
             if intentar():
                 return True
+            if job.estado == "abandonado":
+                # `intentar()` ya dejó un veredicto propio (el conflicto de
+                # rebase que manda a la cola de mantenimiento, #64):
+                # reintentar no lo arregla, volvería a chocar con lo mismo.
+                return False
             if intento < self.spec.infra_retries:
                 self.dormir(self.spec.infra_retry_wait_s)
         self._abandonar(job, ref, motivo, clase="infra")
