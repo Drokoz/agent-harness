@@ -559,6 +559,19 @@ class TestCosto(unittest.TestCase):
         res, _ = despachar(m, [job()], costo_real=lambda *a, **k: None)
         self.assertAlmostEqual(res[0].costo, 0.25)
 
+    def test_el_reparto_se_marca_estimado_y_la_medicion_no(self):
+        """Un promedio y una medición no pueden leerse igual en el log: el
+        router (#45) decide con esa diferencia (#65)."""
+        m = Mundo(credits=[100.0, 100.25])
+        _, lineas = despachar(m, [job()], costo_real=lambda *a, **k: None)
+        cuerpo = [l["cuerpo"] for l in lineas
+                  if l["tipo"] == "costo" and l["ref"] == "ticket/7"][0]
+        self.assertIn("estimado", cuerpo)
+        _, lineas = despachar(m, [job()], costo_real=lambda *a, **k: 0.42)
+        cuerpo = [l["cuerpo"] for l in lineas
+                  if l["tipo"] == "costo" and l["ref"] == "ticket/7"][0]
+        self.assertNotIn("estimado", cuerpo)
+
     def test_pi_mide_aunque_no_haya_creditos_para_repartir(self):
         """La medición real no depende de que la corrida termine bien."""
         m = Mundo(credits=[None, None])

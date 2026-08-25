@@ -1210,8 +1210,10 @@ class Dispatcher:
         share = sobra / len(resto)
         for j in resto:
             j.costo = share
+            # "estimado" no es decorativo (#65): un promedio y una medición no
+            # pueden leerse igual, porque el router decide con la diferencia.
             self._log(j, "costo", "ticket/{}".format(j.issue),
-                      "${:.4f}".format(share))
+                      "${:.4f} (estimado: reparto del delta)".format(share))
 
     def _costo_de_pi(self, job, desde):
         """El costo real del ticket, si hay con qué medirlo. Nunca puede tumbar
