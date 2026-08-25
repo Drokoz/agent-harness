@@ -173,6 +173,55 @@ def worktree_path(repo_path, issue):
     return repo_path.parent / ".worktrees" / "{}-ticket-{}".format(repo_path.name, issue)
 
 
+# Cuántas transcripciones por ticket sobreviven al podado (#66): lo más
+# viejo se borra al guardar la nueva, para que no crezcan sin límite.
+TRANSCRIPCIONES_POR_TICKET = 5
+
+
+def worktree_logs_dir(repo_path):
+    """Dónde vive la transcripción de cada intento (#66).
+
+    Junto a los worktrees (`worktree_path`), fuera del checkout principal:
+    la transcripción es evidencia del dispatcher, no contenido del repo.
+    """
+    return Path(repo_path).parent / ".worktrees" / "logs"
+
+
+def transcripcion_path(repo_path, issue, attempt):
+    """Un archivo por ticket e intento (#66): un intento nunca pisa el
+    archivo del anterior, ni el próximo intento destruye la evidencia de
+    este. El nombre lleva el repo porque dos repos pueden tener el mismo
+    número de issue."""
+    nombre = "{}-ticket-{}-intento-{}.log".format(
+        Path(repo_path).name, issue, attempt)
+    return worktree_logs_dir(repo_path) / nombre
+
+
+def podar_transcripciones(dir, repo, issue, keep=TRANSCRIPCIONES_POR_TICKET):
+    """Sólo las `keep` transcripciones más recientes del ticket sobreviven
+    (#66); los tickets vecinos y los archivos que no son transcripciones
+    no se tocan. Devuelve los nombres borrados."""
+    dir = Path(dir)
+    if not dir.is_dir():
+        return []
+    patron = re.compile(
+        r"^{}-ticket-{}-intento-(\d+)\.log$".format(re.escape(str(repo)), issue))
+    archivos = []
+    for f in dir.iterdir():
+        m = patron.match(f.name)
+        if m and f.is_file():
+            archivos.append((int(m.group(1)), f))
+    archivos.sort()
+    borrados = []
+    for _, f in archivos[:-keep]:
+        try:
+            f.unlink()
+        except OSError:
+            continue
+        borrados.append(f.name)
+    return borrados
+
+
 def prompt_de(issue, gate_tail=None):
     """El trabajo de un agente, en una línea. En inglés: es machine-facing.
 
@@ -799,6 +848,75 @@ class Dispatcher:
                   "escalera agotada tras {} intento(s)".format(len(motivos)))
 
     # --------------------------------------------------------------- limpieza
+    def _rescate(self, job, ref):
+        """Lo que el abandono no debe borrar (#66), en el orden que hace
+        posible cada cosa: la transcripción con el pane todavía abierto, el
+        commit WIP con el worktree todavía en pie. Un job que terminó bien
+        no pasa por acá: no deja WIP ni transcripción."""
+        self._transcripcion(job, ref)
+        self._wip_abandono(job, ref)
+
+    def _transcripcion(self, job, ref):
+        """La salida reciente del agente, en un archivo por ticket e intento
+        (#66): sin ella no hay forma de saber por qué se detuvo —la misma
+        lección que `adapters.run` cuando descartaba stderr. El log de
+        eventos apunta al archivo, para ir del abandono a la transcripción.
+        """
+        if not (job.agent or job.pane):
+            return
+        destino = transcripcion_path(job.repo_path, job.issue, job.attempt)
+        ok, out = ((False, "") if not job.agent
+                   else self.run_cmd(["herdr", "agent", "read", job.agent,
+                                      "--source", "recent", "--lines", "200"],
+                                     timeout=30))
+        if not ok and job.pane:
+            # El agente no contestó: el pane sí queda abierto hasta acá, y
+            # lo que muestra es también evidencia.
+            ok, out = self.run_cmd(["herdr", "pane", "read", job.pane,
+                                    "--source", "recent", "--lines", "200"],
+                                   timeout=30)
+        if not ok:
+            self._log(job, "transcripcion", ref,
+                      "no se pudo leer la salida del agente")
+            return
+        try:
+            destino.parent.mkdir(parents=True, exist_ok=True)
+            destino.write_text(out, encoding="utf-8")
+        except OSError:
+            self._log(job, "transcripcion", ref,
+                      "no se pudo escribir " + str(destino))
+            return
+        podar_transcripciones(destino.parent, Path(job.repo_path).name,
+                              job.issue)
+        self._log(job, "transcripcion", ref, str(destino))
+
+    def _wip_abandono(self, job, ref):
+        """Los cambios sin commitear no entraron al PR ni al gate (#36),
+        pero borrarlos con el worktree es borrar el trabajo (#66): viajan a
+        la rama como commit WIP, y el próximo intento los encuentra cuando
+        reutiliza la rama. Arbol limpio = nada que rescatar."""
+        if not job.worktree:
+            return
+        ok, out = self.run_cmd(["git", "-C", job.worktree, "status",
+                                "--porcelain"])
+        if not ok or not out.strip():
+            return
+        msg = ("WIP: trabajo sin commitear que dejo el abandono de {} "
+               "(intento {})".format(job.branch or "ticket/{}".format(job.issue),
+                                     job.attempt))
+        ok, out = self.run_cmd(["git", "-C", job.worktree, "add", "-A"],
+                               timeout=60)
+        if not ok:
+            self._log(job, "wip", ref,
+                      "no se pudieron agregar los cambios: " + out.strip()[-160:])
+            return
+        ok, out = self.run_cmd(["git", "-C", job.worktree, "commit", "-m", msg],
+                               timeout=60)
+        if not ok:
+            self._log(job, "wip", ref, "el commit WIP fallo: " + out.strip()[-160:])
+            return
+        self._log(job, "wip", ref, msg)
+
     def _repartir_costo(self, jobs, antes, despues):
         """El costo por job, después de que la corrida entera terminó.
 
@@ -836,7 +954,13 @@ class Dispatcher:
         """Cierra el pane y quita el worktree: un pane que queda abierto para
         siempre hace inutilizable la pantalla después de unas cuantas tandas.
         La rama queda: si el agente dejo commits, son recuperables, y si el
-        ticket vuelve a la frontera el próximo intento la reutiliza."""
+        ticket vuelve a la frontera el próximo intento la reutiliza.
+
+        Un abandono rescata antes (#66): la transcripción necesita el pane
+        abierto y el commit WIP necesita el worktree en pie, así que nada de
+        eso se cierra ni se borra hasta después."""
+        if job.estado == "abandonado":
+            self._rescate(job, ref)
         cerrado = ""
         if job.pane:
             self.run_cmd(["herdr", "pane", "close", job.pane], timeout=60)
