@@ -395,12 +395,15 @@ class TestCicloDeVida(unittest.TestCase):
         self.assertEqual(res[0].estado, "abandonado")
         self.assertIn("sin PR", res[0].motivo)
 
-    def test_timeout_de_espera_es_abandono(self):
+    def test_timeout_de_espera_es_un_tick_del_watchdog(self):
+        """Antes, el timeout de una hora era el veredicto. Ahora cada
+        timeout es un chequeo de progreso (#41): sin progreso, el agente
+        se mata mucho antes de la hora."""
         m = Mundo()
         m.wait_out = '{"error":{"code":"timeout"},"id":"cli:agent:wait"}'
         res, _ = despachar(m, [job()])
         self.assertEqual(res[0].estado, "abandonado")
-        self.assertIn("timeout", res[0].motivo)
+        self.assertIn("sin progreso", res[0].motivo)
 
     def test_falla_el_worktree_y_el_job_no_arranca(self):
         m = Mundo().responder(
@@ -959,6 +962,125 @@ class TestElGateMideLoQueVaEnElPR(unittest.TestCase):
         self.assertIsNone(dispatch.ruta_protegida("README.md"))
         self.assertIsNone(dispatch.ruta_protegida("docs/scripts/gate.sh"),
                           "sólo el gate del repo, no uno homónimo en otro path")
+
+
+class TestWatchdog(unittest.TestCase):
+    """El watchdog de progreso (#41): un agente en bucle no se espera una
+    hora. Cada `watchdog_check_min` minutos (default 5) se mide si hay
+    progreso — commit nuevo en la rama, contexto que sube o costo que
+    sube — y sin progreso durante `watchdog_kill_min` minutos (default 12)
+    se mata al agente y se abandona `modelo`. Un agente corriendo el gate
+    no se toca: esa espera es legítima y puede pasar el umbral."""
+
+    TIMEOUT = '{"error":{"code":"timeout"},"id":"cli:agent:wait"}'
+
+    @staticmethod
+    def _pantalla(ctx):
+        return ("⠏ Working...\n~/repo (ticket/7)\n"
+                "↑12k ↓2k R4k CH0.1% $0.056 {}%/262k ...\n").format(ctx)
+
+    def _wait_con_timeouts_luego_idle(self, m, timeouts):
+        """`agent wait`: `timeout` las primeras N veces, `idle` después."""
+        def wait(args):
+            if len(m.llamo("herdr", "agent", "wait")) <= timeouts:
+                return (True, self.TIMEOUT)
+            return (True, '{"result":{"agent":{"agent_status":"idle"}}}')
+        m.responder(lambda a: a[:3] == ["herdr", "agent", "wait"], wait)
+
+    def _pane_por_espera(self, m, pantallas):
+        """`pane read`: la pantalla i según cuántas esperas ya hubo.
+
+        Las lecturas antes de la primera espera (verificar el prompt, la
+        señal base del watchdog) ven la primera pantalla.
+        """
+        def pane(args):
+            i = min(len(m.llamo("herdr", "agent", "wait")),
+                    len(pantallas) - 1)
+            return (True, pantallas[i])
+        m.responder(lambda a: a[:3] == ["herdr", "pane", "read"], pane)
+
+    def test_defaults_cinco_minutos_de_chequeo_y_doce_de_umbral(self):
+        s = spec()
+        self.assertEqual(s.watchdog_check_min, 5)
+        self.assertEqual(s.watchdog_kill_min, 12)
+
+    def test_avanza_y_no_lo_matan(self):
+        """El agente que avanza (el contexto sube en cada corte) se deja
+        estar hasta que se asienta: sin watchdog, sin abandono."""
+        m = Mundo()
+        self._wait_con_timeouts_luego_idle(m, timeouts=2)
+        self._pane_por_espera(m, [self._pantalla("1.2"), self._pantalla("3.4"),
+                                  self._pantalla("5.6")])
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        self.assertNotIn("abandono", [l["tipo"] for l in lineas])
+        self.assertEqual(m.llamo("herdr", "agent", "send-keys"), [])
+
+    def test_un_commit_nuevo_cuenta_como_progreso(self):
+        m = Mundo(pr_head_oid="b" * 40)  # el PR apunta al commit nuevo
+        self._wait_con_timeouts_luego_idle(m, timeouts=1)
+        # pane quieto, pero el HEAD de la rama cambia entre corte y corte
+        heads = []
+
+        def head(args):
+            heads.append(1)
+            oid = "a" * 40 if len(heads) <= 1 else "b" * 40
+            return (True, oid + "\n")
+
+        m.responder(lambda a: "rev-parse" in a and a[-1] == "HEAD", head)
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        self.assertEqual(m.llamo("herdr", "agent", "send-keys"), [])
+
+    def test_no_avanza_y_lo_matan(self):
+        """Commits quietos, contexto quieto, costo quieto, y el wait no se
+        asienta: pasado el umbral se corta al agente (ctrl+c) y se abandona
+        `modelo`."""
+        m = Mundo()
+        m.wait_out = self.TIMEOUT
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+        self.assertEqual(res[0].clase_abandono, "modelo")
+        self.assertIn("sin progreso", res[0].motivo)
+        (matada,) = m.llamo("herdr", "agent", "send-keys")
+        self.assertEqual(matada[0][-1], "ctrl+c")
+        self.assertIn("abandono", [l["tipo"] for l in lineas])
+
+    def test_un_agente_corriendo_el_gate_no_lo_matan(self):
+        """El gate en un worktree limpio puede pasar de los 12 minutos: es
+        una espera legítima. Con el gate en pantalla, cinco cortes sin
+        progreso (25 min) no alcanzan el umbral."""
+        gate = ("⠏ Working...\n~/repo (ticket/7)\n"
+                "↑12k ↓2k R4k CH0.1% $0.056 1.2%/262k ...\n"
+                "❯ ./scripts/gate.sh\nPASS tests/integration.test.js\n"
+                "Tests: 51 passed\n")
+        m = Mundo(pane_out=gate)
+        self._wait_con_timeouts_luego_idle(m, timeouts=5)
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        self.assertNotIn("abandono", [l["tipo"] for l in lineas])
+        self.assertEqual(m.llamo("herdr", "agent", "send-keys"), [])
+
+    def test_el_log_deja_cuanto_estuvo_sin_progreso(self):
+        """Para calibrar el umbral con datos (#41): cada corte sin progreso
+        anota sus minutos en el log de eventos."""
+        m = Mundo()
+        m.wait_out = self.TIMEOUT
+        _, lineas = despachar(m, [job()])
+        cuerpos = [l["cuerpo"] for l in lineas if l["tipo"] == "watchdog"]
+        self.assertTrue(any("sin progreso 5 min" in c for c in cuerpos), cuerpos)
+        self.assertTrue(any("sin progreso 15 min" in c for c in cuerpos), cuerpos)
+
+    def test_avanzando_siempre_mata_al_agotar_el_presupuesto(self):
+        """El watchdog no sustituye al presupuesto total (`wait_ms`): un
+        agente que avanza y nunca se asienta se abandona igual al agotarlo."""
+        m = Mundo()
+        self._wait_con_timeouts_luego_idle(m, timeouts=999)
+        self._pane_por_espera(m, [self._pantalla("1.2"), self._pantalla("2.2")])
+        res, _ = despachar(m, [job()], wait_ms=300_000)  # una ronda de 5 min
+        self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+        self.assertIn("timeout de espera", res[0].motivo)
+        self.assertEqual(res[0].clase_abandono, "modelo")
 
 
 class TestClasificacionDeAbandonos(unittest.TestCase):
