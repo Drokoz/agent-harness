@@ -60,7 +60,11 @@ El repo pasó de 272 a 486 tests. Mergeado y verificado:
    pide. `extensions/harness-guard/` bloquea merge, force-push, `reset --hard` y escrituras
    fuera del worktree desde la tool, antes de que se ejecuten. El prompt sigue diciéndolo,
    pero ya no es lo único que lo sostiene.
-8. **Fallar en silencio con código 0 es peor que fallar.** Un `/tmp/harness-stop` viejo se
+8. **El síntoma que ve el dispatcher no es la causa.** "El agente terminó sin PR abierto"
+   es lo que se observa; el porqué lo guarda pi en `stopReason`/`errorMessage`. Cinco
+   abandonos del 24 de agosto, clasificados `modelo`, eran un solo corte de red de siete
+   minutos. Antes de sacar conclusiones sobre un modelo, mirar `costo_pi.salida_de`.
+9. **Fallar en silencio con código 0 es peor que fallar.** Un `/tmp/harness-stop` viejo se
    comió la noche del 25 y el log parecía una corrida normal. Ver #91.
 
 ---
