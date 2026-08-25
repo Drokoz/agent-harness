@@ -15,7 +15,7 @@
     harness quota                   la cuota de Claude, medida leyendo las
                                     sesiones locales (~/.claude/projects)
     harness quota --projects PATH   otra carpeta de sesiones (p.ej. una fixture)
-    harness quota --json            el agregado crudo, parseable
+    harness quota --json            el agregado (crudo + ponderado), parseable
                                     Limitaciones (también en docs/harness/quota.md):
                                     es aproximado, y sólo ve las sesiones de este
                                     usuario de esta máquina —ni otros dispositivos
@@ -227,12 +227,16 @@ def quota_main(args, contexts):
     projects = (Path(args.projects).expanduser() if args.projects
                 else Path.home() / ".claude" / "projects")
     agg = agregar(leer_sesiones(projects), raices)
+    # La constante de calibración vive en config (#74), no en el código;
+    # con `--all` gana la primera que haya.
+    tope = next((c.quota.tope_semanal for c in contexts
+                 if c.quota.tope_semanal), None)
     if args.como_json:
         json.dump(quota_as_dict(agg), sys.stdout, indent=2, ensure_ascii=False,
                   sort_keys=True)
         sys.stdout.write("\n")
     else:
-        sys.stdout.write(render_quota(agg))
+        sys.stdout.write(render_quota(agg, tope_semanal=tope))
     if not OFFLINE:
         log = EventLog(_estado_dir() / "harness" / "events.jsonl", "harness")
         log.write("quota", "quota", resumen_evento(agg))

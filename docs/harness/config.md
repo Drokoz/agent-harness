@@ -20,7 +20,8 @@ seguía el viejo `repos.conf`.
       "autonomy": "frontier",
       "budget":   {"polarity": "remaining", "provider": "openrouter"},
       "vault":    "~/notas",
-      "run":      {"kind": "local"}
+      "run":      {"kind": "local"},
+      "quota":    {"tope_semanal": 900000000}
     },
     "trabajo": {
       "tracker":  {"kind": "jira", "url": "https://wl.atlassian.net",
@@ -47,8 +48,9 @@ seguía el viejo `repos.conf`.
 | `budget.provider` | `openrouter` (lee la key de `~/.pi/agent/models.json`), `manual` (`total`/`used` acá) o `none` |
 | `vault` | dónde vive la vault del contexto. El harness la lee, no la administra |
 | `run.kind` | `local` o `ssh` (con `host`): cómo se ejecuta el trabajo de este contexto |
+| `quota.tope_semanal` | opcional: el tope semanal estimado de `harness quota`, en tokens ponderados. Es la constante de calibración (#74): sale de medir `/usage` (interactivo, lo mide un humano) y vive acá, no en el código. Con ella la tabla muestra el % del tope semanal en cada corte; sin ella, los tokens y la nota de que falta calibrar |
 
-`vault` es opcional; todo lo demás es obligatorio. Un campo de más o un valor que no
+`vault` y `quota` son opcionales; todo lo demás es obligatorio. Un campo de más o un valor que no
 existe son error: el harness sale con código 2 y una línea que dice qué contexto y
 qué campo hay que arreglar.
 

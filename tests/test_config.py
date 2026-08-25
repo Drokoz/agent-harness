@@ -67,6 +67,36 @@ class TestValido(unittest.TestCase):
     def test_vault_es_opcional(self):
         self.assertIsNone(parse_config(conf(personal=ctx())).contexts[0].vault)
 
+
+class TestQuota(unittest.TestCase):
+    """`quota` es opcional (#74): la constante de calibración de `harness
+    quota`, medida contra `/usage`, vive en config y no en el código."""
+
+    def test_sin_quota_no_hay_tope(self):
+        c = parse_config(conf(personal=ctx())).contexts[0]
+        self.assertIsNone(c.quota.tope_semanal)
+
+    def test_quota_vacia_es_valida(self):
+        c = parse_config(conf(personal=ctx(quota={}))).contexts[0]
+        self.assertIsNone(c.quota.tope_semanal)
+
+    def test_tope_semanal(self):
+        c = parse_config(
+            conf(personal=ctx(quota={"tope_semanal": 900000000}))).contexts[0]
+        self.assertEqual(c.quota.tope_semanal, 900000000.0)
+
+    def test_clave_desconocida_dentro_de_quota(self):
+        with self.assertRaises(ConfigError):
+            parse_config(conf(personal=ctx(quota={"tope": 10})))
+
+    def test_tope_no_numerico(self):
+        with self.assertRaises(ConfigError):
+            parse_config(conf(personal=ctx(quota={"tope_semanal": "900M"})))
+
+    def test_tope_no_positivo(self):
+        with self.assertRaises(ConfigError):
+            parse_config(conf(personal=ctx(quota={"tope_semanal": 0})))
+
     def test_default_config_es_valida(self):
         c = default_config()
         self.assertIsInstance(c, Config)

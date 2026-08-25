@@ -10,7 +10,7 @@ thinking va dentro del output y no suma dos veces).
 ## Uso
 
     harness quota                  la tabla corta
-    harness quota --json           el agregado crudo
+    harness quota --json           el agregado (crudo + ponderado)
     harness quota --projects PATH  otra carpeta de sesiones (tests, otra máquina)
 
 Qué dice la tabla:
@@ -25,22 +25,55 @@ Qué dice la tabla:
   mensaje— como si pesara lo mismo que un `input`. Abajo del ponderado, la
   tabla muestra el desglose crudo de los cuatro componentes; `--json` los
   trae siempre completos, sin perder el dato: la ponderación es una vista.
-- **por modelo**: el total histórico de cada modelo (crudo, sin ponderar).
-  Cada modelo se mide por separado, así que un ticket corrido con `--model
-  fable` queda medido con su propio total y su propia ventana de 5h: se ve
-  si Fable consume su bucket (la semana de Fable que muestra `/usage`) y
-  cuánto queda del general.
+- **por modelo**: el total histórico de cada modelo, **ponderado** (la misma
+  unidad que el total —ticket #74: antes el desglose sumaba crudos contra un
+  total ponderado). Cada modelo se mide por separado, así que un ticket
+  corrido con `--model fable` queda medido con su propio total y su propia
+  ventana de 5h: se ve si Fable consume su bucket (la semana de Fable que
+  muestra `/usage`) y cuánto queda del general.
 - **pico en 5h**: el máximo de tokens dentro de *cualquier* ventana de 5
-  horas, por modelo. Es la ventana rodante de la cuota de 5h: es lo comparable
-  contra el "% used · resets ..." de `/usage`.
-- **por semana**: el total por semana, con el reset de **viernes 17:00
-  America/Santiago** (la "Current week" de `/usage`).
-- **por proyecto / ticket**: la carpeta de la sesión codifica el path del
-  worktree (`...--worktrees-<repo>-ticket-<n>`), así que el consumo se
-  atribuye por proyecto y, cuando el nombre lo permite, por ticket.
+  horas, por modelo, en crudo (está marcado como tal en la tabla). Es la
+  ventana rodante de la cuota de 5h: es lo comparable contra el "% used ·
+  resets ..." de `/usage`.
+- **por semana**: el total ponderado por semana, con el reset de **viernes
+  17:00 America/Santiago** (la "Current week" de `/usage`). El corte por
+  semana es el que contesta "cuánto vamos esta semana", y por eso importa
+  que esté ponderado: crudo, quedaba dominado por `cache_read`.
+- **por día**: el total ponderado por fecha calendario en America/Santiago
+  (la hora local del contexto), con los últimos 10 días en la tabla. Es la
+  pregunta que se hace en la práctica: "¿cuánto gastamos hoy?" El `--json`
+  trae todos los días, no sólo los 10.
+- **por proyecto / ticket**: el total ponderado por proyecto; la carpeta de
+  la sesión codifica el path del worktree
+  (`...--worktrees-<repo>-ticket-<n>`), así que el consumo se atribuye por
+  proyecto y, cuando el nombre lo permite, por ticket.
 - **harness vs resto**: los worktrees bajo `<repos.root>/.worktrees/` son del
   harness; todo lo demás es el resto. Es la línea que responde "cuánto se
   comió el harness y cuánto el 9-5".
+
+## El porcentaje del tope: la constante de calibración
+
+Con la constante configurada, cada corte muestra además el **porcentaje
+estimado del tope semanal** —la unidad en la que se piensa. Sin ella, la
+tabla no inventa un porcentaje: muestra los tokens y dice que falta
+calibrar.
+
+La constante vive en config, no en el código (`docs/harness/config.md`):
+
+```json
+"personal": {
+  "tracker": {"kind": "github"},
+  ...
+  "quota": {"tope_semanal": 900000000}
+}
+```
+
+`tope_semanal` es el tope semanal estimado en tokens ponderados, y sale de
+leer `/usage` (interactivo: lo mide un humano, no el agente). Medición del
+2026-08-24: la semana desde el viernes 21 a las 17:00 marcaba 25% con
+224.880.155 tokens ponderados —o sea ~9.0M ponderados por punto y un tope
+semanal de ~900M con el promo de +50% vigente hasta el 31-ago; sin promo,
+~600M. Re-medir después del 4-sep y actualizar la config.
 
 Cada corrida escribe una línea `tipo: quota` en el log de eventos
 (`~/.local/state/harness/events.jsonl`), para que el histórico quede junto a
@@ -97,15 +130,18 @@ para Tomás o para la próxima corrida de agentes.
 
 ## Forma del `--json`
 
-`harness quota --json` devuelve el agregado crudo: `total` (con sus cuatro
+`harness quota --json` devuelve el agregado: `total` (con sus cuatro
 componentes intactos), `ponderado` (el mismo total pesado por `PESOS`),
-`por_modelo` (con `mensajes`), `pico_5h` (total + inicio y fin de la
-ventana), `por_semana` (clave = inicio de semana en ISO con offset SCL, por
-modelo, crudo), `por_semana_cuota` (la misma semana pero ponderada y
-partida `harness`/`resto`), `por_dia` (ponderado, partido `harness`/`resto`,
-clave = fecha calendario en America/Santiago — la "noche" del harness),
-`por_proyecto` (claves `[harness]` para los worktrees, con `tickets` crudo
-y `tickets_ponderado`), `harness`, `resto`, `archivos`, `mensajes`.
+`por_modelo` (con `mensajes` y `ponderado` por modelo), `pico_5h` (total +
+inicio y fin de la ventana), `por_semana` (crudo, clave = inicio de semana en
+ISO con offset SCL, por modelo), `por_semana_cuota` (la misma semana pero
+ponderada y partida `harness`/`resto`), `por_semana_ponderado` (la misma
+semana ponderada por modelo, la que dibuja la tabla —ticket #74), `por_dia`
+(ponderado, partido `harness`/`resto`, clave = fecha calendario en
+America/Santiago — la "noche" del harness), `por_proyecto` (claves
+`[harness]` para los worktrees, con `ponderado`, `tickets` crudo y
+`tickets_ponderado`), `harness`, `resto`, `archivos`, `mensajes`. El crudo no
+se pierde: la ponderación es una vista, no una pérdida de dato.
 
 ## La cuota en `status` y `report` (#47)
 
