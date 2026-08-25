@@ -1083,7 +1083,9 @@ class TestClasificacionDeAbandonos(unittest.TestCase):
         res, lineas = despachar(m, [job()], infra_retries=2, infra_retry_wait_s=0)
         self.assertEqual(res[0].estado, "abandonado")
         self.assertEqual(self._clase(lineas), "infra")
-        self.assertEqual(len(llamadas), 3)
+        # 1 + 2 reintentos, más uno del rescate del abandono (#66):
+        # antes de borrar el worktree hay que saber si queda algo sin commitear.
+        self.assertEqual(len(llamadas), 4)
 
     def test_sin_pr_es_modelo(self):
         m = Mundo(prs=[{"number": 31, "headRefName": "otra-rama"}])
@@ -1249,3 +1251,160 @@ class TestParkear(unittest.TestCase):
             d.parkear(job(slug=""), "ticket/7", ["algo"])
         self.assertEqual(m.llamo("gh", "issue", "edit"), [])
         self.assertEqual(m.llamo("gh", "issue", "comment"), [])
+
+
+class TestElAbandonoDejaPistas(unittest.TestCase):
+    """El abandono no borra ni el trabajo ni el porqué (#66).
+
+    2026-08-24: el guard de árbol sucio (#36) rechazó bien un worktree con
+    cambios sin commitear —y la limpieza los borró. US$0.43 y 19 minutos, y
+    sin transcripción para saber por qué el agente se detuvo. El rescate va
+    en el orden que las hace posibles: la transcripción con el pane todavía
+    abierto, el commit WIP con el worktree todavía en pie. Un job que
+    termina bien no deja ni lo uno ni lo otro.
+    """
+
+    def _job_en(self, tmp, **kw):
+        (Path(tmp) / "koku").mkdir(parents=True, exist_ok=True)
+        return job(path=str(Path(tmp) / "koku"), **kw)
+
+    def _despachar(self, m, j, **kw):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = log_en(tmp)
+            d = Dispatcher(spec(**kw), log, m.cmd, credits=m.credits,
+                           dormir=m.dormir)
+            res = d.dispatch([j])
+            lineas = [json.loads(l) for l in log.path.read_text().splitlines()]
+        return res, lineas
+
+    def test_el_abandono_guarda_la_transcripcion_por_ticket_e_intento(self):
+        tmp = tempfile.mkdtemp()
+        m = Mundo(gate=(False, "ROJO: unittest"))
+        salida = "linea 1\nlinea 2\n"
+        m.responder(lambda a: a[:3] == ["herdr", "agent", "read"], (True, salida))
+        j = self._job_en(tmp)
+        res, lineas = self._despachar(m, j)
+        self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+        destino = dispatch.transcripcion_path(j.repo_path, j.issue, j.attempt)
+        self.assertEqual(destino.parent, Path(tmp) / ".worktrees" / "logs")
+        self.assertEqual(destino.name, "koku-ticket-7-intento-1.log",
+                         "por ticket e intento, no por corrida")
+        self.assertEqual(destino.read_text(), salida)
+        # El log de eventos apunta al archivo: se va del abandono a la transcripción.
+        (tc,) = [l for l in lineas if l["tipo"] == "transcripcion"]
+        self.assertIn(str(destino), tc["cuerpo"])
+        self.assertEqual(tc["ref"], "ticket/7")
+        # Antes de cerrar el pane, no después.
+        (read,) = m.llamo("herdr", "agent", "read")
+        (close,) = m.llamo("herdr", "pane", "close")
+        self.assertLess(m.llamadas.index(read), m.llamadas.index(close))
+
+    def test_los_intentos_y_tickets_no_se_pisan(self):
+        base = "/repos/koku"
+        p = dispatch.transcripcion_path
+        self.assertNotEqual(p(base, 7, 1), p(base, 7, 2), "intento distinto")
+        self.assertNotEqual(p(base, 7, 1), p(base, 8, 1), "ticket distinto")
+
+    def test_si_no_se_puede_leer_al_agente_se_le_al_pane(self):
+        tmp = tempfile.mkdtemp()
+        m = Mundo(gate=(False, "ROJO: unittest"))
+        m.responder(lambda a: a[:3] == ["herdr", "agent", "prompt"],
+                    (True, '{"result":{"agent":{"agent_status":"working"}}}'))
+        m.responder(lambda a: a[:3] == ["herdr", "agent", "read"], (False, "fallo"))
+        m.responder(lambda a: a[:3] == ["herdr", "pane", "read"], (True, "del pane\n"))
+        j = self._job_en(tmp)
+        res, _ = self._despachar(m, j)
+        self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+        destino = dispatch.transcripcion_path(j.repo_path, j.issue, j.attempt)
+        self.assertEqual(destino.read_text(), "del pane\n")
+
+    def test_sin_pane_ni_agente_no_hay_transcripcion(self):
+        tmp = tempfile.mkdtemp()
+        m = Mundo().responder(
+            lambda a: a[0] == "git" and "worktree" in a and "add" in a,
+            (False, "fatal: no pathspec"))
+        j = self._job_en(tmp)
+        res, lineas = self._despachar(m, j)
+        self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+        self.assertEqual(m.llamo("herdr", "agent", "read"), [])
+        self.assertFalse((Path(tmp) / ".worktrees").exists())
+        self.assertNotIn("transcripcion", [l["tipo"] for l in lineas])
+
+    def test_el_podado_deja_los_mas_recientes_por_ticket(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            for n in range(1, 8):
+                (d / "koku-ticket-7-intento-{}.log".format(n)).write_text(str(n))
+            (d / "koku-ticket-8-intento-1.log").write_text("vecino")
+            (d / "koku-ticket-7-intento-2.txt").write_text("no es transcripcion")
+            borrados = dispatch.podar_transcripciones(d, "koku", 7)
+            self.assertEqual(borrados, ["koku-ticket-7-intento-1.log",
+                                        "koku-ticket-7-intento-2.log"],
+                             "de los más viejos, por intento, sin tocar vecinos")
+            restantes = sorted(f.name for f in d.iterdir())
+            self.assertEqual(restantes, [
+                "koku-ticket-7-intento-2.txt",
+                "koku-ticket-7-intento-3.log", "koku-ticket-7-intento-4.log",
+                "koku-ticket-7-intento-5.log", "koku-ticket-7-intento-6.log",
+                "koku-ticket-7-intento-7.log", "koku-ticket-8-intento-1.log"])
+
+    def test_el_rescate_poda_los_mas_viejos(self):
+        tmp = tempfile.mkdtemp()
+        logs = Path(tmp) / ".worktrees" / "logs"
+        logs.mkdir(parents=True)
+        for n in range(1, 7):
+            (logs / "koku-ticket-7-intento-{}.log".format(n)).write_text("viejo")
+        m = Mundo(gate=(False, "ROJO: unittest"))
+        m.responder(lambda a: a[:3] == ["herdr", "agent", "read"], (True, "nuevo\n"))
+        j = self._job_en(tmp, attempt=7)
+        res, _ = self._despachar(m, j)
+        self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+        restantes = sorted(f.name for f in logs.iterdir())
+        self.assertEqual(restantes,
+                         ["koku-ticket-7-intento-{}.log".format(n)
+                          for n in range(3, 8)],
+                         "las dos más viejas no sobreviven al rescate")
+
+    def test_el_abandono_con_arbol_sucio_deja_un_commit_wip_en_la_rama(self):
+        tmp = tempfile.mkdtemp()
+        m = Mundo()
+        m.responder(lambda a: a[0] == "git" and "status" in a,
+                    (True, " M harness/dispatch.py\n?? evidencia.txt\n"))
+        j = self._job_en(tmp)
+        res, lineas = self._despachar(m, j)
+        self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+        self.assertIn("sucio", res[0].motivo)
+        (add,) = m.llamo("git", "add", "-A")
+        self.assertIn(j.worktree, add[0])
+        (commit,) = m.llamo("git", "commit")
+        self.assertIn(j.worktree, commit[0], "sobre la rama del worktree")
+        msg = commit[0][commit[0].index("-m") + 1]
+        self.assertIn("WIP", msg)
+        self.assertIn("abandono", msg)
+        self.assertIn("intento 1", msg)
+        # El WIP viaja ANTES de que el worktree se borre.
+        (remove,) = m.llamo("git", "worktree", "remove")
+        self.assertLess(m.llamadas.index(commit), m.llamadas.index(remove))
+        (wip,) = [l for l in lineas if l["tipo"] == "wip"]
+        self.assertIn("WIP", wip["cuerpo"])
+
+    def test_el_abandono_con_arbol_limpio_no_deja_wip(self):
+        tmp = tempfile.mkdtemp()
+        m = Mundo(gate=(False, "ROJO: unittest"))
+        j = self._job_en(tmp)
+        res, _ = self._despachar(m, j)
+        self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+        self.assertEqual(m.llamo("git", "add", "-A"), [])
+        self.assertEqual(m.llamo("git", "commit"), [])
+
+    def test_el_job_que_termina_bien_no_deja_wip_ni_transcripcion(self):
+        tmp = tempfile.mkdtemp()
+        m = Mundo()
+        j = self._job_en(tmp)
+        res, lineas = self._despachar(m, j)
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        self.assertEqual(m.llamo("git", "commit"), [])
+        self.assertEqual(m.llamo("herdr", "agent", "read"), [])
+        self.assertNotIn("transcripcion", [l["tipo"] for l in lineas])
+        self.assertNotIn("wip", [l["tipo"] for l in lineas])
+        self.assertFalse((Path(tmp) / ".worktrees").exists())
