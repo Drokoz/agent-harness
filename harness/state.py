@@ -19,8 +19,12 @@ Esquema de línea: cada evento lleva `run_id` (una corrida del
 dispatcher), `ticket` ("repo#issue"; None en las líneas que no son de un
 ticket, p.ej. `corrida`) y `attempt` (el intento global del ticket: el
 primer intento vale 1). Las líneas viejas, escritas antes de estas
-claves, se leen igual: se reconocen por `ref` ("ticket/N"), no tienen
-forma de distinguir el repo, y todas cuentan como un solo intento.
+claves, se leen sin romper, pero sin `ticket` no se pueden atribuir a
+un repo: el `ref` ("ticket/N") es idéntico en todos los repos, y dos
+repos que compartan el número de issue se contaminarían el conteo de
+intentos y la escalera (#72). Así que no cuentan para ningún repo: se
+pierde la historia anterior a #35, que es el trueque correcto — un
+intento mal atribuido hace escalar de más y gastar cuota.
 """
 
 from __future__ import annotations
@@ -32,8 +36,8 @@ from typing import Dict, Optional
 
 from harness.summary import COSTO_JOB_RE, parse_fecha
 
-# Corrida sintética para las líneas viejas (sin `run_id`): todas entran
-# en la misma, así que un ticket viejo cuenta como un intento.
+# Corrida sintética para las líneas que no traen `run_id` (en el
+# esquema nuevo esto no debería pasar): se agrupan juntas.
 _SIN_RUN = "__sin_run_id__"
 
 # El cuerpo de la línea "agente" lleva el kind del agente —el runner del
@@ -47,30 +51,25 @@ def _ticket_clave(repo, issue):
 
 
 def _clave_de(e):
-    """(run_id, ticket) del evento para agrupar, o None si no es de ticket.
-
-    Las líneas nuevas traen el ticket en `ticket`; las viejas, en `ref`
-    ("ticket/N"), que además no permite saber el repo.
+    """(run_id, ticket) del evento para agrupar, o None si no se puede
+    atribuir: líneas que no son de ticket (p.ej. `corrida`) y líneas
+    viejas (sin campo `ticket`, cuyo `ref` no distingue el repo, #72).
     """
     t = e.get("ticket")
     if t is None:
-        ref = str(e.get("ref", ""))
-        if not ref.startswith("ticket/"):
-            return None
-        t = ref
+        return None
     return (e.get("run_id") or _SIN_RUN, t)
 
 
 def _es_de(e, repo, issue):
     """¿Este evento es del ticket (repo, issue)?
 
-    Con las líneas viejas, que no traen repo, dos repos que compartan el
-    número de issue se mezclan: es la limitación del esquema anterior, no
-    del reductor.
+    La única clave confiable es `ticket` ("repo#issue"). Las líneas
+    viejas no la traen y el `ref` ("ticket/N") es idéntico en todos los
+    repos, así que no se pueden atribuir a ningún repo y no cuentan
+    para ninguno (#72).
     """
-    if "ticket" in e:
-        return e.get("ticket") == _ticket_clave(repo, issue)
-    return e.get("ref") == "ticket/{}".format(issue)
+    return e.get("ticket") == _ticket_clave(repo, issue)
 
 
 def _runners(eventos):
@@ -90,8 +89,8 @@ def _runners(eventos):
 def intentos(eventos, repo, issue):
     """Cuántas corridas intentaron este ticket: un `run_id` es una corrida.
 
-    Las líneas viejas (sin `run_id`) entran todas en la misma corrida, y
-    cuentan como intento 1. El dispatcher usa esto para numerar el
+    Las líneas viejas (sin `ticket`) no cuentan para ningún repo: no se
+    pueden atribuir (#72). El dispatcher usa esto para numerar el
     siguiente intento antes de despachar."""
     runs = set()
     for e in eventos:
@@ -220,7 +219,7 @@ def intentos_que_escalan(eventos, repo, issue):
     cuentan. Una corrida sin línea `abandono` (todavía en curso, o
     cerrada con `pr`) tampoco cuenta: nada que escalar.
 
-    La clase de una línea vieja (sin `clase`, escrita antes de #37) se
+    La clase de una línea sin `clase` (escrita entre #35 y #37) se
     lee como `modelo`: el default conservador es el que gasta, no el
     que reintenta gratis.
     """
@@ -268,8 +267,8 @@ def tasas(eventos):
 
     El runner del evento es el de su corrida y ticket (el kind de la línea
     `agente`); sin forma de saberlo, va en "desconocido". El repo sale de
-    `ticket` ("repo#issue"): las líneas viejas no lo traen, así que entran
-    en `por_runner` y no en `por_repo`.
+    `ticket` ("repo#issue"); las líneas sin `ticket` no se pueden atribuir
+    a ningún repo, así que no cuentan en ningún lado (#72).
     """
     runners = _runners(eventos)
     por_runner: Dict[str, Dict[str, int]] = {}
@@ -279,9 +278,10 @@ def tasas(eventos):
             continue
         clave = "exito" if e["tipo"] == "pr" else "abandono"
         k = _clave_de(e)
+        if k is None:
+            continue
         _agregar(por_runner, runners.get(k, "desconocido"), clave)
-        if k is not None and not k[1].startswith("ticket/"):
-            _agregar(por_repo, k[1].rsplit("#", 1)[0], clave)
+        _agregar(por_repo, k[1].rsplit("#", 1)[0], clave)
     return {"por_runner": por_runner, "por_repo": por_repo}
 
 
