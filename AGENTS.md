@@ -5,6 +5,10 @@ tickets y una flota de agentes los consume, con un gate mecánico decidiendo qu�
 
 `PLAN.md` es el documento canónico. Leerlo antes de tocar nada.
 
+`docs/SESSION_HANDOFF.md` es el relevo: el estado al día, el presupuesto, la cola
+por umbral y las reglas que salieron de operar el harness. Es lo primero que lee
+una sesión nueva.
+
 Este repo se lee desde varios runners (Claude Code, pi, codex), por eso el contexto vive
 en `AGENTS.md` y no en `CLAUDE.md`: las skills en `.claude/skills/` y `.pi/skills/` son
 el mismo markdown, y cambiar de agente no debe cambiar el proceso.
