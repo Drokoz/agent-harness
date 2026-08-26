@@ -64,9 +64,21 @@ test("las tools que no escriben ni ejecutan ni se miran", () => {
 });
 
 test("fuera de un worktree del harness no opina", () => {
-  const { pi, llamar } = piFalso();
-  montar(pi);   // cwd = el repo, no un worktree
-  assert.strictEqual(llamar({ toolName: "bash", input: { command: "sudo rm -rf /" } }), undefined);
+  // El gate puede correr desde el repo principal o desde el worktree del
+  // dispatcher: la forma del path del worktree ES el patrón que el guard
+  // mira, así que no se puede asumir de dónde viene el cwd. El test lo
+  // fija a un directorio que no lo matchea.
+  const antes = process.cwd();
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "guard-afuera-"));
+  process.chdir(tmp);
+  try {
+    const { pi, llamar } = piFalso();
+    montar(pi);
+    assert.strictEqual(llamar({ toolName: "bash", input: { command: "sudo rm -rf /" } }), undefined);
+  } finally {
+    process.chdir(antes);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test("cada bloqueo deja una linea en el log de eventos", () => {
