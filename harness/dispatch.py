@@ -281,6 +281,31 @@ def peldano_de(escalados):
     return ESCALERA[escalados]
 
 
+def peldano_numero(kind, model, extra_args):
+    """El número (1-based) del peldaño de `ESCALERA` que corresponde a
+    kind/modelo/args, o 0 si no coincide con ninguno: el fallback de la
+    corrida (--kind/--model) no es un peldaño, no se le finge número."""
+    args = tuple(extra_args or ())
+    for i, p in enumerate(ESCALERA):
+        if (p["kind"] == kind and p["model"] == model
+                and tuple(p.get("extra_args", ())) == args):
+            return i + 1
+    return 0
+
+
+def peldano_etiqueta(kind, model, extra_args):
+    """El peldaño con que arrancó un ticket (#81): la decisión menos obvia
+    del despacho, y tiene que verse sin ir a buscar el JSONL. El número, si
+    coincide con `ESCALERA`, seguido de runner, modelo y los args del
+    peldaño: `peldaño 1 · pi qwen/qwen3.8-27b --thinking medium`."""
+    partes = [kind] + (list(extra_args) if extra_args else [])
+    if model:
+        partes.insert(1, model)
+    etiqueta = " ".join(partes)
+    n = peldano_numero(kind, model, extra_args)
+    return "peldaño {} · {}".format(n, etiqueta) if n else etiqueta
+
+
 def _ahora():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -313,14 +338,22 @@ class EventLog:
 
     `origen` existe y hoy siempre vale `harness`: es la marca de quién
     escribió la línea, para que un observador futuro no invalide lo escrito.
+
+    `listener` (ticket #81): un callback que recibe cada dict de línea
+    apenas se escribe, para la salida en vivo de `run` en stdout. El
+    archivo manda: si el listener falla, el evento queda en el JSONL igual.
     """
 
-    def __init__(self, path, contexto, reloj=None, run_id=None):
+    def __init__(self, path, contexto, reloj=None, run_id=None, listener=None):
         self.path = Path(path).expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.contexto = contexto
         self.reloj = reloj or _ahora
         self.run_id = run_id or uuid.uuid4().hex[:12]
+        # Callback que recibe cada dict de línea apenas se escribe (#81):
+        # la salida en vivo de `run` en stdout. El archivo manda: si el
+        # listener falla, el evento queda en el JSONL igual.
+        self.listener = listener
 
     def write(self, tipo, ref, cuerpo, ticket=None, attempt=None, clase=None):
         linea = {
@@ -337,6 +370,11 @@ class EventLog:
         }
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(linea, ensure_ascii=False) + "\n")
+        if self.listener is not None:
+            try:
+                self.listener(linea)
+            except Exception:
+                pass
         return linea
 
 
@@ -476,6 +514,13 @@ class Dispatcher:
             self._log(job, "peldano", ref,
                       "claude no permitido ahora (router): " + motivo)
             return job
+        # El peldaño con que arrancó (#81): antes de cualquier otra acción
+        # del ticket, para que la salida en vivo muestre la decisión menos
+        # obvia del despacho.
+        self._log(job, "peldano", ref,
+                  peldano_etiqueta(job.kind or self.spec.kind,
+                                    job.model or self.spec.model,
+                                    job.extra_args))
         try:
             if not self._worktree_ok(job, ref):
                 pass  # ya se abandono con su motivo

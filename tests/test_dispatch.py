@@ -267,6 +267,37 @@ class TestPeldanoDe(unittest.TestCase):
         self.assertEqual((p["kind"], p["model"]), ("claude", "sonnet"))
 
 
+class TestEtiquetaPeldano(unittest.TestCase):
+    """El peldaño con que arrancó un ticket (#81): la decisión menos obvia
+    del despacho, y tiene que verse en la salida en vivo."""
+
+    def test_cada_peldano_de_escalera_lleva_su_numero(self):
+        from harness.dispatch import peldano_etiqueta, peldano_numero
+        for i, p in enumerate(ESCALERA):
+            self.assertEqual(peldano_numero(p["kind"], p["model"],
+                                            p["extra_args"]), i + 1)
+            etiqueta = peldano_etiqueta(p["kind"], p["model"], p["extra_args"])
+            self.assertTrue(etiqueta.startswith("peldaño {} · ".format(i + 1)),
+                            etiqueta)
+            self.assertIn(p["kind"], etiqueta)
+            self.assertIn(p["model"], etiqueta)
+            self.assertIn(" ".join(p["extra_args"]), etiqueta)
+
+    def test_los_peldanos_1_y_2_se_distinigen_por_el_thinking(self):
+        from harness.dispatch import peldano_etiqueta
+        p1, p2 = ESCALERA[0], ESCALERA[1]
+        self.assertNotEqual(
+            peldano_etiqueta(p1["kind"], p1["model"], p1["extra_args"]),
+            peldano_etiqueta(p2["kind"], p2["model"], p2["extra_args"]))
+
+    def test_spec_fuera_de_la_escalera_no_finge_numero(self):
+        """El fallback --kind/--model no es un peldaño: se muestra sin número."""
+        from harness.dispatch import peldano_etiqueta, peldano_numero
+        self.assertEqual(peldano_numero("pi", "xai/grok", ()), 0)
+        self.assertEqual(peldano_etiqueta("pi", "xai/grok", ()), "pi xai/grok")
+        self.assertEqual(peldano_etiqueta("pi", "", ()), "pi")
+
+
 class TestEventLog(unittest.TestCase):
     def test_lineas_completas_y_append_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -315,6 +346,31 @@ class TestEventLog(unittest.TestCase):
             linea = json.loads(p.read_text().splitlines()[0])
             self.assertEqual(linea["clase"], "infra")
 
+    def test_listener_recibe_cada_linea_escrita(self):
+        """El listener (#81) ve cada evento en el momento en que se escribe,
+        con el mismo dict que va al JSONL."""
+        vistos = []
+        with tempfile.TemporaryDirectory() as tmp:
+            log = EventLog(Path(tmp) / "e.jsonl", "personal",
+                           reloj=lambda: "2026-08-22T12:00:00Z",
+                           listener=vistos.append)
+            log.write("corrida", "corrida", "inicio: 1 ticket(s)")
+            log.write("gate", "ticket/7", "verde", ticket="koku#7")
+            archivo = [json.loads(l) for l in log.path.read_text().splitlines()]
+        self.assertEqual(vistos, archivo)
+
+    def test_listener_que_falla_no_tumba_la_escritura(self):
+        """El archivo es la fuente: un listener que explota (stdout roto)
+        no impide que el evento quede en el JSONL ni lanza afuera."""
+        def rompe(_linea):
+            raise OSError("broken pipe")
+        with tempfile.TemporaryDirectory() as tmp:
+            log = EventLog(Path(tmp) / "e.jsonl", "personal",
+                           reloj=lambda: "2026-08-22T12:00:00Z",
+                           listener=rompe)
+            log.write("gate", "ticket/7", "verde", ticket="koku#7")
+            self.assertEqual(len(log.path.read_text().splitlines()), 1)
+
 
 class TestCicloDeVida(unittest.TestCase):
     def test_happy_path_llega_a_hecho(self):
@@ -354,6 +410,39 @@ class TestCicloDeVida(unittest.TestCase):
             else:
                 self.assertIsNone(l["ticket"])
                 self.assertIsNone(l["attempt"])
+
+    def test_el_peldano_con_que_arranco_queda_en_el_log(self):
+        """El peldaño es la decisión menos obvia del despacho (#81): se
+        anota antes de cualquier otra acción del ticket, y dice runner,
+        modelo y args del peldaño."""
+        m = Mundo()
+        res, lineas = despachar(m, [job_de_peldano(0)])
+        peldanos = [l for l in lineas if l["tipo"] == "peldano"]
+        self.assertEqual(len(peldanos), 1)
+        self.assertEqual(peldanos[0]["cuerpo"],
+                         "peldaño 1 · pi qwen/qwen3.8-27b --thinking medium")
+        self.assertEqual(peldanos[0]["ticket"], "koku#7")
+        self.assertLess(lineas.index(peldanos[0]),
+                        lineas.index([l for l in lineas
+                                      if l["tipo"] == "worktree"][0]))
+
+    def test_fallback_sin_peldano_no_finge_numero(self):
+        """kind/modelo vacíos = el fallback de la corrida, no un peldaño de
+        la escalera: la etiqueta se escribe sin número."""
+        m = Mundo()
+        res, lineas = despachar(m, [job()])
+        self.assertEqual([l["cuerpo"] for l in lineas if l["tipo"] == "peldano"],
+                         ["pi"])
+
+    def test_aplazo_del_router_no_anota_peldano_despachado(self):
+        """Un job que el router aplazó no se despachó: en el log queda el
+        aplazo, no un peldaño que no se corrió."""
+        m = Mundo()
+        res, lineas = despachar(m, [job_de_peldano(2)],
+                                permitir_claude=lambda: (False, "cuota"))
+        self.assertEqual(res[0].estado, "pendiente")
+        self.assertEqual([l["cuerpo"] for l in lineas if l["tipo"] == "peldano"],
+                         ["claude no permitido ahora (router): cuota"])
 
     def test_nunca_merge(self):
         m = Mundo()
