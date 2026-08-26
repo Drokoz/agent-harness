@@ -21,7 +21,9 @@ seguía el viejo `repos.conf`.
       "budget":   {"polarity": "remaining", "provider": "openrouter"},
       "vault":    "~/notas",
       "run":      {"kind": "local"},
-      "quota":    {"tope_semanal": 900000000}
+      "quota":    {"tope_semanal": 900000000,
+                   "projects": ["~/.claude/projects",
+                                "/Users/tomasherceg/.claude/projects"]}
     },
     "trabajo": {
       "tracker":  {"kind": "jira", "url": "https://wl.atlassian.net",
@@ -49,6 +51,7 @@ seguía el viejo `repos.conf`.
 | `vault` | dónde vive la vault del contexto. El harness la lee, no la administra |
 | `run.kind` | `local` o `ssh` (con `host`): cómo se ejecuta el trabajo de este contexto |
 | `quota.tope_semanal` | opcional: el tope semanal estimado de `harness quota`, en tokens ponderados. Es la constante de calibración (#74): sale de medir `/usage` (interactivo, lo mide un humano) y vive acá, no en el código. Con ella la tabla muestra el % del tope semanal en cada corte; sin ella, los tokens y la nota de que falta calibrar |
+| `quota.projects` | opcional: la lista de directorios de sesiones que lee `harness quota` (#75). Sin declarar, mira un solo usuario del sistema (`~/.claude/projects`); con la lista suma los declarados (p.ej. otro usuario de la máquina que comparte la cuenta). `--projects` por coma gana sobre la config. Una fuente ilegible se salta, se dice cuál y por qué, y el total se marca como piso (`≥` / `"completa": false`) |
 
 `vault` y `quota` son opcionales; todo lo demás es obligatorio. Un campo de más o un valor que no
 existe son error: el harness sale con código 2 y una línea que dice qué contexto y

@@ -19,18 +19,24 @@ De ahí salen:
   worktree (`...--worktrees-<repo>-ticket-<n>`), que es lo que permite separar
   el consumo del harness del resto
 
-Es aproximado, a propósito: sólo ve las sesiones de este usuario de esta
-máquina —ni otros dispositivos ni otros usuarios. Está documentado en el
-`--help` del CLI y en `docs/harness/quota.md`.
+Es aproximado, a propósito: sólo ve las sesiones locales de esta máquina —
+ni otros dispositivos. Por defecto son las de un solo usuario; con varias
+fuentes (`--projects` por coma o `quota.projects` en config, ticket #75) suma
+los usuarios declarados, y una fuente que no se puede leer se salta y se
+dice cuál y por qué — el total queda marcado como piso (`≥`), no como
+medición. Está documentado en el `--help` del CLI y en `docs/harness/quota.md`.
 
 Acá vive la lógica pura (parsear, atribuir, agregar, dibujar). El que toca el
-disco es `leer_sesiones`; el que escribe el evento lo hace el CLI.
+disco es `leer_sesiones`/`leer_fuentes`; el que escribe el evento lo hace el
+CLI.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+from stat import S_ISDIR
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict
@@ -178,6 +184,77 @@ def leer_sesiones(projects):
     return out
 
 
+def leer_fuentes(rutas):
+    """`(registros, fuentes)` de una lista de directorios de sesiones (#75).
+
+    `rutas` es una lista de str/Path (o una sola). `fuentes` trae una entrada
+    por fuente declarada, en orden: `{"ruta", "ok", "error"}`. La fuente que
+    no se puede leer no rompe el comando: se salta y su razón queda en
+    `error` — es lo que hace del total un piso y no una medición. Las rutas
+    repetidas se leen una vez; los registros salen en el orden de las
+    fuentes.
+    """
+    rutas = [rutas] if isinstance(rutas, (str, Path)) else list(rutas or [])
+    registros, fuentes, vistos = [], [], set()
+    for ruta in rutas:
+        p = Path(ruta).expanduser()
+        clave = str(p)
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        error = _error_fuente(p)
+        if error is not None:
+            fuentes.append({"ruta": clave, "ok": False, "error": error})
+            continue
+        registros.extend(leer_sesiones(p))
+        fuentes.append({"ruta": clave, "ok": True, "error": None})
+    return registros, fuentes
+
+
+# ----------------------------------------------------------------------- fuentes
+def fuentes_desde_spec(spec):
+    """Una lista de directorios de sesiones como texto separado por coma
+    (#75) → lista de rutas. Los segmentos vacíos (comas sueltas o finales)
+    se descartan; las rutas repetidas, una sola vez, en el orden declarado."""
+    out, vistos = [], set()
+    for p in str(spec).split(","):
+        p = p.strip()
+        if not p or p in vistos:
+            continue
+        vistos.add(p)
+        out.append(p)
+    return out
+
+
+def _error_fuente(base):
+    """Por qué un directorio de sesiones no se puede leer (#75), o None si se
+    puede. Distingue "no existe" de "no se puede acceder": el segundo es el
+caso multiusuario (el `~/.claude/projects` de otro usuario de la máquina),
+y decir "no existe" lo taparía."""
+    try:
+        st = base.stat()
+    except PermissionError:
+        return "no se puede acceder (permiso denegado)"
+    except FileNotFoundError:
+        return "no existe"
+    except NotADirectoryError:
+        return "no es un directorio"
+    except OSError as e:
+        return "no se puede acceder ({})".format(e.strerror or e)
+    if not S_ISDIR(st.st_mode):
+        return "no es un directorio"
+    # `stat` puede pasar por encima de permisos que `scandir` no; el probe
+    # de verdad es abrir el listado.
+    try:
+        with os.scandir(base) as it:
+            next(it, None)
+    except PermissionError:
+        return "no se puede acceder (permiso denegado)"
+    except OSError as e:
+        return "no se puede acceder ({})".format(e.strerror or e)
+    return None
+
+
 # ------------------------------------------------------------------ atribución
 def codificar_path(p):
     """La codificación de Claude Code para nombres de carpeta: el path con `/`
@@ -254,7 +331,7 @@ def pico_5h(puntos, ventana=VENTANA_5H):
 
 
 # ----------------------------------------------------------------------- agregar
-def agregar(registros, raices):
+def agregar(registros, raices, fuentes=None):
     """El agregado crudo (la forma de `--json`, con los timestamps como
     datetime, que `as_dict` convierte a ISO).
 
@@ -265,7 +342,13 @@ def agregar(registros, raices):
     y la evolución por noche del reporte HTML—: `por_semana` sigue crudo y por
     modelo, sin tocar, porque `test_por_semana` ya lo fija así y `--json` no
     pierde el crudo. `por_dia` bucketea por fecha calendario en `SEMANA_TZ`:
-    es la "noche" del harness, no UTC."""
+    es la "noche" del harness, no UTC.
+
+    `fuentes` (de `leer_fuentes`, #75) se lleva en el agregado: con alguna
+    faltante, `completa` es False y el total es un piso (`≥`), no una
+    medición — es la marca que un consumidor (p.ej. el piso de cuota del
+    router, #45) tiene que respetar. Sin `fuentes` no hay marca: es el
+    agregado de antes, y `completa` queda sin información para negar."""
     total = vacio()
     por_modelo: Dict[str, dict] = {}
     puntos: Dict[str, list] = {}
@@ -307,6 +390,8 @@ def agregar(registros, raices):
                 p["tickets_ponderado"].get(str(ticket), 0.0) + peso)
         sumar_en(harness if es_h else resto, t)
     return {
+        "fuentes": fuentes,
+        "completa": fuentes is None or all(f["ok"] for f in fuentes),
         "archivos": len({r["archivo"] for r in registros}),
         "mensajes": len(registros),
         "total": total,
@@ -398,10 +483,22 @@ def render_quota(agg, tope_semanal=None):
     total = agg["total"]["total"]
     t = agg["total"]
     total_w = agg["ponderado"]
+    # Con fuentes faltantes el total no se lee como medición: se marca piso
+    # (≥) y se dice cuál falta y por qué (#75).
+    fuentes = agg.get("fuentes") or []
+    faltan = [f for f in fuentes if not f["ok"]]
+    piso = bool(faltan)
     a(f"Cuota · sesiones locales ({agg['archivos']} archivo(s), "
       f"{agg['mensajes']} mensaje(s))")
-    a(f"  total ponderado {_fmt(round(total_w))} tokens "
-      f"(por costo relativo, ver PESOS)")
+    if fuentes:
+        a("  fuentes: {}/{} leídas{}".format(
+            len(fuentes) - len(faltan), len(fuentes),
+            " — el total es un piso" if piso else ""))
+        for f in faltan:
+            a("    falta {}: {}".format(f["ruta"], f["error"]))
+    signo = "≥ " if piso else ""
+    a(f"  total ponderado {signo}{_fmt(round(total_w))} tokens "
+      f"(por costo relativo, ver PESOS)" + (" · piso" if piso else ""))
     a(f"    crudo: input {_fmt(t['input'])} · cache_creation "
       f"{_fmt(t['cache_creation'])} · cache_read {_fmt(t['cache_read'])} · "
       f"output {_fmt(t['output'])} · thinking {_fmt(t['thinking'])} "
@@ -462,7 +559,7 @@ def render_quota(agg, tope_semanal=None):
     else:
         a("  (sin calibración: fijar \"quota\": {\"tope_semanal\": N} en la "
           "config para estimar el tope semanal)")
-    a("  (aproximado: solo este usuario de esta máquina)")
+    a("  (aproximado: solo las sesiones locales de esta máquina)")
     return "\n".join(out) + "\n"
 
 
@@ -478,4 +575,9 @@ def resumen_evento(agg):
         f"{iso[:10]}={sum(v.values())}" for iso, v in semanas[:3]))
     partes.append(f"harness={agg['harness']['total']} "
                   f"({_pct(agg['harness']['total'], agg['total']['total'])})")
+    fuentes = agg.get("fuentes") or []
+    faltan = [f for f in fuentes if not f["ok"]]
+    if faltan:
+        partes.append("piso: faltan {} de {} fuente(s)".format(
+            len(faltan), len(fuentes)))
     return "; ".join(partes)

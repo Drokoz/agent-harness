@@ -83,14 +83,20 @@ class BudgetSpec:
 
 @dataclass
 class QuotaSpec:
-    """Calibración de `harness quota` (#74), opcional.
+    """Calibración y fuentes de `harness quota`, opcional.
 
     `tope_semanal` es el tope semanal estimado en tokens PONDERADOS. No lo
     inventa el código: sale de medir `/usage` (interactivo) y va en config
     para poder re-medirlo sin tocar nada más.
+
+    `projects` (#75) son los directorios de sesiones a leer: sin declarar,
+    la cuota mira un solo usuario del sistema (`~/.claude/projects`); con la
+    lista, suma los declarados, y una fuente ilegible se salta y marca el
+    total como piso.
     """
 
     tope_semanal: Optional[float] = None
+    projects: Optional[List[str]] = None
 
 
 @dataclass
@@ -249,21 +255,31 @@ def _run(raw, donde):
 
 
 def _quota(raw, donde):
-    """Opcional: la constante de calibración de `harness quota` (#74). Sin la
-    sección, sin `tope_semanal`, o `quota` vacío: sin tope — la tabla no
-    inventa porcentajes y dice que falta calibrar."""
+    """Opcional: la calibración de `harness quota` (#74) y sus fuentes (#75).
+    Sin la sección, sin `tope_semanal`, o `quota` vacío: sin tope — la tabla
+    no inventa porcentajes y dice que falta calibrar."""
     if raw is None:
         return QuotaSpec()
     raw = _obj(raw, donde + ' → "quota"')
     donde = donde + ' → "quota"'
-    _keys(raw, ("tope_semanal",), donde)
+    _keys(raw, ("tope_semanal", "projects"), donde)
+    tope = None
     if "tope_semanal" in raw:
         tope = _num(raw["tope_semanal"], '"tope_semanal"', donde)
         if tope <= 0:
             raise ConfigError(
                 '{}: "tope_semanal" tiene que ser mayor que cero'.format(donde))
-        return QuotaSpec(tope_semanal=tope)
-    return QuotaSpec()
+    projects = None
+    if "projects" in raw:
+        raw_p = raw["projects"]
+        if not isinstance(raw_p, list) or not raw_p:
+            raise ConfigError(
+                '{}: "projects" tiene que ser una lista de rutas no vacía'.format(
+                    donde))
+        for p in raw_p:
+            _str(p, "cada ruta de projects", donde)
+        projects = list(raw_p)
+    return QuotaSpec(tope_semanal=tope, projects=projects)
 
 
 def _context(name, raw):
