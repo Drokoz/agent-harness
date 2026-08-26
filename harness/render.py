@@ -130,6 +130,17 @@ def _peldanos(t, c, out):
             f"{gasto}{motivo}{c.off}")
 
 
+def _detalle_ticket(t):
+    """Lo que la línea dice del PR (#86): cuando el estado se confirmó en
+    vivo, el estado reconciliado y el número — el cuerpo del evento es de
+    cuando se abrió y se queda atrás (un PR mergeado sigue diciendo "abierto"
+    en el log, y el encabezado ya dice mergeados). Sin confirmar, el cuerpo
+    del log, que la línea marca "según el log" de todos modos."""
+    if t.en_vivo and t.numero is not None:
+        return f"PR #{t.numero} {t.estado}"
+    return t.detalle
+
+
 def _tickets(tickets, c, out):
     """Los tickets del período, agrupados por el estado en vivo del PR: el
     merge es humano y no deja evento, así que "abierto" es sólo lo que decía
@@ -147,7 +158,7 @@ def _tickets(tickets, c, out):
         out(f"   {color}{icono}{c.off} {len(del_estado)} {etiqueta}")
         for t in del_estado:
             marca = "" if t.en_vivo else f" {c.dim}(según el log, sin confirmar){c.off}"
-            out(f"     · {t.contexto} {t.ref}: {t.detalle}{marca}{_gasto_ticket(t, c)}")
+            out(f"     · {t.contexto} {t.ref}: {_detalle_ticket(t)}{marca}{_gasto_ticket(t, c)}")
             _peldanos(t, c, out)
 
 

@@ -216,6 +216,93 @@ class TestResumen(unittest.TestCase):
         self.assertIn("1 tickets cerrados sin mergear", salida)
         self.assertNotIn("tickets con PR abierto (gate verde)", salida)
 
+    def test_un_pr_mergeado_se_lee_como_mergeado_en_su_linea(self):
+        """(#86) El cuerpo del evento dice "abierto" de cuando se abrió; si
+        hoy está mergeado, la línea lo dice también — y conserva el número
+        de PR, que es lo útil para ir a mirarlo."""
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-25T08:00:00Z", tickets=[
+            Ticket(contexto="personal", ref="ticket/41", numero=77,
+                  detalle="PR #77 abierto (gate verde)",
+                  estado="mergeado", en_vivo=True),
+        ])
+        salida = self.pantalla(r)
+        self.assertIn("1 tickets mergeados", salida)
+        self.assertIn("ticket/41: PR #77 mergeado", salida)
+        self.assertNotIn("PR #77 abierto", salida)
+
+    def test_abierto_se_lee_abierto_y_cerrado_se_distingue_de_mergeado(self):
+        """(#86) El estado vivo sigue siendo el de la línea: uno que sigue
+        abierto se lee abierto, y uno cerrado sin mergear no se lee como
+        mergeado."""
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-25T08:00:00Z", tickets=[
+            Ticket(contexto="personal", ref="ticket/73", numero=79,
+                  detalle="PR #79 abierto (gate verde)",
+                  estado="abierto", en_vivo=True),
+            Ticket(contexto="personal", ref="ticket/74", numero=80,
+                  detalle="PR #80 abierto (gate verde)",
+                  estado="cerrado", en_vivo=True),
+        ])
+        salida = self.pantalla(r)
+        self.assertIn("PR #79 abierto", salida)
+        self.assertIn("PR #80 cerrado", salida)
+        self.assertNotIn("mergeado", [l for l in salida.splitlines()
+                                      if "ticket/74" in l][0])
+
+    def test_el_encabezado_y_el_detalle_no_pueden_discrepar(self):
+        """(#86) El encabezado cuenta por `estado` reconciliado y la línea
+        de cada ticket dice ese mismo estado: se compara sobre el mismo
+        conjunto — por grupo, el número del encabezado es la cantidad de
+        líneas de abajo, y cada línea dice el estado del grupo."""
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-25T08:00:00Z", tickets=[
+            Ticket(contexto="personal", ref="ticket/41", numero=77,
+                  detalle="PR #77 abierto (gate verde)",
+                  estado="mergeado", en_vivo=True),
+            Ticket(contexto="personal", ref="ticket/72", numero=78,
+                  detalle="PR #78 abierto (gate verde)",
+                  estado="mergeado", en_vivo=True),
+            Ticket(contexto="personal", ref="ticket/73", numero=79,
+                  detalle="PR #79 abierto (gate verde)",
+                  estado="abierto", en_vivo=True),
+            Ticket(contexto="personal", ref="ticket/74", numero=80,
+                  detalle="PR #80 abierto (gate verde)",
+                  estado="cerrado", en_vivo=True),
+        ])
+        salida = self.pantalla(r)
+        estado_por_grupo = {"tickets mergeados": "mergeado",
+                            "tickets con PR abierto": "abierto",
+                            "tickets cerrados sin mergear": "cerrado"}
+        grupos, actual = [], None
+        for l in salida.splitlines():
+            m = re.match(r"\s+. (\d+) tickets ", l)
+            if m:
+                actual = {"n": int(m.group(1)), "cab": l, "det": []}
+                grupos.append(actual)
+            elif l.lstrip().startswith("· ") and actual is not None:
+                actual["det"].append(l)
+        self.assertEqual(len(grupos), 3)
+        for g in grupos:
+            estado = next(e for et, e in estado_por_grupo.items() if et in g["cab"])
+            self.assertEqual(len(g["det"]), g["n"], g["cab"])
+            for d in g["det"]:
+                self.assertIn(estado, d, (g["cab"], d))
+
+    def test_sin_reconciliar_encabezado_y_detalle_dicen_lo_mismo(self):
+        """(#86) Sin poder reconciliar (sin red), el encabezado y la línea
+        salen del mismo dato —el log— y la línea marca que no se confirmó
+        en vivo."""
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-25T08:00:00Z", tickets=[
+            Ticket(contexto="personal", ref="ticket/41", numero=77,
+                  detalle="PR #77 abierto (gate verde)"),
+        ])
+        salida = self.pantalla(r)
+        self.assertIn("1 tickets con PR abierto (gate verde)", salida)
+        self.assertIn("PR #77 abierto (gate verde)", salida)
+        self.assertIn("según el log", salida)
+
     def test_sin_confirmar_en_vivo_se_marca_como_tal(self):
         """Sin red, el ticket se muestra con lo que dice el log, pero
         distinguido de un estado confirmado en vivo (ticket #55)."""
