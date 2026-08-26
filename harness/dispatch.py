@@ -477,6 +477,10 @@ class Dispatcher:
         # Desde acá miran las sesiones de pi: un ticket reintentado ya tiene
         # sesiones de anoche en el disco y ese costo no es de esta corrida.
         desde = self._desde = self.log.reloj()
+        # La base de toda la corrida se actualiza una sola vez acá, no por
+        # ticket (#85): sin fetch, origin/<rama por defecto> puede estar
+        # viejo y rebasar contra él da la sensación de estar al día.
+        self._fetch_base(jobs)
         with cf.ThreadPoolExecutor(max_workers=max(1, self.spec.max_parallel)) as ex:
             resultados = list(ex.map(self.run_job, jobs))
         despues = self.credits()
@@ -557,13 +561,44 @@ class Dispatcher:
         return self.spec.permitir_claude()
 
     # -------------------------------------------------- pasos del ciclo de vida
+    def _fetch_base(self, jobs):
+        """El dispatcher nunca hacía fetch (#85): `origin/<rama por
+        defecto>` podía estar viejo y rebasar contra un origin/main
+        desactualizado daba la sensación de estar al día sin estarlo.
+        Una vez por corrida y por repo —no por ticket— se trae la rama
+        por defecto antes de calcular la base. Un fetch que falla (sin
+        red) no voltea la corrida: se sigue con lo que hay y queda
+        anotado que la base puede estar vieja."""
+        vistos = set()
+        for job in jobs:
+            if job.repo_path in vistos:
+                continue
+            vistos.add(job.repo_path)
+            rama = self._rama_base(job)
+            ok, out = self.run_cmd(["git", "-C", job.repo_path, "fetch",
+                                    "origin", rama], timeout=60)
+            if ok:
+                self.log.write("fetch", "corrida",
+                               "origin/{} de {} actualizado".format(rama,
+                                                                   job.repo))
+            else:
+                self.log.write("fetch", "corrida",
+                               "fetch origin/{} de {} fallo ({}): la base "
+                               "puede estar vieja".format(rama, job.repo,
+                                                          out.strip()[-120:]))
+
     def _worktree(self, job, ref):
         """Worktree aislado por ticket. Si la rama ya existe (un intento
         anterior la dejo), se reutiliza en vez de chocar — pero antes se
         actualiza sobre la base, para que el reintento no arranque viejo
-        (#64)."""
+        (#64). La rama nueva nace sobre la base de la corrida, no sobre
+        el HEAD del checkout principal (#85): una sola definición de
+        base para crear, rebasar y contar commits."""
         job.branch = "ticket/{}".format(job.issue)
         job.worktree = str(worktree_path(job.repo_path, job.issue))
+        ref_base, sha_base = self._base(job)
+        self._log(job, "base", ref,
+                  "base efectiva {} (sha {})".format(ref_base, sha_base[:8]))
         self.run_cmd(["git", "-C", job.repo_path, "worktree", "prune"])
         if Path(job.worktree).exists():
             self.run_cmd(["git", "-C", job.repo_path, "worktree", "remove",
@@ -576,10 +611,12 @@ class Dispatcher:
             # La rama ya está (un intento anterior la dejó): se reutiliza.
             args += [job.worktree, job.branch]
         else:
-            # `worktree add -b <rama> <path>`. El nombre de la rama va pegado a
-            # -b: si va el path, git lo toma como nombre de rama y falla con
-            # "is not a valid branch name".
-            args += ["-b", job.branch, job.worktree]
+            # `worktree add -b <rama> <path> <base>`. El nombre de la rama va
+            # pegado a -b: si va el path, git lo toma como nombre de rama y
+            # falla con "is not a valid branch name". El punto de partida es
+            # la base de la corrida, para que la rama nueva no herede el
+            # atraso de la main local (#85).
+            args += ["-b", job.branch, job.worktree, ref_base]
         ok, out = self.run_cmd(args, timeout=120)
         if not ok:
             self._log(job, "worktree", ref, "fallo: " + out.strip()[-200:])
@@ -590,9 +627,10 @@ class Dispatcher:
         return True
 
     def _rama_base(self, job):
-        """Sobre qué se actualiza una rama reutilizada (#64): la rama por
-        defecto del remote (a qué apunta `origin/HEAD`), una consulta local
-        que no toca la red. Sin remote resuelto, `main`."""
+        """El nombre de la rama por defecto del remote (a qué apunta
+        `origin/HEAD`), una consulta local que no toca la red. Sin
+        remote resuelto, `main`. Es el nombre, no la base: la base es el
+        ref `<rama>` actualizado por el fetch de la corrida (#85)."""
         ok, out = self.run_cmd(["git", "-C", job.repo_path, "symbolic-ref",
                                 "refs/remotes/origin/HEAD"])
         prefijo = "refs/remotes/origin/"
@@ -600,16 +638,40 @@ class Dispatcher:
             return out.strip()[len(prefijo):]
         return "main"
 
+    def _base(self, job):
+        """(ref, sha) de la base de todo lo que el job toca (#85):
+        `origin/<rama por defecto>`, actualizada por el fetch de la
+        corrida. Es la única definición de base: la usan crear la rama
+        nueva, rebasar la reutilizada y contar commits — antes cada una
+        medía la suya (HEAD del checkout principal, origin/main) y un
+        reintento podía quedar adelante o atrás del intento anterior.
+
+        Si el ref del remote no resuelve (sin remote, o fetch que falló
+        sin el ref) cae al HEAD del checkout principal: la base vieja,
+        posiblemente atrasada — la corrida no muere por eso, y el fetch
+        que falló ya quedó anotado en el log."""
+        ref = "origin/" + self._rama_base(job)
+        ok, out = self.run_cmd(["git", "-C", job.repo_path, "rev-parse",
+                                "--verify", "--quiet", ref])
+        sha = out.strip().splitlines()[-1].strip() if ok and out.strip() else ""
+        if not sha:
+            ref = "HEAD"
+            ok, out = self.run_cmd(["git", "-C", job.repo_path, "rev-parse",
+                                    "--verify", "--quiet", ref])
+            sha = (out.strip().splitlines()[-1].strip()
+                   if ok and out.strip() else "")
+        return ref, sha
+
     def _actualizar_sobre_base(self, job, ref, base_vieja):
         """El reintento no arranca sobre la base vieja (#64): la rama
-        reutilizada se rebasa sobre la rama por defecto del remote antes de
+        reutilizada se rebasa sobre la base de la corrida (#85) antes de
         despachar, y queda en el log qué base tenía y sobre qué se
         actualizó.
 
         Si conflictúa, el ticket no se despacha a ciegas: se anota y se
         manda a la cola de mantenimiento (#56), y el rebase se aborta para
         que no quede medio rebase en el worktree."""
-        ref_base = "origin/" + self._rama_base(job)
+        ref_base, _ = self._base(job)
         ok, out = self.run_cmd(["git", "-C", job.worktree, "rebase", ref_base],
                                timeout=120)
         if not ok:
@@ -940,10 +1002,10 @@ class Dispatcher:
 
     def _rama_con_commits(self, job, ref):
         """Antes de correr el gate: la rama tiene que tener al menos un
-        commit por delante de su base.
+        commit por delante de la base de la corrida (#85: la misma base
+        que usaron crear la rama nueva y rebasar la reutilizada).
 
-        La base es el HEAD del checkout principal, de donde nació el
-        worktree: cuenta cero significa que la rama no trae trabajo, y el
+        Contar cero significa que la rama no trae trabajo, y el
         gate correría sobre el código de la base sin cambios -- el mismo
         verde que uno que trabajó bien, escrito en el log como un logro
         (#52 lo pasó así, y #45 otra vez). Verde significa "no rompe
@@ -955,9 +1017,7 @@ class Dispatcher:
         salida = []
 
         def intentar():
-            ok, out = self.run_cmd(["git", "-C", job.repo_path, "rev-parse",
-                                    "HEAD"])
-            base = out.strip().splitlines()[-1].strip() if ok and out.strip() else ""
+            _, base = self._base(job)
             if not base:
                 return False
             ok, out = self.run_cmd(["git", "-C", job.worktree, "rev-list",
