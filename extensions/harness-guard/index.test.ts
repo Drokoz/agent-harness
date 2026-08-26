@@ -17,21 +17,38 @@ function piFalso() {
   };
 }
 
-/** Un worktree con la forma que arma `dispatch.worktree_path`. */
-function enWorktree(fn: (wt: string) => void) {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "guard-"));
-  const wt = path.join(fs.realpathSync(tmp), ".worktrees", "agent-harness-ticket-74");
-  fs.mkdirSync(wt, { recursive: true });
+/** Corre `fn` con el cwd del proceso puesto en `destino`, y lo deja como estaba.
+ *
+ *  El guard mira `process.cwd()`, así que estos tests dependen de dónde se
+ *  corren. Y el gate se corre ADENTRO de un worktree del harness: un test que
+ *  asuma "el cwd es el repo" pasa en la máquina del humano y rojea en todos los
+ *  worktrees. Pasó: la noche del 2026-08-26 los ocho agentes se encontraron con
+ *  este test en rojo y los ocho lo arreglaron por su cuenta, cada uno distinto. */
+function enCwd(destino: string, limpiar: string, fn: () => void) {
   const antes = process.cwd();
   const estado = process.env.XDG_STATE_HOME;
-  process.env.XDG_STATE_HOME = path.join(fs.realpathSync(tmp), "state");
-  process.chdir(wt);
-  try { fn(wt); } finally {
+  process.env.XDG_STATE_HOME = path.join(limpiar, "state");
+  process.chdir(destino);
+  try { fn(); } finally {
     process.chdir(antes);
     if (estado === undefined) delete process.env.XDG_STATE_HOME;
     else process.env.XDG_STATE_HOME = estado;
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(limpiar, { recursive: true, force: true });
   }
+}
+
+/** Un worktree con la forma que arma `dispatch.worktree_path`. */
+function enWorktree(fn: (wt: string) => void) {
+  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "guard-")));
+  const wt = path.join(tmp, ".worktrees", "agent-harness-ticket-74");
+  fs.mkdirSync(wt, { recursive: true });
+  enCwd(wt, tmp, () => fn(wt));
+}
+
+/** Un directorio neutro: no es worktree del harness, corra donde corra el gate. */
+function fueraDeWorktree(fn: () => void) {
+  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "guard-neutro-")));
+  enCwd(tmp, tmp, fn);
 }
 
 test("bloquea con la forma que pi espera", () => {
@@ -64,9 +81,11 @@ test("las tools que no escriben ni ejecutan ni se miran", () => {
 });
 
 test("fuera de un worktree del harness no opina", () => {
-  const { pi, llamar } = piFalso();
-  montar(pi);   // cwd = el repo, no un worktree
-  assert.strictEqual(llamar({ toolName: "bash", input: { command: "sudo rm -rf /" } }), undefined);
+  fueraDeWorktree(() => {
+    const { pi, llamar } = piFalso();
+    montar(pi);
+    assert.strictEqual(llamar({ toolName: "bash", input: { command: "sudo rm -rf /" } }), undefined);
+  });
 });
 
 test("cada bloqueo deja una linea en el log de eventos", () => {
