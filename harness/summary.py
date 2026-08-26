@@ -25,7 +25,11 @@ from typing import Callable, List, Optional
 # Costo de job: el cuerpo de la línea "costo" es exactamente "$0.0560".
 # El delta de créditos de la corrida ("creditos antes ... / delta $0.2") NO
 # se suma: mide el mismo gasto por otra vía y sumar ambos lo contaría dos veces.
-COSTO_JOB_RE = re.compile(r"^\$(\d+(?:\.\d+)?)$")
+# El sufijo entre paréntesis dice de dónde salió el número --- "(sesion de pi)"
+# es medido, "(estimado: reparto del delta)" es un promedio (#90, #65). El
+# regex tiene que tolerarlo: anclado al final, un cambio de redacción deja
+# TODO el costo de una noche en cero, sin romper ningún test.
+COSTO_JOB_RE = re.compile(r"^\$(\d+(?:\.\d+)?)(?:\s+\([^)]*\))?$")
 
 # El PR de un evento "pr" viene en el cuerpo: "PR #19 abierto (gate verde)".
 PR_NUM_RE = re.compile(r"PR #(\d+)")
