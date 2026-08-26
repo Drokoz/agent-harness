@@ -114,7 +114,7 @@ def build_parser():
                                     "por defecto sólo ve las sesiones de Claude "
                                     "Code de este usuario de esta máquina —no "
                                     "ve otros dispositivos ni otros usuarios de "
-                                    "la máquina. Con --projects (vías separadas "
+                                    "la máquina. Con --projects (rutas separadas "
                                     "por coma) o quota.projects en config se "
                                     "declaran varias fuentes; una que no se "
                                     "pueda leer se salta, se dice cuál y por "
