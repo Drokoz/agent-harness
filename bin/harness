@@ -13,13 +13,20 @@
     harness decisions --json        lo mismo, parseable
 
     harness quota                   la cuota de Claude, medida leyendo las
-                                    sesiones locales (~/.claude/projects)
-    harness quota --projects PATH   otra carpeta de sesiones (p.ej. una fixture)
+                                    sesiones locales (por defecto las de este
+                                    usuario: ~/.claude/projects)
+    harness quota --projects RUTAS  otra(s) carpeta(s) de sesiones, separadas
+                                    por coma (p.ej. una fixture, otro usuario
+                                    de la máquina)
     harness quota --json            el agregado (crudo + ponderado), parseable
                                     Limitaciones (también en docs/harness/quota.md):
-                                    es aproximado, y sólo ve las sesiones de este
-                                    usuario de esta máquina —ni otros dispositivos
-                                    ni otros usuarios.
+                                    es aproximado, y por defecto sólo ve las
+                                    sesiones de este usuario de esta máquina —
+                                    ni otros dispositivos ni otros usuarios.
+                                    Con `--projects` (o `quota.projects` en
+                                    config) se declaran varias fuentes; una que
+                                    no se pueda leer se salta y el total se
+                                    marca como piso (≥).
 
     harness run                     lanza la frontera del contexto por defecto;
                                     cada ticket corre en el peldaño de la escalera
@@ -80,8 +87,8 @@ from harness.dispatch import (DispatchSpec, Dispatcher, EventLog, Job, cosechar,
                               peldano_de)
 from harness.render import linea_evento, render  # noqa: E402
 from harness.quota import (agregar, as_dict as quota_as_dict, cuota_por_ventana,  # noqa: E402
-                           leer_sesiones, puntos_de_ticket, render_quota,
-                           resumen_evento, semana_de)
+                           fuentes_desde_spec, leer_fuentes, puntos_de_ticket,
+                           render_quota, resumen_evento, semana_de)
 from harness.snapshot import as_dict, snapshot  # noqa: E402
 from harness.state import (intentos, intentos_que_escalan, motivos_de_abandono,  # noqa: E402
                            pasos, ultimo_gate_rojo)
@@ -104,9 +111,14 @@ def build_parser():
                                 epilog=(
                                     "quota: las dos limitaciones (ver también "
                                     "docs/harness/quota.md): es aproximado, y "
-                                    "sólo ve las sesiones de Claude Code de este "
-                                    "usuario de esta máquina —no ve otros "
-                                    "dispositivos ni otros usuarios de la máquina."),
+                                    "por defecto sólo ve las sesiones de Claude "
+                                    "Code de este usuario de esta máquina —no "
+                                    "ve otros dispositivos ni otros usuarios de "
+                                    "la máquina. Con --projects (vías separadas "
+                                    "por coma) o quota.projects en config se "
+                                    "declaran varias fuentes; una que no se "
+                                    "pueda leer se salta, se dice cuál y por "
+                                    "qué, y el total se marca como piso (≥)."),
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", nargs="?", default="status",
                    choices=["status", "decisions", "run", "report", "quota"],
@@ -138,8 +150,9 @@ def build_parser():
     p.add_argument("--log", default="",
                    help="run: dónde va el log JSONL de eventos")
     p.add_argument("--projects", default="",
-                   help="quota: carpeta de sesiones (por defecto "
-                        "~/.claude/projects)")
+                   help="quota: carpeta(s) de sesiones separadas por coma "
+                        "(por defecto ~/.claude/projects de este usuario, o la "
+                        "lista que declare quota.projects en config)")
     return p
 
 
@@ -183,11 +196,11 @@ def main(argv=None):
         # El log de eventos da el estado `despachado` de la frontera (ticket #43).
         raw["eventos"] = leer_eventos(_estado_dir() / "harness" / "events.jsonl")
         # La cuota (#47): sesiones locales de Claude, sin red — igual que
-        # `harness quota`, pero con la carpeta por defecto (sin `--projects`:
+        # `harness quota`, pero con las fuentes de la config (sin `--projects`:
         # esa bandera es de `quota`, acá no hace falta exponerla).
         raices = [Path(c.repos.root).expanduser() for c in contexts]
-        quota_registros = leer_sesiones(Path.home() / ".claude" / "projects")
-        quota_agg = agregar(quota_registros, raices)
+        quota_registros, fuentes = leer_fuentes(_rutas_sesiones(args, contexts))
+        quota_agg = agregar(quota_registros, raices, fuentes=fuentes)
     snap = snapshot(raw)
     if args.since and parse_fecha(args.since) is None:
         sys.stderr.write("harness: --since inválido: se espera YYYY-MM-DD o ISO "
@@ -224,15 +237,26 @@ def _cuota_dict(quota_agg):
     return {"estado": "ok", "por_dia": quota_agg["por_dia"]}
 
 
+def _rutas_sesiones(args, contexts):
+    """Los directorios de sesiones a leer (#75): `--projects` (separadas por
+    coma) gana; si no, `quota.projects` de la config (con `--all`, la primera
+    que haya); si no, `~/.claude/projects` de este usuario."""
+    if args.projects:
+        return fuentes_desde_spec(args.projects)
+    for c in contexts:
+        if c.quota.projects:
+            return list(c.quota.projects)
+    return [str(Path.home() / ".claude" / "projects")]
+
+
 def quota_main(args, contexts):
     """`harness quota`: la cuota de Claude medida sobre las sesiones locales
     (la misma fuente que /usage). Deja una línea en el log de eventos para
     que el histórico quede junto a todo lo demás; offline, sin efectos de
     lado, como el resto del CLI."""
     raices = [Path(c.repos.root).expanduser() for c in contexts]
-    projects = (Path(args.projects).expanduser() if args.projects
-                else Path.home() / ".claude" / "projects")
-    agg = agregar(leer_sesiones(projects), raices)
+    registros, fuentes = leer_fuentes(_rutas_sesiones(args, contexts))
+    agg = agregar(registros, raices, fuentes=fuentes)
     # La constante de calibración vive en config (#74), no en el código;
     # con `--all` gana la primera que haya.
     tope = next((c.quota.tope_semanal for c in contexts

@@ -97,6 +97,37 @@ class TestQuota(unittest.TestCase):
         with self.assertRaises(ConfigError):
             parse_config(conf(personal=ctx(quota={"tope_semanal": 0})))
 
+    def test_projects_opcional(self):
+        """`quota.projects` (#75): sin declarar, la quota mira un solo usuario."""
+        c = parse_config(conf(personal=ctx())).contexts[0]
+        self.assertIsNone(c.quota.projects)
+
+    def test_projects_lista(self):
+        c = parse_config(conf(personal=ctx(quota={"projects": [
+            "~/.claude/projects", "/Users/tomasherceg/.claude/projects"]}))).contexts[0]
+        self.assertEqual(c.quota.projects,
+                         ["~/.claude/projects",
+                          "/Users/tomasherceg/.claude/projects"])
+
+    def test_projects_y_tope_juntos(self):
+        c = parse_config(conf(personal=ctx(quota={
+            "tope_semanal": 900000000, "projects": ["~/.claude/projects"]}))).contexts[0]
+        self.assertEqual(c.quota.tope_semanal, 900000000.0)
+        self.assertEqual(c.quota.projects, ["~/.claude/projects"])
+
+    def test_projects_no_lista(self):
+        with self.assertRaises(ConfigError):
+            parse_config(conf(personal=ctx(quota={"projects": "~/.claude/projects"})))
+
+    def test_projects_vacia(self):
+        """Una lista vacía no es "una fuente": es un error, no un default."""
+        with self.assertRaises(ConfigError):
+            parse_config(conf(personal=ctx(quota={"projects": []})))
+
+    def test_projects_elemento_no_texto(self):
+        with self.assertRaises(ConfigError):
+            parse_config(conf(personal=ctx(quota={"projects": [1]})))
+
     def test_default_config_es_valida(self):
         c = default_config()
         self.assertIsInstance(c, Config)

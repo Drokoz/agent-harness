@@ -24,9 +24,10 @@ from pathlib import Path
 import support  # noqa: F401  (pone la raíz en sys.path)
 
 from harness.quota import (PESOS, agregar, as_dict, atribuir, codificar_path,
-                           cuota_por_ventana, decodificar_uso, leer_sesiones,
-                           parsear_linea, pico_5h, ponderar, puntos_de_ticket,
-                           render_quota, resumen_evento, semana_de, semana_inicio)
+                           cuota_por_ventana, decodificar_uso, fuentes_desde_spec,
+                           leer_fuentes, leer_sesiones, parsear_linea, pico_5h,
+                           ponderar, puntos_de_ticket, render_quota,
+                           resumen_evento, semana_de, semana_inicio)
 
 HARNESS = support.ROOT / "bin" / "harness"
 SESIONES = support.FIXTURES / "claude_sessions"
@@ -51,8 +52,9 @@ CONFIG_QUOTA = json.dumps({
 
 
 @contextlib.contextmanager
-def correr_quota(*args, config=CONFIG_QUOTA, offline=False):
-    """El CLI `harness quota` contra el fixture, con HOME y estado aislados."""
+def correr_quota(*args, config=CONFIG_QUOTA, offline=False, projects=SESIONES):
+    """El CLI `harness quota` contra el fixture, con HOME y estado aislados.
+    `projects` None = sin `--projects` (la ruta la da la config o el default)."""
     with tempfile.TemporaryDirectory() as tmp:
         env = dict(os.environ)
         env["HOME"] = tmp
@@ -64,9 +66,11 @@ def correr_quota(*args, config=CONFIG_QUOTA, offline=False):
         else:
             env.pop("HARNESS_OFFLINE", None)
         (Path(tmp) / "config.json").write_text(config)
-        yield subprocess.run(
-            [str(HARNESS), "quota", "--projects", str(SESIONES), *args],
-            env=env, capture_output=True, text=True, timeout=120)
+        cmd = [str(HARNESS), "quota"]
+        if projects is not None:
+            cmd += ["--projects", str(projects)]
+        yield subprocess.run(cmd + list(args), env=env, capture_output=True,
+                             text=True, timeout=120)
 
 
 class TestPonderar(unittest.TestCase):
@@ -581,6 +585,189 @@ class TestCli(unittest.TestCase):
         self.assertIn("aproximado", p.stdout)
         self.assertIn("otros dispositivos", p.stdout)
         self.assertIn("otros usuarios", p.stdout)
+
+
+class TestFuentes(unittest.TestCase):
+    """Multiusuario (#75): dos directorios de sesiones legibles y uno
+    ilegible. El ilegible no rompe: se salta y se sabe cuál y por qué."""
+
+    LINEA = ('{"type":"assistant","timestamp":"2026-08-25T10:00:00.000Z",'
+             '"message":{"model":"claude-opus-5","usage":{"input_tokens":1,'
+             '"cache_creation_input_tokens":0,"cache_read_input_tokens":0,'
+             '"output_tokens":1}}}')
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        base = Path(cls._tmp.name)
+        cls.a = base / "a"
+        cls.b = base / "b"
+        (cls.a / "-u-docs-koku").mkdir(parents=True)
+        (cls.a / "-u-docs-koku" / "s.jsonl").write_text(cls.LINEA + "\n")
+        (cls.b / "-otro-lugar").mkdir(parents=True)
+        (cls.b / "-otro-lugar" / "s.jsonl").write_text(cls.LINEA + "\n")
+        cls.inlegible = base / "inlegible"
+        cls.inlegible.mkdir()
+        cls.inlegible.chmod(0o000)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.inlegible.chmod(0o755)
+        cls._tmp.cleanup()
+
+    def test_dos_directorios_y_uno_inlegible(self):
+        regs, fuentes = leer_fuentes([self.a, self.b, self.inlegible])
+        self.assertEqual(len(regs), 2)  # los legibles se leen igual
+        self.assertEqual([f["ruta"] for f in fuentes],
+                         [str(self.a), str(self.b), str(self.inlegible)])
+        self.assertEqual([f["ok"] for f in fuentes], [True, True, False])
+        self.assertIn("permiso", fuentes[2]["error"])
+
+    def test_inexistente_no_rompe(self):
+        regs, fuentes = leer_fuentes(["/no/existe-en-ningun-lado"])
+        self.assertEqual(regs, [])
+        self.assertFalse(fuentes[0]["ok"])
+        self.assertIn("no existe", fuentes[0]["error"])
+
+    def test_archivo_no_es_fuente(self):
+        (self.a / "no-es-directorio.txt").write_text("no")
+        regs, fuentes = leer_fuentes([self.a / "no-es-directorio.txt"])
+        self.assertEqual(regs, [])
+        self.assertFalse(fuentes[0]["ok"])
+        self.assertIn("no es un directorio", fuentes[0]["error"])
+
+    def test_ruta_repetida_cuenta_una_vez(self):
+        regs, fuentes = leer_fuentes([str(self.a), str(self.a)])
+        self.assertEqual(len(regs), 1)
+        self.assertEqual(len(fuentes), 1)
+
+    def test_fuentes_desde_spec(self):
+        self.assertEqual(
+            fuentes_desde_spec("{0}, {1} ,{0},".format(self.a, self.b)),
+            [str(self.a), str(self.b)])
+        self.assertEqual(fuentes_desde_spec(""), [])
+        self.assertEqual(fuentes_desde_spec("  ,  "), [])
+
+
+class TestRenderFuentes(unittest.TestCase):
+    """Con fuentes faltantes el total se marca como piso (≥), no como
+    medición (#75)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.regs = leer_sesiones(SESIONES)
+
+    def test_completa_no_marca_piso(self):
+        texto = render_quota(agregar(self.regs, RAIZ, fuentes=[
+            {"ruta": str(SESIONES), "ok": True, "error": None}]))
+        self.assertIn("fuentes: 1/1 leídas", texto)
+        self.assertNotIn("≥", texto)
+
+    def test_parcial_marca_el_piso_y_la_fuente_faltante(self):
+        texto = render_quota(agregar(self.regs, RAIZ, fuentes=[
+            {"ruta": str(SESIONES), "ok": True, "error": None},
+            {"ruta": "/Users/tomasherceg/.claude/projects", "ok": False,
+             "error": "no se puede acceder (permiso denegado)"}]))
+        self.assertIn("fuentes: 1/2 leídas", texto)
+        self.assertIn("falta /Users/tomasherceg/.claude/projects: "
+                      "no se puede acceder (permiso denegado)", texto)
+        self.assertIn("total ponderado ≥ 20,350", texto)
+        self.assertIn("piso", texto)
+
+    def test_sin_fuentes_el_render_no_cambia(self):
+        """Los agregados viejos (sin `fuentes`) se dibujan sin piso."""
+        texto = render_quota(agregar(self.regs, RAIZ))
+        self.assertNotIn("≥", texto)
+        self.assertNotIn("fuentes:", texto)
+
+    def test_completa_en_el_json(self):
+        agg = agregar(self.regs, RAIZ, fuentes=[
+            {"ruta": str(SESIONES), "ok": True, "error": None},
+            {"ruta": "/x", "ok": False, "error": "no existe"}])
+        data = json.loads(json.dumps(as_dict(agg), sort_keys=True))
+        self.assertFalse(data["completa"])
+        self.assertEqual(data["fuentes"],
+                         [{"ruta": str(SESIONES), "ok": True, "error": None},
+                          {"ruta": "/x", "ok": False, "error": "no existe"}])
+        # El dato medido no cambia: el piso marca la lectura, no el número.
+        self.assertEqual(data["total"]["total"], 8000)
+
+    def test_resumen_evento_marca_el_piso(self):
+        linea = resumen_evento(agregar(self.regs, RAIZ, fuentes=[
+            {"ruta": str(SESIONES), "ok": True, "error": None},
+            {"ruta": "/x", "ok": False, "error": "no existe"}]))
+        self.assertIn("piso", linea)
+        self.assertIn("1 de 2", linea)
+
+
+class TestCliFuentes(unittest.TestCase):
+    """El CLI: `--projects` por coma y la lista declarada en config (#75)."""
+
+    def _inlegible(self, tmp):
+        d = Path(tmp) / "inlegible"
+        d.mkdir()
+        d.chmod(0o000)
+        return d
+
+    def test_projects_separados_por_coma(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inlegible = str(self._inlegible(tmp))
+            with correr_quota(projects="{0},{1}".format(SESIONES, inlegible)) as p:
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertIn("fuentes: 1/2 leídas", p.stdout)
+                self.assertIn("falta {}: no se puede acceder".format(inlegible),
+                              p.stdout)
+                self.assertIn("total ponderado ≥", p.stdout)
+
+    def test_json_marca_completa_falso(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inlegible = str(self._inlegible(tmp))
+            with correr_quota("--json",
+                              projects="{0},{1}".format(SESIONES, inlegible)) as p:
+                self.assertEqual(p.returncode, 0, p.stderr)
+                data = json.loads(p.stdout)
+        self.assertFalse(data["completa"])
+        faltantes = [f for f in data["fuentes"] if not f["ok"]]
+        self.assertEqual(len(faltantes), 1)
+        self.assertEqual(faltantes[0]["ruta"], inlegible)
+        self.assertEqual(data["total"]["total"], 8000)
+
+    def test_todas_las_fuentes_legibles_es_completa(self):
+        with correr_quota("--json") as p:
+            self.assertEqual(p.returncode, 0, p.stderr)
+            data = json.loads(p.stdout)
+        self.assertTrue(data["completa"])
+        self.assertTrue(all(f["ok"] for f in data["fuentes"]))
+
+    def test_config_declara_la_lista(self):
+        """Sin `--projects`: la lista de fuentes viene de `quota.projects`."""
+        config = json.loads(CONFIG_QUOTA)
+        config["contexts"]["personal"]["quota"] = {
+            "projects": [str(SESIONES), "/no/existe/en/ningun/lado"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ)
+            env["HOME"] = tmp
+            env["HARNESS_CONFIG_DIR"] = tmp
+            env["XDG_STATE_HOME"] = tmp
+            env["HARNESS_OFFLINE"] = "1"
+            (Path(tmp) / "config.json").write_text(json.dumps(config))
+            p = subprocess.run([str(HARNESS), "quota"], env=env,
+                               capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("fuentes: 1/2 leídas", p.stdout)
+        self.assertIn("falta /no/existe/en/ningun/lado: no existe", p.stdout)
+        self.assertIn("total ponderado ≥", p.stdout)
+
+    def test_proyectos_por_coma_gana_sobre_config(self):
+        config = json.loads(CONFIG_QUOTA)
+        config["contexts"]["personal"]["quota"] = {
+            "projects": [str(SESIONES), "/no/existe/en/ningun/lado"]}
+        with correr_quota("--json", config=json.dumps(config)) as p:
+            self.assertEqual(p.returncode, 0, p.stderr)
+            data = json.loads(p.stdout)
+        # Gana `--projects` (la SESIONES sola): no hay faltantes.
+        self.assertTrue(data["completa"])
+        self.assertEqual([f["ruta"] for f in data["fuentes"]], [str(SESIONES)])
 
 
 if __name__ == "__main__":

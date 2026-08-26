@@ -11,7 +11,8 @@ thinking va dentro del output y no suma dos veces).
 
     harness quota                  la tabla corta
     harness quota --json           el agregado (crudo + ponderado)
-    harness quota --projects PATH  otra carpeta de sesiones (tests, otra máquina)
+    harness quota --projects RUTAS otra(s) carpeta(s) de sesiones, separadas
+                                   por coma (tests, otro usuario de la máquina)
 
 Qué dice la tabla:
 
@@ -51,6 +52,36 @@ Qué dice la tabla:
   harness; todo lo demás es el resto. Es la línea que responde "cuánto se
   comió el harness y cuánto el 9-5".
 
+## Varias fuentes: los usuarios de la máquina (#75)
+
+Por defecto la cuota mira un solo usuario del sistema (`~/.claude/projects`),
+o sea: si hay dos usuarios que usan Claude Code contra la misma cuenta, la
+medición está incompleta **por diseño**. Se declara la lista de fuentes de
+dos formas, y `--projects` gana sobre la config:
+
+- **config**: `quota.projects`, una lista de rutas en el contexto
+  (`docs/harness/config.md`).
+- **CLI**: `--projects RUTA1,RUTA2` separadas por coma.
+
+Una fuente que no se puede leer **no rompe el comando**: se salta, y la salida
+dice cuál y por qué (`no existe`, `no es un directorio`, `no se puede acceder
+(permiso denegado)`), junto al recuento de fuentes leídas:
+
+```
+  fuentes: 1/2 leídas — el total es un piso
+    falta /Users/tomasherceg/.claude/projects: no se puede acceder (permiso denegado)
+  total ponderado ≥ 20,350 tokens (por costo relativo, ver PESOS) · piso
+```
+
+Con fuentes faltantes el total se marca como **piso (`≥`)**, no como medición:
+un número que subestima sistemáticamente no puede leerse como exacto. En
+`--json` la marca es `"completa": false` junto a `"fuentes": [{ruta, ok,
+error}]`.
+
+Contrato para consumidores: un total con `completa: false` es un piso, y no se
+usa para autorizar gasto (p.ej. el piso de cuota del router, #45) salvo que la
+config lo permita explícitamente.
+
 ## El porcentaje del tope: la constante de calibración
 
 Con la constante configurada, cada corte muestra además el **porcentaje
@@ -83,8 +114,10 @@ tiene efectos de lado.
 ## Limitaciones (las mismas que `/usage`)
 
 1. **Es aproximado**: la fuente son las sesiones locales, no el servidor.
-2. **Sólo ve este usuario de esta máquina**: no ve otros dispositivos ni otros
-   usuarios de la máquina (ni claude.ai).
+2. **Sólo ve las sesiones locales de esta máquina**: no ve otros dispositivos
+   ni (claude.ai). Otros usuarios de la máquina se declaran con
+   `quota.projects`/`--projects` (#75); uno ilegible se salta y el total se
+   marca como piso.
 
 Están en el `--help` de la CLI, en el epígrafe de esta doc y al pie de la
 tabla.
@@ -130,7 +163,9 @@ para Tomás o para la próxima corrida de agentes.
 
 ## Forma del `--json`
 
-`harness quota --json` devuelve el agregado: `total` (con sus cuatro
+`harness quota --json` devuelve el agregado: `fuentes` (una entrada por fuente
+declarada: `ruta`, `ok`, `error` — #75), `completa` (false = falta alguna
+fuente y el total es un piso, no una medición), `total` (con sus cuatro
 componentes intactos), `ponderado` (el mismo total pesado por `PESOS`),
 `por_modelo` (con `mensajes` y `ponderado` por modelo), `pico_5h` (total +
 inicio y fin de la ventana), `por_semana` (crudo, clave = inicio de semana en
