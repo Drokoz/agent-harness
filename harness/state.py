@@ -273,6 +273,51 @@ def motivos_de_abandono(eventos, repo, issue):
            if _es_de(e, repo, issue) and e.get("tipo") == "abandono"]
 
 
+def clave_mantenimiento(repo, pr):
+    """La clave de log del mantenedor de conflictos (#56): "repo#pr<N>".
+
+    Distinguible de la del ticket ("repo#<N>"): los reductores coinciden
+    la clave exacta, así que un abandono de mantenimiento no consume
+    peldaño de la escalera del ticket con el mismo número, ni un
+    abandono del ticket escala al mantenedor del PR (la misma lección
+    de #72: dos colas que comparten número no se contaminan)."""
+    return "{}#pr{}".format(repo, pr)
+
+
+def intentos_pr(eventos, repo, pr):
+    """Cuántas corridas de mantenimiento intentaron este PR (#56): un
+    `run_id` es una corrida, igual que `intentos` para tickets."""
+    clave = clave_mantenimiento(repo, pr)
+    runs = set()
+    for e in eventos:
+        if e.get("ticket") == clave:
+            runs.add(e.get("run_id") or _SIN_RUN)
+    return len(runs)
+
+
+def intentos_pr_que_escalan(eventos, repo, pr):
+    """Cuántos intentos de mantenimiento consumen peldaño de la escalera
+    (#56): la misma regla que `intentos_que_escalan` (los abandonos,
+    salvo los `infra`), con la clave del PR."""
+    clave = clave_mantenimiento(repo, pr)
+    clase_por_run = {}
+    for e in eventos:
+        if e.get("ticket") != clave or e.get("tipo") != "abandono":
+            continue
+        run = e.get("run_id") or _SIN_RUN
+        clase_por_run[run] = e.get("clase") or "modelo"
+    return sum(1 for clase in clase_por_run.values() if clase != "infra")
+
+
+def motivos_de_abandono_pr(eventos, repo, pr):
+    """Los motivos de cada abandono de mantenimiento del PR (#56), en el
+    orden del historial: lo que `Mantener.parkear` comenta al agotar la
+    escalera."""
+    clave = clave_mantenimiento(repo, pr)
+    return [str(e.get("cuerpo", "")) for e in eventos
+           if e.get("ticket") == clave and e.get("tipo") == "abandono"]
+
+
 def ultimo_gate_rojo(eventos, repo, issue):
     """La cola del gate rojo más reciente de este ticket (sin el prefijo
     "rojo:"), o None si no hubo ninguno: lo que el peldaño 2 de la escalera

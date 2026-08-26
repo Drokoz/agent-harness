@@ -191,25 +191,27 @@ def worktree_logs_dir(repo_path):
     return Path(repo_path).parent / ".worktrees" / "logs"
 
 
-def transcripcion_path(repo_path, issue, attempt):
-    """Un archivo por ticket e intento (#66): un intento nunca pisa el
+def transcripcion_path(repo_path, issue, attempt, tipo="ticket"):
+    """Un archivo por trabajo e intento (#66): un intento nunca pisa el
     archivo del anterior, ni el próximo intento destruye la evidencia de
-    este. El nombre lleva el repo porque dos repos pueden tener el mismo
-    número de issue."""
-    nombre = "{}-ticket-{}-intento-{}.log".format(
-        Path(repo_path).name, issue, attempt)
+    este. `tipo` es "ticket" (lo normal) o "pr" (el mantenedor de
+    conflictos, #56). El nombre lleva el repo porque dos repos pueden
+    tener el mismo número."""
+    nombre = "{}-{}-{}-intento-{}.log".format(
+        Path(repo_path).name, tipo, issue, attempt)
     return worktree_logs_dir(repo_path) / nombre
 
 
-def podar_transcripciones(dir, repo, issue, keep=TRANSCRIPCIONES_POR_TICKET):
-    """Sólo las `keep` transcripciones más recientes del ticket sobreviven
-    (#66); los tickets vecinos y los archivos que no son transcripciones
-    no se tocan. Devuelve los nombres borrados."""
+def podar_transcripciones(dir, repo, issue, keep=TRANSCRIPCIONES_POR_TICKET,
+                          tipo="ticket"):
+    """Sólo las `keep` transcripciones más recientes del trabajo
+    sobreviven (#66); los trabajos vecinos y los archivos que no son
+    transcripciones no se tocan. Devuelve los nombres borrados."""
     dir = Path(dir)
     if not dir.is_dir():
         return []
     patron = re.compile(
-        r"^{}-ticket-{}-intento-(\d+)\.log$".format(re.escape(str(repo)), issue))
+        r"^{}-{}-{}-intento-(\d+)\.log$".format(re.escape(str(repo)), tipo, issue))
     archivos = []
     for f in dir.iterdir():
         m = patron.match(f.name)
@@ -625,7 +627,17 @@ class DispatchSpec:
 
 class Dispatcher:
     """Lanza y cosecha la frontera. Todo el mundo entra por callables,
-    para que los tests no necesiten herdr ni git de verdad."""
+    para que los tests no necesiten herdr ni git de verdad.
+
+    El segundo tipo de job —el mantenedor de conflictos (#56)— hereda este
+    ciclo de vida y redefine sus costuras: el ref de las líneas (`_ref_de`),
+    el prompt (`_prompt`), el worktree (la rama ya existe), la baseline
+    previa (`_baseline`) y la condición de terminación (`_done`)."""
+
+    # El tipo de las líneas de principio y fin de la corrida en el log:
+    # "corrida" para la frontera de tickets; el mantenedor lo cambia a su
+    # propio tipo para que sea distinguible en el log (#56).
+    _tipo_corrida = "corrida"
 
     def __init__(self, spec, log, run_cmd, credits=None, dormir=None,
                  costo_real=None, salida_real=None):
@@ -650,10 +662,49 @@ class Dispatcher:
     def _log(self, job, tipo, ref, cuerpo, clase=None):
         """Evento de un job: además de lo fijo, el ticket ("repo#issue") y
         el intento global, para que el historial sepa qué se intentó y
-        cuántas veces."""
+        cuántas veces. El mantenedor redefine la clave a la del PR
+        ("repo#pr<N>", #56)."""
         self.log.write(tipo, ref, cuerpo,
                        ticket="{}#{}".format(job.repo, job.issue),
                        attempt=job.attempt, clase=clase)
+
+    # ----------------------------------------------- costuras por tipo de job
+    def _ref_de(self, job):
+        """El ref de las líneas del job: "ticket/N" para un ticket, "pr/N"
+        para el mantenedor de conflictos (#56)."""
+        return "ticket/{}".format(job.issue)
+
+    def _claves_costo(self, job):
+        """(repo, issue) con qué leer el costo medido de pi (#90)."""
+        return (job.repo, job.issue)
+
+    def _es_hecho(self, job):
+        """¿El job terminó bien? "hecho" para un ticket; el mantenedor
+        cuenta su "resuelto" como tal (#56)."""
+        return job.estado == "hecho"
+
+    def _nombre_agente(self, job):
+        return nombre_agente(job.repo, job.issue)
+
+    def _prompt(self, job):
+        return prompt_de(job.issue, job.gate_tail)
+
+    def _baseline(self, job, ref):
+        """Lo que el job debía preservar antes de despachar. El ticket no
+        trae baseline: la trae el mantenedor de conflictos (#56)."""
+        return True
+
+    def _done(self, job, ref):
+        """La condición de terminación del job, después del gate verde:
+        para un ticket, que el agente dejó un PR abierto sobre su rama; el
+        mantenedor la redefine a "PR mergeable y trabajo preservado" (#56)."""
+        self._pr_abierto(job, ref)
+
+    def _transcripcion_destino(self, job):
+        return transcripcion_path(job.repo_path, job.issue, job.attempt)
+
+    def _podar_transcripciones(self, dir, job):
+        return podar_transcripciones(dir, Path(job.repo_path).name, job.issue)
 
     # ----------------------------------------------------------- nivel corrida
     def dispatch(self, jobs):
@@ -661,7 +712,7 @@ class Dispatcher:
         medido con los creditos de antes y después, y las líneas de principio
         y fin. Devuelve los jobs con su estado final."""
         ref = "corrida"
-        self.log.write("corrida", ref,
+        self.log.write(self._tipo_corrida, ref,
                        "inicio: {} ticket(s), max {} en paralelo".format(
                            len(jobs), self.spec.max_parallel))
         antes = self.credits()
@@ -680,7 +731,7 @@ class Dispatcher:
             self.log.write("costo", ref,
                            "creditos antes {} / despues {} / delta ${:.4f}".format(
                                antes, despues, despues - antes))
-        hechas = [j for j in resultados if j.estado == "hecho"]
+        hechas = [j for j in resultados if self._es_hecho(j)]
         abandonadas = [j for j in resultados if j.estado == "abandonado"]
         # Un job que el router aplazó (#38) queda "pendiente": no gastó
         # peldaño, no es un abandono, y se cuenta aparte para no mentir en
@@ -692,14 +743,14 @@ class Dispatcher:
         if sin_medir:
             costo_txt += " ({} sin medir)".format(sin_medir)
         extra = ", {} aplazado(s) (router)".format(aplazadas) if aplazadas else ""
-        self.log.write("corrida", ref,
+        self.log.write(self._tipo_corrida, ref,
                        "fin: {} hecho(s), {} abandonado(s){}, costo de jobs {}".format(
                            len(hechas), len(abandonadas), extra, costo_txt))
         return resultados
 
     # ------------------------------------------------------------- un job
     def run_job(self, job):
-        ref = "ticket/{}".format(job.issue)
+        ref = self._ref_de(job)
         permitido, motivo = self._permitir_claude(job)
         if not permitido:
             # No se gasta el peldaño: el job queda "pendiente" (no
@@ -717,7 +768,9 @@ class Dispatcher:
                                     job.model or self.spec.model,
                                     job.extra_args))
         try:
-            if not self._worktree_ok(job, ref):
+            if not self._baseline(job, ref):
+                pass  # ya se abandono con su motivo
+            elif not self._worktree_ok(job, ref):
                 pass  # ya se abandono con su motivo
             elif not self._pane(job, ref):
                 pass  # ya se abandono con su motivo
@@ -736,7 +789,7 @@ class Dispatcher:
             elif not self._gate_verde(job, ref):
                 pass  # ya se abandono con su motivo
             else:
-                self._pr_abierto(job, ref)
+                self._done(job, ref)
         finally:
             self._limpiar(job, ref)
         return job
@@ -908,7 +961,7 @@ class Dispatcher:
         return False
 
     def _agente(self, job, ref):
-        job.agent = nombre_agente(job.repo, job.issue)
+        job.agent = self._nombre_agente(job)
         # El peldaño de la escalera (#38) resuelve kind/modelo por ticket;
         # sin peldaño asignado (job.kind == ""), se usa el de la corrida
         # entera -- el comportamiento de antes de la escalera.
@@ -948,7 +1001,7 @@ class Dispatcher:
         éxito igual. La evidencia de que llego es que el contexto del agente
         sube de 0%; si no, se reintenta. Un trabajo que nunca arranco no puede
         contarse como lanzado."""
-        prompt = prompt_de(job.issue, job.gate_tail)
+        prompt = self._prompt(job)
         for intento in range(1, self.spec.verify_retries + 1):
             # `--wait --until working` es lo que hace que herdr entregue el
             # prompt y confirme que llegó. Sin `--wait`, `--timeout` es un
@@ -1403,7 +1456,7 @@ class Dispatcher:
         """
         if not (job.agent or job.pane):
             return
-        destino = transcripcion_path(job.repo_path, job.issue, job.attempt)
+        destino = self._transcripcion_destino(job)
         ok, out = ((False, "") if not job.agent
                    else self.run_cmd(["herdr", "agent", "read", job.agent,
                                       "--source", "recent", "--lines", "200"],
@@ -1425,8 +1478,7 @@ class Dispatcher:
             self._log(job, "transcripcion", ref,
                       "no se pudo escribir " + str(destino))
             return
-        podar_transcripciones(destino.parent, Path(job.repo_path).name,
-                              job.issue)
+        self._podar_transcripciones(destino.parent, job)
         self._log(job, "transcripcion", ref, str(destino))
 
     def _wip_abandono(self, job, ref):
@@ -1498,7 +1550,7 @@ class Dispatcher:
                 continue
             j.costo = c
             medidos.append(j)
-            self._log(j, "costo", "ticket/{}".format(j.issue),
+            self._log(j, "costo", self._ref_de(j),
                       "${:.4f} (sesion de pi)".format(c))
 
         # 2) El resto se reparte lo que sobra del delta. La resta puede dar
@@ -1509,7 +1561,7 @@ class Dispatcher:
             return
         if antes is None or despues is None:
             for j in resto:
-                self._log(j, "costo", "ticket/{}".format(j.issue), "desconocido")
+                self._log(j, "costo", self._ref_de(j), "desconocido")
             return
         sobra = max(0.0, (despues - antes) - sum(j.costo for j in medidos))
         share = sobra / len(resto)
@@ -1517,7 +1569,7 @@ class Dispatcher:
             j.costo = share
             # "estimado" no es decorativo (#65): un promedio y una medición no
             # pueden leerse igual, porque el router decide con la diferencia.
-            self._log(j, "costo", "ticket/{}".format(j.issue),
+            self._log(j, "costo", self._ref_de(j),
                       "${:.4f} (estimado: reparto del delta)".format(share))
 
     def _costo_de_pi(self, job, desde):
@@ -1526,7 +1578,8 @@ class Dispatcher:
         if not self.costo_real:
             return None
         try:
-            return self.costo_real(job.repo, job.issue, desde)
+            repo, issue = self._claves_costo(job)
+            return self.costo_real(repo, issue, desde)
         except Exception:
             return None
 

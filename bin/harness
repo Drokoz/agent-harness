@@ -52,6 +52,13 @@
                                     la frontera se recalcula entre pasadas
     harness run --loop --freno F    archivo que, si aparece, frena el bucle
 
+    harness maintain                el mantenedor de conflictos (#56): recorre
+                                    los PRs abiertos, y los que no son mergeables
+                                    los resuelve en un worktree aislado, con el
+                                    prompt de resolver (no de implementar). Corre
+                                    antes que los tickets nuevos: `harness run`
+                                    lo procesa primero, y acá solo, da igual
+
 v0 deliberadamente chico: NO es una app, es un script que imprime. La idea es vivir
 con él dos semanas y recién ahí especificar el dashboard de verdad, con datos de uso
 en vez de suposiciones. Ver ../PLAN.md §"centralizar" y §11 para `run`.
@@ -99,13 +106,17 @@ from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa
 from harness.dispatch import (BucleSpec, DispatchSpec, Dispatcher, EventLog,  # noqa: E402
                               Job, Pasada, bucle, cosechar, decidir_tanda,
                               peldano_de)
+from harness.maintain import (CONFLICTING, MantenJob, Mantener,  # noqa: E402
+                              mergeable_de)
 from harness.render import linea_evento, render  # noqa: E402
 from harness.quota import (agregar, as_dict as quota_as_dict, cuota_por_ventana,  # noqa: E402
                            fuentes_desde_spec, leer_fuentes, puntos_de_ticket,
                            render_quota, resumen_evento, semana_de)
 from harness.snapshot import as_dict, snapshot  # noqa: E402
-from harness.state import (costo_promedio, intentos, intentos_que_escalan,  # noqa: E402
-                           motivos_de_abandono, pasos, ultimo_gate_rojo)
+from harness.state import (costo_promedio, intentos, intentos_pr,  # noqa: E402
+                           intentos_pr_que_escalan, intentos_que_escalan,
+                           motivos_de_abandono, motivos_de_abandono_pr,
+                           pasos, ultimo_gate_rojo)
 from harness.summary import (PrAbierto, Resumen, con_cuota, construir,  # noqa: E402
                              filtrar, guardar_marca, as_dict as resumen_as_dict,
                              leer_eventos, leer_marca, parse_fecha)
@@ -135,9 +146,11 @@ def build_parser():
                                     "qué, y el total se marca como piso (≥)."),
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", nargs="?", default="status",
-                   choices=["status", "decisions", "run", "report", "quota"],
+                   choices=["status", "decisions", "run", "maintain", "report",
+                            "quota"],
                    help="status (la pantalla), decisions (las decisiones), "
-                        "run (el dispatcher de la frontera) o "
+                        "run (el dispatcher de la frontera), "
+                        "maintain (el mantenedor de conflictos, #56) o "
                         "quota (la cuota de Claude por sesiones locales)")
     p.add_argument("--context", metavar="NOMBRE",
                    help="un contexto en vez del de por defecto")
@@ -232,6 +245,8 @@ def main(argv=None):
                              "separados por coma (p.ej. 38,47)\n")
             return 2
         return run_main(args, contexts, solo)
+    if args.command == "maintain":
+        return maintain_main(args, contexts)
 
     raw = collect(contexts, offline=OFFLINE)
     quota_registros, quota_agg = None, None
@@ -472,6 +487,57 @@ def _creditos_restantes():
         return None
 
 
+def _jobs_mantenimiento(crudo, eventos_previos, spec, log, credits,
+                        costo_real, salida_real):
+    """Los PRs abiertos del contexto que no son mergeables, en el peldaño
+    de la escalera que le toca a cada uno (#56): `runner:cheap` con
+    escalada, igual que los tickets, leyendo el historial del log. Un
+    repo sin gate no se mantiene: sin gate no hay forma de verificar la
+    rama resuelta. Devuelve (mantenedor, jobs, parkeados)."""
+    main_t = Mantener(spec, log, run_cmd=adapters.run, credits=credits,
+                      costo_real=costo_real, salida_real=salida_real)
+    jobs, parkeados = [], 0
+    for r in crudo["contexts"][0]["repos"]:
+        if not r.get("slug") or not r.get("exists", {}).get("gate"):
+            continue
+        for pr in r.get("prs") or []:
+            numero = pr.get("number")
+            branch = pr.get("headRefName") or ""
+            if numero is None or not branch:
+                continue
+            if mergeable_de(r["slug"], numero, adapters.run) != CONFLICTING:
+                continue
+            escalados = intentos_pr_que_escalan(eventos_previos, r["name"], numero)
+            peldano = peldano_de(escalados)
+            job = MantenJob(repo=r["name"], repo_path=r.get("path", ""),
+                            slug=r["slug"], pr=numero, branch=branch,
+                            base=r.get("default_branch") or "main",
+                            attempt=intentos_pr(eventos_previos, r["name"],
+                                                numero) + 1)
+            if peldano is None:
+                # Escalera agotada: se anota para humano sin worktree ni
+                # pane -- no hay peldaño que correr.
+                main_t.parkear(job, "pr/{}".format(numero),
+                               motivos_de_abandono_pr(eventos_previos,
+                                                      r["name"], numero))
+                parkeados += 1
+                continue
+            job.kind = peldano["kind"]
+            job.model = peldano["model"]
+            job.extra_args = tuple(peldano["extra_args"])
+            jobs.append(job)
+    return main_t, jobs, parkeados
+
+
+def _imprimir_mantenimiento(resultados):
+    for j in resultados:
+        estado = "OK       " if j.estado == "resuelto" else "ABANDONADO"
+        detalle = (j.motivo if j.estado != "resuelto"
+                   else "PR mergeable (gate verde)")
+        sys.stdout.write("  {} PR #{}/{} {}\n".format(estado, j.pr, j.repo,
+                                                      detalle))
+
+
 def run_main(args, contexts, solo=None):
     """`harness run`: la frontera desbloqueada, en worktrees y panes aislados,
     con tope de paralelismo, todo anotado en el log JSONL de eventos.
@@ -514,6 +580,19 @@ def run_main(args, contexts, solo=None):
                           credits=_creditos_usado
                           if ctx.budget.provider == "openrouter" else None,
                           costo_real=costo_de_pi, salida_real=salida_de_pi)
+        # El mantenimiento va primero (#56): con PRs no mergeables la pila
+        # se pudre sola si la flota sigue abriendo más sobre la misma
+        # base. Mismo peldaño, mismo log, misma cola de prioridad.
+        main_t, mant_jobs, mant_parkeados = _jobs_mantenimiento(
+            crudo, eventos_previos, spec, log,
+            credits=_creditos_usado
+            if ctx.budget.provider == "openrouter" else None,
+            costo_real=costo_de_pi, salida_real=salida_de_pi)
+        if mant_jobs:
+            _imprimir_mantenimiento(main_t.dispatch(mant_jobs))
+        if mant_parkeados:
+            sys.stdout.write("  ({} PR(s) parkeado(s): escalera agotada, "
+                             "anotado para humano)\n".format(mant_parkeados))
         jobs, parkeados = [], 0
         candidatos = []
         for r in snap.contexts[0].repos:
@@ -736,6 +815,49 @@ def _run_loop(args, contexts, log_path):
     corte = bucle(ejecutar, spec, EventLog(log_path, nombre),
                   creditos=creditos, freno=args.freno or None)
     sys.stdout.write("harness: bucle: corte: {}\n".format(corte))
+    return 0
+
+
+def maintain_main(args, contexts):
+    """`harness maintain`: la cola de mantenimiento sola (#56). Los PRs
+    abiertos que no son mergeables corren en un worktree aislado por PR,
+    con el prompt de resolver y la escalera de reintentos. No toca la
+    frontera de tickets: eso sigue siendo de `run`."""
+    log_path = (Path(args.log).expanduser() if args.log
+                else _estado_dir() / "harness" / "events.jsonl")
+    for ctx in contexts:
+        # Un contexto manual no delega: este comando no toma nada solo.
+        if ctx.autonomy == "manual":
+            sys.stdout.write('harness: contexto "{}": autonomía manual, '
+                             'este comando no toma nada solo\n'.format(ctx.name))
+            continue
+        if OFFLINE or os.environ.get("HERDR_ENV") != "1":
+            sys.stderr.write("harness: maintain necesita adaptadores y una "
+                             "sesión de herdr (sin HARNESS_OFFLINE, con "
+                             "HERDR_ENV=1)\n")
+            return 2
+        eventos_previos = leer_eventos(log_path)
+        log = EventLog(log_path, ctx.name)
+        crudo = collect([ctx])
+        crudo["eventos"] = eventos_previos
+        spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
+                            kind=args.kind, model=args.model)
+        costo_de_pi, salida_de_pi = _sesiones_de_pi()
+        main_t, jobs, parkeados = _jobs_mantenimiento(
+            crudo, eventos_previos, spec, log,
+            credits=_creditos_usado
+            if ctx.budget.provider == "openrouter" else None,
+            costo_real=costo_de_pi, salida_real=salida_de_pi)
+        if not jobs and not parkeados:
+            sys.stdout.write('harness: "{}": nada que mantener (todos los '
+                             'PRs abiertos son mergeables)\n'.format(ctx.name))
+            continue
+        if jobs:
+            _imprimir_mantenimiento(main_t.dispatch(jobs))
+        if parkeados:
+            sys.stdout.write("  ({} PR(s) parkeado(s): escalera agotada, "
+                             "anotado para humano)\n".format(parkeados))
+        sys.stdout.write("harness: log de eventos {}\n".format(log.path))
     return 0
 
 
