@@ -310,6 +310,85 @@ def _ahora():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# --------------------------------------------------------------------- tanda
+# Los runners que corren contra la cuota de Claude, no contra la key de
+# OpenRouter: para ellos el tope por presupuesto no existe (#68).
+RUNNERS_SIN_CREDITOS = ("claude",)
+
+
+def decidir_tanda(candidatos, creditos, costo_promedio, margen,
+                  max_tickets=None, presupuesto=True):
+    """Qué tickets de la tanda entran y cuáles se quedan fuera (#68).
+
+    `candidatos` (Jobs, en el orden de la frontera), `creditos` (lo que
+    queda en la key, float | None — None es "no se pudo leer"),
+    `costo_promedio` (`state.costo_promedio`, float | None) y `margen`
+    (el colchón en dólares: no se arranca un ticket si lo que queda no
+    cubre el costo medio más el margen). `max_tickets` acota la tanda a
+    mano sin tocar etiquetas. `presupuesto` (True por defecto) corta el
+    tope por plata del todo: un contexto que no mide créditos de
+    OpenRouter no se dimensiona con plata, y el llamador se lo dice — el
+    tope manual `max_tickets` sigue aplicando.
+
+    Devuelve una decisión por candidato, en orden: `{"job", "despachar",
+    "motivo"}`. `motivo` es "" en los que entran, y en los que se quedan
+    fuera es la razón, para anotar en el log en vez de omitirlos en
+    silencio: una tanda que dejó cosas afuera lo dice.
+
+    Reglas, en el orden que se evalúan:
+
+    - Un runner que no gasta créditos (`claude`) nunca cae por
+      presupuesto: corre contra cuota, no contra la key, y el motivo lo
+      dice aunque todo lo demás quede afuera.
+    - Sin costo medio no hay con qué dimensionar: no se dispara nada
+      (conservador) y se anota el porqué. Sin crédito leído tampoco: no
+      se puede prometer plata que no se puede medir. Ambas cosas quedan
+      anotadas, no en silencio.
+    - Cada arranque gasta el costo medio (la estimación que se tiene) y
+      exige dejar el margen por delante. El crédito no se relee entre
+      candidatos: la decisión se toma una vez, con el crédito de ahora.
+    - `max_tickets` acota la tanda; si un candidato cae por ambos topes,
+      los dos motivos quedan en la razón.
+
+    Puro: sin créditos ni historial inyectados no hay nada que decida.
+    """
+    decisiones = []
+    restante = creditos
+    despachados = 0
+    for j in candidatos:
+        es_claude = (j.kind or "") in RUNNERS_SIN_CREDITOS
+        razones = []
+        if not es_claude and presupuesto:
+            if costo_promedio is None:
+                razones.append("costo medio sin historial: sin dimensionar "
+                               "no se arranca nada")
+            elif creditos is None:
+                razones.append("creditos desconocidos: sin medirlos no se "
+                               "puede prometer nada")
+            elif restante < costo_promedio + margen:
+                razones.append("presupuesto: quedan ${:.4f} y se exigen "
+                               "${:.4f} (costo medio ${:.4f} + margen "
+                               "${:.4f})".format(restante, costo_promedio +
+                               margen, costo_promedio, margen))
+        if (max_tickets is not None and despachados >= max_tickets):
+            # Se evalúa igual que el presupuesto haya fallado: un candidato
+            # que cae por los dos topes se anota con los dos motivos.
+            razones.append("max-tickets {}".format(max_tickets))
+        despachar = not razones
+        if despachar:
+            despachados += 1
+            if not es_claude and presupuesto and costo_promedio is not None:
+                restante -= costo_promedio
+        if es_claude and despachar:
+            # Los que corren contra cuota no gastan del presupuesto, y se
+            # dice: no caen por él, punto.
+            motivo = "no gasta creditos"
+        else:
+            motivo = "; ".join(razones)
+        decisiones.append({"job": j, "despachar": despachar, "motivo": motivo})
+    return decisiones
+
+
 def _json_field(texto, claves):
     """`texto["a"]["b"]...` sin excepción: None si el JSON no coopera."""
     try:

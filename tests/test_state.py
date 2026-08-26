@@ -529,7 +529,9 @@ class TestCostoPromedio(unittest.TestCase):
                   run_id="r2"),
                ev("costo", "ticket/9", "$0.4000", "2026-08-22T13:00:00Z",
                   run_id="r1", ticket="koku#9")]
-        self.assertAlmostEqual(state.costo_promedio(evs), 0.4)
+        # koku#7 acumuló 0.60 en dos intentos; koku#9 gastó 0.40: el
+        # promedio es (0.60 + 0.40) / 2, no (0.20 + 0.40 + 0.40) / 3
+        self.assertAlmostEqual(state.costo_promedio(evs), 0.5)
 
     def test_un_ticket_que_no_gasto_no_diluye_el_promedio(self):
         # cero = nunca prendió agente: diluir el promedio con ceros haría
