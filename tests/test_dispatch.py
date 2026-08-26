@@ -742,6 +742,65 @@ class TestCosecha(unittest.TestCase):
         self.assertEqual(cerrados, [])
         self.assertEqual(m.llamo("gh", "issue", "close"), [])
 
+    def test_cierra_lo_que_el_cuerpo_dice_y_la_api_no_vinculo(self):
+        """#30: `closingIssuesReferences` vacío pero `Closes #7` en el cuerpo."""
+        with tempfile.TemporaryDirectory() as tmp:
+            m = Mundo()
+            m.prs = [{"number": 30, "headRefName": "ticket/7",
+                      "body": "Refactor y cierra el todo: Closes #7",
+                      "closingIssuesReferences": []}]
+            m.responder(lambda a: a[:3] == ["gh", "issue", "view"],
+                        (True, '{"state":"OPEN"}'))
+            log = log_en(tmp)
+            cerrados = cosechar("Drokoz/koku", m.cmd, log)
+            self.assertEqual(cerrados, [7])
+            self.assertEqual(len(m.llamo("gh", "issue", "close", "7")), 1)
+            lineas = [json.loads(l) for l in log.path.read_text().splitlines()]
+            self.assertEqual(lineas[0]["tipo"], "issue-cerrado")
+            self.assertIn("no registro el vinculo", lineas[0]["cuerpo"])
+
+    def test_no_cierra_referencias_cruez_a_otros_repos(self):
+        """#30: `Closes owner/otro-repo#7` no se cierra sola."""
+        m = Mundo()
+        m.prs = [{"number": 30, "headRefName": "ticket/7",
+                  "body": "Closes owner/otro-repo#7",
+                  "closingIssuesReferences": []}]
+        m.responder(lambda a: a[:3] == ["gh", "issue", "view"],
+                    (True, '{"state":"OPEN"}'))
+        with tempfile.TemporaryDirectory() as tmp:
+            cerrados = cosechar("Drokoz/koku", m.cmd, log_en(tmp))
+        self.assertEqual(cerrados, [])
+        self.assertEqual(m.llamo("gh", "issue", "view"), [])
+        self.assertEqual(m.llamo("gh", "issue", "close"), [])
+
+    def test_el_issue_cerrado_citado_en_el_cuerpo_no_se_toca(self):
+        m = Mundo()
+        m.prs = [{"number": 30, "headRefName": "ticket/7",
+                  "body": "Closes #7",
+                  "closingIssuesReferences": []}]
+        m.responder(lambda a: a[:3] == ["gh", "issue", "view"],
+                    (True, '{"state":"CLOSED"}'))
+        with tempfile.TemporaryDirectory() as tmp:
+            cerrados = cosechar("Drokoz/koku", m.cmd, log_en(tmp))
+        self.assertEqual(cerrados, [])
+        self.assertEqual(m.llamo("gh", "issue", "close"), [])
+
+    def test_el_vinculo_de_la_api_se_anota_como_su_propio_caso(self):
+        """Si la API sí vinculó, el cierre no se anota como fallo de vínculo."""
+        with tempfile.TemporaryDirectory() as tmp:
+            m = Mundo()
+            m.prs = [{"number": 30, "headRefName": "ticket/7",
+                      "body": "Closes #7",
+                      "closingIssuesReferences": [{"number": 7}]}]
+            m.responder(lambda a: a[:3] == ["gh", "issue", "view"],
+                        (True, '{"state":"OPEN"}'))
+            log = log_en(tmp)
+            cerrados = cosechar("Drokoz/koku", m.cmd, log)
+            self.assertEqual(cerrados, [7])
+            self.assertEqual(len(m.llamo("gh", "issue", "close", "7")), 1)
+            lineas = [json.loads(l) for l in log.path.read_text().splitlines()]
+            self.assertNotIn("no registro el vinculo", lineas[0]["cuerpo"])
+
 
 class TestSnapshotPath(unittest.TestCase):
     def test_el_repo_lleva_su_path(self):

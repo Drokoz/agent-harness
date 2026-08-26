@@ -1325,14 +1325,40 @@ class Dispatcher:
 
 
 # ---------------------------------------------------------------- cosecha
+# Los keywords que la API de GitHub reconoce para cerrar issues. Una
+# referencia cruzada (`owner/otro-repo#N`) no cierra nada de este repo (#30).
+_CLOSES_KEYWORDS = re.compile(
+    r"\b(?:Closes|Fixes|Resolves)\s+([#\w./-]+)", re.IGNORECASE)
+
+
+def _closes_en_cuerpo(cuerpo):
+    """Números de issue que el cuerpo del PR promete cerrar con
+    `Closes|Fixes|Resolves #N`. Las referencias cruzadas a otro repo
+    (`owner/otro-repo#N`) se descartan: no se cierran solas."""
+    nums = []
+    for token in _CLOSES_KEYWORDS.findall(cuerpo or ""):
+        m = re.fullmatch(r"#(\d+)", token)
+        if m:
+            n = int(m.group(1))
+            if n not in nums:
+                nums.append(n)
+    return nums
+
+
 def cosechar(slug, run_cmd, log, limit=20):
     """Después de mergear, el issue tiene que quedar cerrado: los agentes
     escriben "Closes #N" de forma inconsistente, y un issue que sigue abierto
     vuelve a la frontera y se re-trabaja para siempre. Cierra, por cada PR
-    merged reciente, los issues que cerró y que siguen abiertos."""
+    merged reciente, los issues que cerró y que siguen abiertos.
+
+    Lee además el **cuerpo** del PR (#30): la API no siempre registra el
+    vínculo aunque la palabra clave esté escrita, y un PR puede mergearse
+    con `Closes #N` y `closingIssuesReferences` vacío. Lo que se cierra por
+    esa vía se anota distinto en el log: el vínculo de GitHub falló, y
+    saberlo importa. Idempotente: lo que ya está cerrado no se toca."""
     cerrados = []
     ok, out = run_cmd(["gh", "pr", "list", "--state", "merged", "--limit", str(limit),
-                       "--json", "number,headRefName,closingIssuesReferences",
+                       "--json", "number,headRefName,body,closingIssuesReferences",
                        "-R", slug])
     if not ok or not out:
         return cerrados
@@ -1341,17 +1367,26 @@ def cosechar(slug, run_cmd, log, limit=20):
     except ValueError:
         return cerrados
     for pr in prs:
-        for iss in pr.get("closingIssuesReferences") or []:
-            num = iss.get("number")
-            if num is None:
-                continue
+        por_api = [iss.get("number") for iss in pr.get("closingIssuesReferences") or []
+                   if iss.get("number") is not None]
+        # Solo lo que la API no vinculó: un número que sí figura en
+        # closingIssuesReferences se anota como su propio caso, no como fallo.
+        por_cuerpo = [n for n in _closes_en_cuerpo(pr.get("body"))
+                      if n not in por_api]
+        candidatos = [(n, False) for n in por_api] + [(n, True) for n in por_cuerpo]
+        for num, por_cuerpo_ref in candidatos:
             ok2, state = run_cmd(["gh", "issue", "view", str(num), "--json", "state",
                                   "-R", slug])
             if ok2 and '"OPEN"' in state:
                 ok3, _ = run_cmd(["gh", "issue", "close", str(num), "-R", slug])
                 if ok3:
                     cerrados.append(num)
-                    log.write("issue-cerrado", "#{}".format(num),
-                              "PR #{} merged pero el issue seguia abierto".format(
-                                  pr.get("number")))
+                    if por_cuerpo_ref:
+                        cuerpo = ("PR #{} merged; `Closes #{}` en el cuerpo pero "
+                                  "la API no registro el vinculo".format(
+                                      pr.get("number"), num))
+                    else:
+                        cuerpo = ("PR #{} merged pero el issue seguia abierto".format(
+                            pr.get("number")))
+                    log.write("issue-cerrado", "#{}".format(num), cuerpo)
     return cerrados
