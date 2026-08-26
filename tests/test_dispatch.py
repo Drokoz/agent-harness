@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 import support
-from harness import dispatch, state
+from harness import adapters, dispatch, state
 from harness.dispatch import (ESCALERA, DispatchSpec, Dispatcher, EventLog, Job,
                               cosechar, nombre_agente, peldano_de, prompt_de,
                               una_linea, worktree_path)
@@ -43,7 +43,7 @@ class Mundo:
 
     def __init__(self, pane_out=PANE_ARRANCO, wait_out=None, gate=(True, "VERDE"),
                  prs=None, credits=(None, None), head_oid="a" * 40,
-                 pr_head_oid=None, pr_files=None):
+                 pr_head_oid=None, pr_files=None, origin_oid=None):
         self.pane_out = pane_out
         self.wait_out = wait_out or '{"result":{"agent":{"agent_status":"idle"}}}'
         self.gate = gate
@@ -51,6 +51,9 @@ class Mundo:
             {"number": 31, "headRefName": "ticket/7"}]
         self.creditos = list(credits)
         self.head_oid = head_oid
+        # Dónde está origin/<rama por defecto> tras el fetch (#85); sin
+        # definir, en el mismo lugar que el HEAD local.
+        self.origin_oid = origin_oid if origin_oid is not None else head_oid
         self.pr_head_oid = pr_head_oid if pr_head_oid is not None else head_oid
         self.pr_files = pr_files if pr_files is not None else [
             "harness/dispatch.py", "tests/test_dispatch.py"]
@@ -88,6 +91,8 @@ class Mundo:
             if "rev-parse" in args:
                 if args[-1] == "HEAD":
                     return (True, self.head_oid + "\n")
+                if args[-1].startswith("origin/"):
+                    return (True, self.origin_oid + "\n")
                 return (False, "")  # la rama no existe todavía: -b
             return (True, "")
         if a == "herdr":
@@ -1816,6 +1821,171 @@ class TestReintentoSobreBase(unittest.TestCase):
         self.rebase_conflicto(m)
         despachar(m, [job()])
         self.assertEqual(len(self.rebases(m)), 1)
+
+
+class TestBaseUnica(unittest.TestCase):
+    """#85: el dispatcher usaba dos bases distintas (rama nueva desde el
+    HEAD del checkout principal, rama reutilizada rebasada sobre
+    origin/main) y nunca hacía fetch, así que origin/main podía estar
+    viejo. Una sola definición de base —la rama por defecto del remote,
+    tras el fetch único de la corrida— la usan las tres cosas: crear la
+    rama nueva, rebasar la reutilizada y contar commits."""
+
+    ORIGEN = "d" * 40
+
+    def mundo(self, rama_existente=False, **kw):
+        m = Mundo(origin_oid=self.ORIGEN, **kw)
+        if rama_existente:
+            m.responder(
+                lambda a: a[0] == "git" and "rev-parse" in a
+                and "refs/heads/ticket/7" in a,
+                (True, "b" * 40 + "\n"))
+        return m
+
+    def fetches(self, m):
+        return m.llamo("git", "fetch", "origin", "main")
+
+    def test_fetch_de_la_rama_por_defecto_antes_de_cualquier_worktree(self):
+        m = self.mundo()
+        despachar(m, [job()])
+        self.assertEqual(len(self.fetches(m)), 1)
+        i_fetch = next(i for i, c in enumerate(m.llamadas)
+                       if "fetch" in c[0])
+        i_wt = next(i for i, c in enumerate(m.llamadas)
+                    if "worktree" in c[0] and "add" in c[0])
+        self.assertLess(i_fetch, i_wt, "el fetch va antes de calcular la base")
+
+    def test_fetch_uno_por_corrida_no_por_ticket(self):
+        m = self.mundo()
+        despachar(m, [job(7), job(8)])
+        self.assertEqual(len(self.fetches(m)), 1)
+
+    def test_fetch_uno_por_repo(self):
+        m = self.mundo()
+        despachar(m, [job(7, path="/repos/koku"),
+                      job(7, repo="koku-api", path="/repos/koku-api")])
+        self.assertEqual(len(self.fetches(m)), 2)
+
+    def test_fetch_que_falla_no_voltea_la_corrida(self):
+        m = self.mundo()
+        m.responder(
+            lambda a: a[0] == "git" and "fetch" in a,
+            (False, "fatal: unable to access "
+                    "'https://github.com/Drokoz/koku/': Failed to connect"))
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "hecho")
+        avisos = [l for l in lineas if l["tipo"] == "fetch"
+                  and "vieja" in l["cuerpo"]]
+        self.assertEqual(len(avisos), 1,
+                         "queda anotado que la base puede estar vieja")
+
+    def test_rama_nueva_nace_sobre_la_base_remota(self):
+        m = self.mundo()
+        despachar(m, [job()])
+        (add,) = m.llamo("git", "worktree", "add")
+        self.assertIn("origin/main", add[0])
+
+    def test_rama_reutilizada_y_contador_usan_la_base_remota(self):
+        m = self.mundo(rama_existente=True)
+        m.head_oid = "c" * 40  # el tip que deja el rebase
+        despachar(m, [job()])
+        rebases = [c for c in m.llamo("git", "rebase") if "--abort" not in c[0]]
+        self.assertEqual(len(rebases), 1)
+        self.assertEqual(rebases[0][0][-1], "origin/main")
+        (rev,) = m.llamo("git", "rev-list", "--count")
+        self.assertEqual(rev[0][-1], self.ORIGEN + "..HEAD",
+                         "contar commits mide contra la base, no contra el "
+                         "HEAD del checkout principal")
+
+    def test_la_base_efectiva_de_cada_job_queda_en_el_log_con_su_sha(self):
+        m = self.mundo()
+        _, lineas = despachar(m, [job(7), job(8)])
+        bases = [l for l in lineas if l["tipo"] == "base"
+                 and l["ref"].startswith("ticket/")]
+        self.assertEqual(len(bases), 2)
+        for l in bases:
+            self.assertIn("origin/main", l["cuerpo"])
+            self.assertIn(self.ORIGEN[:8], l["cuerpo"])
+
+
+class TestBaseConGitReal(unittest.TestCase):
+    """#85 con git de verdad: con la `main` local atrasada respecto de
+    `origin/main` —lo normal después de mergear PRs desde GitHub sin
+    hacer `git pull`—, rama nueva y rama reutilizada terminan sobre la
+    misma base."""
+
+    def _g(self, cwd, *args):
+        subprocess.run(["git", *args], cwd=cwd, check=True,
+                       capture_output=True, text=True)
+
+    def _sha(self, cwd, ref):
+        return subprocess.run(["git", "-C", str(cwd), "rev-parse", ref],
+                              check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def _repo(self, tmp):
+        """(checkout con main atrasada, sha real de origin/main)."""
+        origen = Path(tmp) / "origin.git"
+        origen.mkdir()
+        self._g(origen, "init", "--bare")
+        local = Path(tmp) / "koku"
+        local.mkdir()
+        self._g(local, "init", "-b", "main")
+        self._g(local, "config", "user.email", "t@e.com")
+        self._g(local, "config", "user.name", "T")
+        self._g(local, "remote", "add", "origin", str(origen))
+        (local / "f.txt").write_text("1\n")
+        self._g(local, "add", ".")
+        self._g(local, "commit", "-m", "c1")
+        self._g(local, "push", "-u", "origin", "main")
+        self._g(local, "remote", "set-head", "origin", "main")
+        # origin/main avanza y la main local queda atrás: el caso que
+        # antes dejaba los dos caminos sobre bases distintas.
+        avance = Path(tmp) / "avance"
+        subprocess.run(["git", "clone", str(origen), str(avance)],
+                       check=True, capture_output=True, text=True)
+        (avance / "f.txt").write_text("2\n")
+        self._g(avance, "add", ".")
+        self._g(avance, "commit", "-m", "c2")
+        self._g(avance, "push", "origin", "main")
+        return str(local), self._sha(avance, "HEAD")
+
+    def test_nueva_y_reutilizada_terminan_sobre_la_misma_base(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, sha_origen = self._repo(tmp)
+            # La reutilizada es de un intento anterior: nació sobre la
+            # base vieja (la main local que quedó atrás) y tiene un
+            # commit de trabajo.
+            self._g(Path(repo), "branch", "ticket/8", "main")
+            wt8 = Path(tmp) / "w8"
+            self._g(Path(repo), "worktree", "add", str(wt8), "ticket/8")
+            (wt8 / "g.txt").write_text("trabajo\n")
+            self._g(wt8, "add", ".")
+            self._g(wt8, "commit", "-m", "intento anterior")
+            self._g(Path(repo), "worktree", "remove", "--force", str(wt8))
+            with tempfile.TemporaryDirectory() as tmp2:
+                log = log_en(tmp2)
+                d = Dispatcher(spec(), log, adapters.run,
+                               dormir=lambda s: None)
+                j7 = job(issue=7, path=repo)
+                j8 = job(issue=8, path=repo)
+                d._fetch_base([j7, j8])
+                self.assertTrue(d._worktree(j7, "ticket/7"))
+                self.assertTrue(d._worktree(j8, "ticket/8"))
+                self.assertEqual(self._sha(j7.worktree, "HEAD"), sha_origen,
+                                 "rama nueva sobre la base")
+                self.assertEqual(self._sha(j8.worktree, "HEAD^"), sha_origen,
+                                 "rama reutilizada rebasada sobre la misma base")
+                self.assertTrue(d._rama_con_commits(j8, "ticket/8"))
+                # Cero commits contra la base = cero, medido contra la
+                # misma base que usaron las otras dos.
+                self.assertFalse(d._rama_con_commits(j7, "ticket/7"))
+                lineas = [json.loads(l) for l in
+                          log.path.read_text().splitlines()]
+                bases = [l for l in lineas if l["tipo"] == "base"]
+                self.assertEqual(len(bases), 2)
+                for l in bases:
+                    self.assertIn(sha_origen[:8], l["cuerpo"])
 
 
 class TestElAbandonoDejaPistas(unittest.TestCase):
