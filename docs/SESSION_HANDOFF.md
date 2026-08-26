@@ -16,7 +16,7 @@ pendiente.
 | Lo que falta | issues abiertos, etiqueta `ready-for-agent` |
 | El gate | `./scripts/gate.sh` — única fuente de verdad de "esto mergea" |
 | El estado en vivo | `harness status --context harness` |
-| El bucle de la noche | `./scripts/noche.sh` (con `caffeinate -imsu`) |
+| El bucle de la noche | `harness run --loop` (con `caffeinate -imsu`) |
 | El guard del agente | `extensions/harness-guard/` — copiado a `~/.pi/agent/extensions/` |
 
 ---

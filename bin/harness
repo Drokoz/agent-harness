@@ -46,6 +46,11 @@
     harness run --log PATH          dónde va el log JSONL de eventos
     harness run -q                  sin la salida en vivo de eventos (#81):
                                     el log JSONL y el listado final no cambian
+    harness run --loop              el bucle de la noche (#88): repite la
+                                    pasada hasta que corta el piso de
+                                    créditos, el tope de pasadas o el freno;
+                                    la frontera se recalcula entre pasadas
+    harness run --loop --freno F    archivo que, si aparece, frena el bucle
 
 v0 deliberadamente chico: NO es una app, es un script que imprime. La idea es vivir
 con él dos semanas y recién ahí especificar el dashboard de verdad, con datos de uso
@@ -91,8 +96,9 @@ from harness.adapters import (adr_files, collect, load_config, openrouter_credit
 from harness.config import ConfigError  # noqa: E402
 from harness import costo_pi  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
-from harness.dispatch import (DispatchSpec, Dispatcher, EventLog, Job, cosechar,  # noqa: E402
-                              decidir_tanda, peldano_de)
+from harness.dispatch import (BucleSpec, DispatchSpec, Dispatcher, EventLog,  # noqa: E402
+                              Job, Pasada, bucle, cosechar, decidir_tanda,
+                              peldano_de)
 from harness.render import linea_evento, render  # noqa: E402
 from harness.quota import (agregar, as_dict as quota_as_dict, cuota_por_ventana,  # noqa: E402
                            fuentes_desde_spec, leer_fuentes, puntos_de_ticket,
@@ -167,6 +173,19 @@ def build_parser():
                    help="run: fallback de modelo nativo (opcional); ídem --kind")
     p.add_argument("--log", default="",
                    help="run: dónde va el log JSONL de eventos")
+    p.add_argument("--loop", action="store_true",
+                   help="run: repite la pasada hasta que corta algo (piso de "
+                        "créditos, tope de pasadas con trabajo, o el archivo "
+                        "de freno); la frontera se recalcula entre pasadas (#88)")
+    p.add_argument("--freno", default="",
+                   help="run --loop: archivo que, si aparece, frena el bucle; "
+                        "se atiende entre pasadas, nunca en medio de una")
+    p.add_argument("--piso", type=float, default=3.0,
+                   help="run --loop: no arranca otra pasada con menos de este "
+                        "crédito restante (US$, por defecto 3.00)")
+    p.add_argument("--max-pasadas", type=int, default=12, dest="max_pasadas",
+                   help="run --loop: tope duro de pasadas con trabajo "
+                        "(por defecto 12); nunca un bucle sin límite")
     p.add_argument("--projects", default="",
                    help="quota: carpeta(s) de sesiones separadas por coma "
                         "(por defecto ~/.claude/projects de este usuario, o la "
@@ -440,9 +459,12 @@ def _imprimir_evento(linea):
 
 
 def _creditos_restantes():
-    """Cuánto queda en la key de OpenRouter (#68): total menos usado.
-    None si no hay key o la API no contesta — la decisión de la tanda
-    (`dispatch.decidir_tanda`) sabe qué hacer con eso."""
+    """Cuánto queda en la key de OpenRouter: total menos usado.
+
+    Lo usan dos cosas: el tamaño de la tanda (#68), que no arranca un ticket
+    si lo que queda no cubre el costo medio más el margen, y el piso del
+    `--loop` (#88), que no arranca otra pasada por debajo de él. None = no se
+    puede medir; sin medir, el piso no corta (los demás cortes sí)."""
     data = openrouter_credits()
     try:
         return float(data["total_credits"]) - float(data["total_usage"])
@@ -451,14 +473,20 @@ def _creditos_restantes():
 
 
 def run_main(args, contexts, solo=None):
-    """`harness run`: la frontera desbloqueada, en worktrees y panes
-    aislados, con tope de paralelismo, todo anotado en el log JSONL de
-    eventos. El tamaño de la tanda lo decide el presupuesto (#68): costo
-    medio del historial + margen contra los créditos que quedan, más los
-    topes manuales `--max-tickets`/`--only`; lo que se queda fuera se
-    anota en el log, no se omite en silencio."""
+    """`harness run`: la frontera desbloqueada, en worktrees y panes aislados,
+    con tope de paralelismo, todo anotado en el log JSONL de eventos.
+
+    El tamaño de la tanda lo decide el presupuesto (#68): costo medio del
+    historial + margen contra los créditos que quedan, más los topes manuales
+    `--max-tickets`/`--only`; lo que se queda fuera se anota en el log, no se
+    omite en silencio.
+
+    Con `--loop`, el bucle de la noche (#88): repite la pasada hasta que corta
+    algo; sin la bandera, una sola pasada, como siempre."""
     log_path = (Path(args.log).expanduser() if args.log
                 else _estado_dir() / "harness" / "events.jsonl")
+    if args.loop:
+        return _run_loop(args, contexts, log_path)
     for ctx in contexts:
         # Un contexto manual no delega: este comando no toma nada solo.
         if ctx.autonomy == "manual":
@@ -588,6 +616,126 @@ def run_main(args, contexts, solo=None):
             detalle = j.motivo if j.estado != "hecho" else "PR abierto (gate verde)"
             sys.stdout.write("  {} #{}/{} {}\n".format(estado, j.issue, j.repo, detalle))
         sys.stdout.write("harness: log de eventos {}\n".format(log.path))
+    return 0
+
+
+def _una_pasada(args, ctx, log):
+    """Una pasada sobre un contexto (el cuerpo de `run`, en un contexto):
+    recalcula la frontera desde el log y GitHub, parkea los que agotaron la
+    escalera y despacha los libres. Devuelve la Pasada que el bucle (#88)
+    necesita para decidir si repite; la frontera se lee del disco cada vez,
+    no de memoria: un ticket que se parkeó deja de entrar y uno que se
+    destrabó entra."""
+    if ctx.autonomy == "manual":
+        sys.stdout.write('harness: contexto "{}": autonomía manual, '
+                         'este comando no toma nada solo\n'.format(ctx.name))
+        return Pasada(False, "autonomía manual", log=log)
+    # El intento global de cada ticket: cuántas veces quedó intentado en
+    # el historial del log, más uno (ticket #35).
+    eventos_previos = leer_eventos(log.path)
+    crudo = collect([ctx])
+    # El mismo log que da el historial da el estado de la frontera
+    # (ticket #43): un ticket despachado no se re-despacha.
+    crudo["eventos"] = eventos_previos
+    snap = snapshot(crudo)
+    spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
+                        kind=args.kind, model=args.model)
+    costo_de_pi, salida_de_pi = _sesiones_de_pi()
+    disp = Dispatcher(spec, log, run_cmd=adapters.run,
+                      credits=_creditos_usado
+                      if ctx.budget.provider == "openrouter" else None,
+                      costo_real=costo_de_pi, salida_real=salida_de_pi)
+    jobs, parkeados = [], 0
+    for r in snap.contexts[0].repos:
+        if not r.slug:
+            continue
+        cosechar(r.slug, adapters.run, log)
+        # Sin gate no hay nada que esté "verde": no se despacha el repo.
+        if not r.ready.get("gate"):
+            continue
+        for i in r.frontier:
+            # Sólo los libres: un ticket con PR abierto, mergeado,
+            # despachado o parkeado no se re-trabaja (ticket #43).
+            if i.estado != "libre":
+                continue
+            # El peldaño se deriva del historial del log, no de un
+            # estado en memoria (#38): sobrevive reiniciar el
+            # dispatcher porque se recalcula acá, de `eventos_previos`.
+            escalados = intentos_que_escalan(eventos_previos, r.name, i.number)
+            peldano = peldano_de(escalados)
+            attempt = intentos(eventos_previos, r.name, i.number) + 1
+            if peldano is None:
+                # Escalera agotada: se parkea acá mismo, sin worktree
+                # ni pane -- no hay peldaño que correr.
+                motivos = motivos_de_abandono(eventos_previos, r.name, i.number)
+                disp.parkear(
+                    Job(repo=r.name, repo_path=r.path, slug=r.slug,
+                        issue=i.number, attempt=attempt),
+                    "ticket/{}".format(i.number), motivos)
+                parkeados += 1
+                continue
+            gate_tail = (ultimo_gate_rojo(eventos_previos, r.name, i.number)
+                        if peldano.get("cola_gate") else None)
+            jobs.append(Job(repo=r.name, repo_path=r.path, slug=r.slug,
+                            issue=i.number, attempt=attempt,
+                            kind=peldano["kind"], model=peldano["model"],
+                            extra_args=tuple(peldano["extra_args"]),
+                            gate_tail=gate_tail))
+    if not jobs:
+        extra = " ({} parkeado(s))".format(parkeados) if parkeados else ""
+        sys.stdout.write('harness: "{}": nada en la frontera{}\n'.format(
+            ctx.name, extra))
+        return Pasada(False, "nada en la frontera{}".format(extra), log=log)
+    resultados = disp.dispatch(jobs)
+    for j in resultados:
+        estado = "OK       " if j.estado == "hecho" else "ABANDONADO"
+        detalle = j.motivo if j.estado != "hecho" else "PR abierto (gate verde)"
+        sys.stdout.write("  {} #{}/{} {}\n".format(estado, j.issue, j.repo, detalle))
+    sys.stdout.write("harness: log de eventos {}\n".format(log.path))
+    return Pasada(True, "{} job(s)".format(len(jobs)), log=log)
+
+
+def _run_loop(args, contexts, log_path):
+    """`harness run --loop` (#88): el modo bucle del CLI, en vez del
+    `scripts/noche.sh` que hace lo mismo sin tests.
+
+    El corte siempre queda en el log de eventos con su motivo, y el freno
+    se atiende entre pasadas (nunca en medio de una). Un freno viejo que ya
+    estaba al arrancar no puede salir 0 (#91): se leería como éxito y se
+    comería la noche.
+    """
+    if args.freno and Path(args.freno).expanduser().exists():
+        sys.stderr.write("harness: freno puesto: {}\n"
+                         "rm {} para sacarlo\n".format(
+                             args.freno, args.freno))
+        return 2
+    if OFFLINE or os.environ.get("HERDR_ENV") != "1":
+        sys.stderr.write("harness: run necesita adaptadores y una sesión de "
+                         "herdr (sin HARNESS_OFFLINE, con HERDR_ENV=1)\n")
+        return 2
+    # El piso se mide contra el mismo proveedor que la corrida cobra:
+    # sin OpenRouter no hay crédito que medir, y sin medir el piso no corta.
+    provider = next((c.budget.provider for c in contexts), None)
+    creditos = (_creditos_restantes if provider == "openrouter" else None)
+    nombre = contexts[0].name if contexts else "harness"
+
+    def ejecutar():
+        # Una corrida nueva por pasada: su propio run_id, y la línea
+        # `pasada` se anota en ella, no en una corrida fantasma.
+        log = EventLog(log_path, nombre)
+        trabajo, partes = False, []
+        for ctx in contexts:
+            p = _una_pasada(args, ctx, log)
+            trabajo = trabajo or p.trabajo
+            partes.append(p.detalle)
+        return Pasada(trabajo, "; ".join(partes), log=log)
+
+    spec = BucleSpec(piso=args.piso, max_pasadas=args.max_pasadas)
+    # El log de respaldo: las pasadas traen el suyo, pero el corte se tiene
+    # que anotar aunque no haya corrido ninguna (piso bajo al arrancar).
+    corte = bucle(ejecutar, spec, EventLog(log_path, nombre),
+                  creditos=creditos, freno=args.freno or None)
+    sys.stdout.write("harness: bucle: corte: {}\n".format(corte))
     return 0
 
 
