@@ -541,6 +541,21 @@ class TestClaseDeAbandono(unittest.TestCase):
         ab = [l for l in lineas if l["tipo"] == "abandono"][0]
         self.assertEqual(ab["clase"], "modelo")
 
+    def test_un_gate_rojo_no_lo_perdona_ningun_error_de_pi(self):
+        """El gate en rojo es evidencia positiva de trabajo malo. Que la
+        sesión además haya cortado con un error de red no lo excusa: la noche
+        del 26, "gate rojo en el worktree" salió `infra` porque pi había
+        tenido un `Connection error.` en el medio."""
+        m = Mundo(credits=[100.0, 100.10]).responder(
+            lambda a: a[0] == "bash" or (a and str(a[-1]).endswith("gate.sh")),
+            (False, "ROJO: unittest"))
+        _, lineas = despachar(m, [job()], salida_real=lambda *a, **k: {
+            "stop": "error", "error": "Connection error."})
+        ab = [l for l in lineas if l["tipo"] == "abandono"]
+        rojo = [l for l in ab if "gate rojo" in l["cuerpo"]]
+        self.assertTrue(rojo, "el escenario tiene que dar gate rojo")
+        self.assertEqual(rojo[0]["clase"], "modelo")
+
     def test_la_evidencia_de_pi_no_pisa_un_infra_que_ya_estaba_clasificado(self):
         """Un abandono que el dispatcher ya sabe que es infra (nunca arrancó
         el agente) no tiene sesión que consultar, y no se toca."""

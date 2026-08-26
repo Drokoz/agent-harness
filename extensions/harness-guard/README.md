@@ -32,11 +32,11 @@ Fuera de ahí, no existe.
 | `git push --force` / `-f` / `--force-with-lease` | reescribe historia que otro ya vio |
 | `git push … main` / `HEAD:main` | saltarse el PR |
 | `git checkout/switch main` | `main` está checkouteado en otro lado; moverlo desincroniza la copia principal |
-| `git worktree …` | los worktrees son del dispatcher |
 | `git branch -d/-D` | la rama es lo único que sobrevive a un intento fallido |
 | `git reset --hard`, `git clean -f` | tira a la basura trabajo sin commitear |
 | `git reflog expire`, `git gc --prune` | borra el último camino de vuelta |
-| `rm` / `find -delete` fuera del worktree | incluye `~`, `..` y `$VAR` sin expandir |
+| `git worktree remove/prune/move` | los worktrees son del dispatcher (`list` y un `add` a `/tmp` sí pasan) |
+| `rm` / `find -delete` fuera del worktree | incluye `~`, `..` y `$VAR` sin expandir; `/tmp/lo-suyo` sí pasa, `/tmp` entero no |
 | `write`/`edit` fuera del worktree | la forma silenciosa de romper el checkout principal |
 | redirección `>` fuera del worktree | `/tmp` y `/dev` sí |
 | `sudo`, `curl \| sh`, `shutdown`, `mkfs`, `dd of=/dev/…` | catastrófico y nunca parte de un ticket |
@@ -52,6 +52,10 @@ Dos detalles que importan:
   comillas, si no el agente quedaría trabado por su propio mensaje de commit.
 - **El cwd se arrastra.** `cd ~ && rm -rf junk` borra en `~`, no en el worktree. Las rutas
   relativas se resuelven contra el `cd` pero se comparan siempre contra la raíz del worktree.
+- **Escribir y borrar no son lo mismo.** Escribir en `/tmp` o en un `$T=$(mktemp -d)` es
+  trabajo normal —el cuerpo de un PR vive ahí— y pasa. Borrar con un `$VAR` sin expandir no
+  pasa: ahí una variable vacía es el desastre clásico. La primera noche con el guard puesto
+  bloqueó dos cuerpos de PR por no hacer esta distinción.
 
 ## Rastro
 

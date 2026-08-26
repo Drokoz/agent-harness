@@ -13,8 +13,20 @@ export type Veredicto = { motivo: string } | null;
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish"]);
 const DESCARGAS = new Set(["curl", "wget"]);
 const APAGADO = new Set(["shutdown", "reboot", "halt", "poweroff"]);
-// Un redirect a estos lados no es "escribir afuera": es scratch y basura.
+// Escribir acá no es "escribir afuera": es scratch y basura. Vale para la
+// tool `write` igual que para un redirect --- el cuerpo de un PR va a
+// /tmp/pr-56-body.md y bloquearlo le cuesta un intento entero al agente.
 const ESCRIBIBLES = ["/tmp", "/dev", "/private/tmp", "/var/folders"];
+
+function esScratch(p: string): boolean {
+  return ESCRIBIBLES.some((d) => p === d || p.startsWith(d + "/"));
+}
+
+/** Estrictamente ADENTRO de un scratch. `/tmp/lo-mio` sí, `/tmp` no: borrar
+ *  /tmp entero se lleva puesto el scratch de los otros agentes. */
+function esHijoDeScratch(p: string): boolean {
+  return ESCRIBIBLES.some((d) => p.startsWith(d + "/") && p.length > d.length + 1);
+}
 
 /** `.../.worktrees/<repo>-ticket-<n>` es lo que arma `dispatch.worktree_path`. */
 const RUTA_WORKTREE = /\/\.worktrees\/([^/]+)-ticket-(\d+)(?:\/|$)/;
@@ -90,6 +102,21 @@ export function fuera(p: string, cwd: string, raiz: string = cwd): boolean {
   return abs !== raiz && !abs.startsWith(raiz + path.sep);
 }
 
+/** Para ESCRIBIR: sale del worktree y tampoco es scratch.
+ *
+ *  Un `$VAR` acá pasa: lo peor que puede hacer una escritura es dejar un
+ *  archivo en un lugar raro, y bloquear el `T=$(mktemp -d)` de un agente le
+ *  cuesta un intento. Para BORRAR se sigue usando `fuera`, que lo bloquea:
+ *  una variable sin expandir adentro de un `rm -rf` es otra cosa. */
+export function fueraParaEscribir(p: string, cwd: string, raiz: string = cwd): boolean {
+  if (!p) return false;
+  if (p.startsWith("~")) return true;
+  if (p.startsWith("$")) return false;
+  const abs = path.resolve(cwd, p);
+  if (esScratch(abs)) return false;
+  return abs !== raiz && !abs.startsWith(raiz + path.sep);
+}
+
 function esBandera(a: string): boolean {
   return a.startsWith("-") && a !== "-";
 }
@@ -102,7 +129,7 @@ function tieneLetra(args: string[], letra: string): boolean {
   return args.some((a) => esBandera(a) && !a.startsWith("--") && a.includes(letra));
 }
 
-function analizarGit(resto: string[]): Veredicto {
+function analizarGit(resto: string[], cwd: string): Veredicto {
   const sub = resto[0];
   const args = resto.slice(1);
   const libres = sinBanderas(args);
@@ -125,7 +152,15 @@ function analizarGit(resto: string[]): Veredicto {
     }
   }
   if (sub === "worktree") {
-    return { motivo: "worktrees belong to the dispatcher, not to the agent. It created yours and it will clean it up." };
+    // Mirar no es tocar, y un worktree de scratch en /tmp es una herramienta
+    // legítima --- el ticket del mantenedor de conflictos lo necesita.
+    if (args[0] === "list") return null;
+    if (args[0] === "add") {
+      const destino = sinBanderas(args.slice(1))[0] || "";
+      if (destino && !fueraParaEscribir(destino, cwd, cwd)) return null;
+      return { motivo: `git worktree add outside /tmp ('${destino}'): worktrees under the repo belong to the dispatcher. Use a path under /tmp for scratch.` };
+    }
+    return { motivo: `git worktree ${args[0] || ""}: worktrees belong to the dispatcher, not to the agent. It created yours and it will clean it up.` };
   }
   if (sub === "branch" && (args.includes("-D") || args.includes("-d"))) {
     return { motivo: "deleting branches: a branch is the only thing that survives a failed attempt. Never delete one." };
@@ -180,11 +215,12 @@ function analizarSegmento(seg: string[], cwd: string, raiz: string): Veredicto {
   if (cmd === "dd" && resto.some((a) => a.startsWith("of=/dev/"))) {
     return { motivo: "dd writing to a raw device destroys the disk. Never part of a ticket." };
   }
-  if (cmd === "git") return analizarGit(resto);
+  if (cmd === "git") return analizarGit(resto, cwd);
   if (cmd === "gh") return analizarGh(resto);
 
   if (cmd === "rm") {
-    const malo = sinBanderas(resto).find((a) => fuera(a, cwd, raiz));
+    const malo = sinBanderas(resto).find(
+      (a) => fuera(a, cwd, raiz) && !esHijoDeScratch(path.resolve(cwd, a)));
     if (malo) {
       return { motivo: `rm on '${malo}', which is outside your worktree. You can only delete files under ${raiz}.` };
     }
@@ -204,8 +240,7 @@ function analizarRedirects(toks: Tok[], cwd: string): Veredicto {
     const destino = toks[i + 1];
     if (!destino || destino.op) continue;
     const p = destino.t;
-    if (!fuera(p, cwd)) continue;
-    if (p.startsWith("/") && ESCRIBIBLES.some((d) => p === d || p.startsWith(d + "/"))) continue;
+    if (!fueraParaEscribir(p, cwd)) continue;
     return { motivo: `redirecting output to '${p}', which is outside your worktree. Write only under ${cwd} (or /tmp).` };
   }
   return null;
@@ -255,7 +290,7 @@ export function revisar(tool: string, input: any, cwd: string): Veredicto {
   if (tool === "bash") return revisarBash(String(input?.command ?? ""), cwd);
   if (tool === "write" || tool === "edit") {
     const p = String(input?.path ?? "");
-    if (fuera(p, cwd)) {
+    if (fueraParaEscribir(p, cwd)) {
       return { motivo: `writing to '${p}', which is outside your worktree. Everything you change has to live under ${cwd} so it lands in your branch.` };
     }
   }

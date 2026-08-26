@@ -226,6 +226,21 @@ class Clasificar(unittest.TestCase):
                   "402 Payment Required"]:
             self.assertEqual(self.clase("error", e), "humano", e)
 
+    def test_que_lo_maten_es_del_modelo_no_de_la_red(self):
+        """`terminated` es nuestro propio watchdog matando a un agente
+        trabado. Clasificarlo `infra` apaga la escalera: la noche del 26 los
+        NUEVE abandonos salieron `infra`, `escalados` quedó en 0 para todos,
+        y #56 corrió cuatro veces en el peldaño más barato por US$2,58."""
+        for e in ["terminated", "Killed", "process terminated by SIGTERM",
+                  "aborted"]:
+            self.assertEqual(self.clase("error", e), "modelo", e)
+
+    def test_el_filtro_de_contenido_del_proveedor_si_es_infra(self):
+        """Qwen corta con esto solo; reintentar suele funcionar."""
+        self.assertEqual(
+            self.clase("error", "Upstream error from Alibaba: Output data may "
+                                "contain inappropriate content."), "infra")
+
     def test_quedarse_sin_contexto_si_es_del_modelo(self):
         self.assertEqual(self.clase("length"), "modelo")
 

@@ -111,6 +111,32 @@ class TestParseFecha(unittest.TestCase):
             self.assertIsNone(parse_fecha(s), s)
 
 
+class TestCostoJobRe(unittest.TestCase):
+    """El cuerpo de una línea `costo` dice de dónde salió el número (#90, #65),
+    y el regex estaba anclado al final: desde ese cambio, TODO el costo de una
+    noche quedó invisible para `harness status` --- el total, el costo por
+    ticket y el desglose por peldaño, los tres en cero."""
+
+    def test_lee_el_costo_diga_lo_que_diga_el_sufijo(self):
+        from harness.summary import COSTO_JOB_RE
+        casos = {
+            "$0.1732": "0.1732",
+            "$0.1732 (sesion de pi)": "0.1732",
+            "$0.1500 (estimado: reparto del delta)": "0.1500",
+            "$12": "12",
+        }
+        for cuerpo, esperado in casos.items():
+            m = COSTO_JOB_RE.match(cuerpo)
+            self.assertIsNotNone(m, cuerpo)
+            self.assertEqual(m.group(1), esperado, cuerpo)
+
+    def test_lo_que_no_es_un_costo_sigue_sin_serlo(self):
+        from harness.summary import COSTO_JOB_RE
+        for cuerpo in ["desconocido",
+                       "creditos antes 11.21 / despues 13.24 / delta $2.02"]:
+            self.assertIsNone(COSTO_JOB_RE.match(cuerpo), cuerpo)
+
+
 class TestResumir(unittest.TestCase):
     def test_log_vacio(self):
         tickets, trabados, costo = resumir([])

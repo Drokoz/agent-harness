@@ -41,7 +41,6 @@ test("nada de reescribir historia ajena", () => {
 test("el agente no se mueve de su rama ni toca worktrees", () => {
   assert.ok(bash("git checkout main"));
   assert.ok(bash("git switch main"));
-  assert.ok(bash("git worktree remove ../otro"));
   assert.ok(bash("git branch -D ticket/73"));
 });
 
@@ -75,6 +74,30 @@ test("rm -rf sólo se bloquea cuando el destino escapa del worktree", () => {
   assert.ok(bash("rm -rf ../otro-worktree"));
   assert.ok(bash("rm -rf /Users/x/Documents/Github/agent-harness"));
   assert.ok(bash("find / -name '*.py' -delete"));
+});
+
+test("el scratch de /tmp es trabajo, no fuga", () => {
+  // La noche del 2026-08-26 el guard bloqueó dos cuerpos de PR en /tmp y el
+  // scratch de un `mktemp -d`. Una redirección a /tmp ya estaba permitida y
+  // la tool `write` al mismo lugar no: incoherente, y caro.
+  assert.strictEqual(revisar("write", { path: "/tmp/pr-56-body.md" }, WT), null);
+  assert.strictEqual(revisar("write", { path: "/private/tmp/x.md" }, WT), null);
+  assert.strictEqual(bash("rm -rf /tmp/guard-check"), null);
+  assert.strictEqual(bash("echo hola > $T/config.json"), null);
+  assert.strictEqual(revisar("write", { path: "$T/config.json" }, WT), null);
+  // Pero borrar con una variable sin expandir sigue siendo el desastre clásico.
+  assert.ok(bash("rm -rf $HOME"));
+  assert.ok(bash("rm -rf ~/Documents"));
+  // Y /tmp no abre la puerta a cualquier lado.
+  assert.ok(revisar("write", { path: "/Users/x/.zshrc" }, WT));
+});
+
+test("git worktree: mirar no es tocar", () => {
+  assert.strictEqual(bash("git worktree list"), null);
+  assert.strictEqual(bash("git worktree add --detach /tmp/ah-base main"), null);
+  assert.ok(bash("git worktree remove ../otro"));
+  assert.ok(bash("git worktree prune"));
+  assert.ok(bash("git worktree add /Users/x/Documents/Github/otro main"));
 });
 
 test("el trabajo del agente pasa entero", () => {

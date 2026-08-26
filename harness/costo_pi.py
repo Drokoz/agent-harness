@@ -55,6 +55,14 @@ CAMPOS = ("input", "output", "cacheRead", "cacheWrite", "reasoning")
 HUMANO = ("402", "out of credits", "insufficient credit", "insufficient_quota",
           "billing", "payment required", "subscription", "add credits")
 
+# A este no lo mató la red: lo matamos nosotros. `terminated` es el watchdog
+# (#41) cortando un agente que dejó de avanzar, y un agente trabado es una
+# falla del modelo, no de la infraestructura. Llamarlo `infra` APAGA la
+# escalera: la noche del 2026-08-26 los nueve abandonos salieron `infra`,
+# `escalados` quedó en 0 para todos, y #56 corrió cuatro veces en el peldaño
+# más barato por US$2,58 sin escalar nunca.
+MATADO = ("terminated", "killed", "sigterm", "sigkill", "aborted")
+
 
 def ticket_de_cwd(cwd) -> Optional[Tuple[str, int]]:
     """`(repo, issue)` si esa ruta es el worktree de un ticket; si no, None."""
@@ -207,7 +215,12 @@ def clasificar_salida(salida) -> Tuple[Optional[str], str]:
     error = (salida.get("error") or "").strip()
     if stop == "error":
         bajo = error.lower()
-        clase = "humano" if any(t in bajo for t in HUMANO) else "infra"
+        if any(t in bajo for t in HUMANO):
+            clase = "humano"
+        elif any(t in bajo for t in MATADO):
+            clase = "modelo"
+        else:
+            clase = "infra"
         return (clase, error or "pi cortó con error, sin mensaje")
     if stop == "length":
         return ("modelo", "se quedó sin contexto (stopReason: length)")

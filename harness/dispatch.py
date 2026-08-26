@@ -947,7 +947,8 @@ class Dispatcher:
             self._log(job, "gate", ref, "verde")
             return True
         self._log(job, "gate", ref, "rojo: " + out.strip()[-200:])
-        self._abandonar(job, ref, "gate rojo en el worktree: sin PR", clase="modelo")
+        self._abandonar(job, ref, "gate rojo en el worktree: sin PR",
+                        clase="modelo", firme=True)
         return False
 
     def _pr_abierto(self, job, ref):
@@ -1254,7 +1255,7 @@ class Dispatcher:
         self._log(job, "limpieza", ref,
                   "{}worktree removido, rama {} quedo".format(cerrado, job.branch))
 
-    def _abandonar(self, job, ref, motivo, clase="modelo"):
+    def _abandonar(self, job, ref, motivo, clase="modelo", firme=False):
         """Marca el job como abandonado, con su clase (#37): `infra`
         (worktree, pane, arranque del agente, prompt perdido, timeout de
         red), `modelo` (gate rojo, sin PR, sin progreso) o `humano`
@@ -1267,7 +1268,11 @@ class Dispatcher:
         # llamador ya sabe no se discute, y encima esos casos ni siquiera
         # llegan a tener sesión que consultar.
         sacar = False
-        if clase == "modelo":
+        # `firme`: hay evidencia positiva de trabajo malo (un gate en rojo) y
+        # eso no lo perdona ningún error de pi. La noche del 2026-08-26 un
+        # "gate rojo en el worktree" salió `infra` porque la sesión además
+        # había tenido un `Connection error.` en el medio.
+        if clase == "modelo" and not firme:
             real, detalle = self._salida_de_pi(job)
             if real:
                 clase = real
