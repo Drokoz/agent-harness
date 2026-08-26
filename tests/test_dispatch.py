@@ -20,8 +20,8 @@ from unittest import mock
 import support
 from harness import adapters, dispatch, state
 from harness.dispatch import (ESCALERA, DispatchSpec, Dispatcher, EventLog, Job,
-                              cosechar, nombre_agente, peldano_de, prompt_de,
-                              una_linea, worktree_path)
+                              cosechar, decidir_tanda, nombre_agente, peldano_de,
+                              prompt_de, una_linea, worktree_path)
 
 ROOT = support.ROOT
 HARNESS = ROOT / "bin" / "harness"
@@ -153,6 +153,125 @@ def job_de_peldano(escalados, **kw):
     (#38): lo mismo que arma `bin/harness` antes de llamar a `dispatch`."""
     p = peldano_de(escalados)
     return job(kind=p["kind"], model=p["model"], extra_args=p["extra_args"], **kw)
+
+
+class TestTandaPorPresupuesto(unittest.TestCase):
+    """#68: el tamaño de la tanda lo decide el presupuesto. Puro: los
+    créditos y el costo medio (del historial, #35) se inyectan; la
+    decisión es por candidato, en el orden de la frontera, y cada uno que
+    se queda fuera dice por qué."""
+
+    def candidatos(self, n, kind="pi", base=40):
+        return [job(issue=base + i, kind=kind) for i in range(n)]
+
+    def despachados(self, decisiones):
+        return [d["job"] for d in decisiones if d["despachar"]]
+
+    def decisiones_despachadas(self, decisiones):
+        return [d for d in decisiones if d["despachar"]]
+
+    def fuera(self, decisiones):
+        return [d for d in decisiones if not d["despachar"]]
+
+    def test_cuantos_entran_con_las_plata_que_quedan(self):
+        # El caso del issue: 15 tickets libres y US$1.86. Con costo medio
+        # $0.43 y margen $0.10 caben 4, no 15.
+        d = decidir_tanda(self.candidatos(15), creditos=1.86,
+                          costo_promedio=0.43, margen=0.10)
+        self.assertEqual(len(d), 15)
+        self.assertEqual([j.issue for j in self.despachados(d)],
+                         [40, 41, 42, 43])
+        self.assertTrue(all("presupuesto" in x["motivo"]
+                            for x in self.fuera(d)))
+
+    def test_un_ticket_arranca_si_caben_costo_mas_margen(self):
+        d = decidir_tanda([job(kind="pi")], creditos=0.53,
+                          costo_promedio=0.43, margen=0.10)
+        self.assertTrue(d[0]["despachar"])
+        d = decidir_tanda([job(kind="pi")], creditos=0.52,
+                          costo_promedio=0.43, margen=0.10)
+        self.assertFalse(d[0]["despachar"])
+        self.assertIn("presupuesto", d[0]["motivo"])
+
+    def test_el_margen_cero_arranca_con_lo_justo(self):
+        d = decidir_tanda([job(kind="pi")], creditos=0.43,
+                          costo_promedio=0.43, margen=0.0)
+        self.assertTrue(d[0]["despachar"])
+
+    def test_sin_historial_no_se_puede_dimensionar(self):
+        d = decidir_tanda(self.candidatos(2), creditos=100.0,
+                          costo_promedio=None, margen=0.10)
+        self.assertEqual(len(self.fuera(d)), 2)
+        self.assertTrue(all("costo medio" in x["motivo"]
+                            for x in self.fuera(d)))
+
+    def test_creditos_desconocidos_se_anotan_y_no_se_dispacha(self):
+        # Sin leer el crédito no hay forma de prometer plata: el tope
+        # tampoco se aplica en silencio, se dice por qué se excluyó.
+        d = decidir_tanda(self.candidatos(2), creditos=None,
+                          costo_promedio=0.43, margen=0.10)
+        self.assertEqual(len(self.fuera(d)), 2)
+        self.assertTrue(all("creditos desconocidos" in x["motivo"]
+                            for x in self.fuera(d)))
+
+    def test_el_runner_sin_creditos_no_se_ve_limitado(self):
+        # Claude corre contra cuota, no contra la key de OpenRouter: el
+        # tope por presupuesto no le aplica, y se dice por qué.
+        d = decidir_tanda(self.candidatos(2, kind="claude"), creditos=0.0,
+                          costo_promedio=0.43, margen=0.10)
+        self.assertEqual(len(self.despachados(d)), 2)
+        self.assertTrue(all(x["motivo"] == "no gasta creditos"
+                            for x in self.decisiones_despachadas(d)))
+        d = decidir_tanda([job(kind="claude")], creditos=None,
+                          costo_promedio=None, margen=0.10)
+        self.assertTrue(d[0]["despachar"])
+
+    def test_el_claude_corre_aunque_la_plata_se_agote(self):
+        d = decidir_tanda(self.candidatos(1) + self.candidatos(1, kind="claude", base=60),
+                          creditos=0.05, costo_promedio=0.43, margen=0.10)
+        self.assertEqual([j.issue for j in self.despachados(d)], [60])
+
+    def test_max_tickets_acota_la_tanda(self):
+        d = decidir_tanda(self.candidatos(5), creditos=100.0,
+                          costo_promedio=0.43, margen=0.10, max_tickets=2)
+        self.assertEqual([j.issue for j in self.despachados(d)], [40, 41])
+        self.assertTrue(all("max-tickets" in x["motivo"]
+                            for x in self.fuera(d)[2:]))
+
+    def test_max_tickets_no_sube_el_tope_de_presupuesto(self):
+        # Piden 5, la plata alcanza para 4: gana la plata, y el motivo
+        # lo dice en vez de omitirlo.
+        d = decidir_tanda(self.candidatos(5), creditos=1.86,
+                          costo_promedio=0.43, margen=0.10, max_tickets=5)
+        self.assertEqual(len(self.despachados(d)), 4)
+        self.assertTrue(all("presupuesto" in x["motivo"]
+                            for x in self.fuera(d)))
+
+    def test_ambos_topes_se_apuntan_juntos(self):
+        d = decidir_tanda(self.candidatos(4), creditos=1.30,
+                          costo_promedio=0.43, margen=0.10, max_tickets=2)
+        # el tercero cae por ambos: los dos motivos quedan en la razón
+        terc = self.fuera(d)[1]
+        self.assertIn("max-tickets", terc["motivo"])
+        self.assertIn("presupuesto", terc["motivo"])
+
+    def test_sin_provider_de_creditos_no_hay_tope_por_plata(self):
+        # El contexto no mide OpenRouter: no se dimensiona con plata, no
+        # es "creditos desconocidos"; el tope manual sí sigue valiendo.
+        d = decidir_tanda(self.candidatos(3), creditos=None,
+                          costo_promedio=None, margen=0.10,
+                          presupuesto=False)
+        self.assertEqual(len(self.despachados(d)), 3)
+        d = decidir_tanda(self.candidatos(3), creditos=None,
+                          costo_promedio=None, margen=0.10,
+                          presupuesto=False, max_tickets=2)
+        self.assertEqual(len(self.despachados(d)), 2)
+
+    def test_el_orden_de_la_frontera_se_mantiene(self):
+        d = decidir_tanda(self.candidatos(5, base=38), creditos=1.86,
+                          costo_promedio=0.43, margen=0.10)
+        self.assertEqual([j.issue for j in [d["job"] for d in d]],
+                         [38, 39, 40, 41, 42])
 
 
 def despachar(mundo, jobs, costo_real=None, salida_real=None, **kw):

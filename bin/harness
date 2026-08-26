@@ -33,6 +33,14 @@
                                     de reintentos que le toca (#38): --kind/--model
                                     son sólo el fallback de un ticket sin peldaño
     harness run --max 2             tope de tickets en paralelo (24 GB: dos)
+    harness run --max-tickets 4     tope de tickets en la tanda, sin tocar
+                                    etiquetas (#68); el presupuesto ya da el
+                                    suyo: costo medio del historial + margen
+    harness run --only 38,47        despachar tickets puntuales sin tocar
+                                    etiquetas (#68)
+    harness run --margen 0.10       colchón en USD: no se arranca un ticket si
+                                    lo que queda no cubre el costo medio más
+                                    el margen (#68)
     harness run --kind pi           fallback: pi | claude | codex | ...
     harness run --model xai/grok    fallback: modelo nativo del agente (opcional)
     harness run --log PATH          dónde va el log JSONL de eventos
@@ -84,14 +92,14 @@ from harness.config import ConfigError  # noqa: E402
 from harness import costo_pi  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
 from harness.dispatch import (DispatchSpec, Dispatcher, EventLog, Job, cosechar,  # noqa: E402
-                              peldano_de)
+                              decidir_tanda, peldano_de)
 from harness.render import linea_evento, render  # noqa: E402
 from harness.quota import (agregar, as_dict as quota_as_dict, cuota_por_ventana,  # noqa: E402
                            fuentes_desde_spec, leer_fuentes, puntos_de_ticket,
                            render_quota, resumen_evento, semana_de)
 from harness.snapshot import as_dict, snapshot  # noqa: E402
-from harness.state import (intentos, intentos_que_escalan, motivos_de_abandono,  # noqa: E402
-                           pasos, ultimo_gate_rojo)
+from harness.state import (costo_promedio, intentos, intentos_que_escalan,  # noqa: E402
+                           motivos_de_abandono, pasos, ultimo_gate_rojo)
 from harness.summary import (PrAbierto, Resumen, con_cuota, construir,  # noqa: E402
                              filtrar, guardar_marca, as_dict as resumen_as_dict,
                              leer_eventos, leer_marca, parse_fecha)
@@ -142,6 +150,16 @@ def build_parser():
                    help="el snapshot completo en JSON, en vez de la pantalla")
     p.add_argument("--max", type=int, default=2, dest="maximo",
                    help="run: tickets en paralelo (por defecto 2)")
+    p.add_argument("--max-tickets", type=int, default=None, dest="max_tickets",
+                   help="run: tope de tickets en la tanda, sin tocar etiquetas "
+                        "(#68); aparte del tope de presupuesto")
+    p.add_argument("--only", default="",
+                   help="run: despachar solo estos issues, separados por coma "
+                        "(p.ej. 38,47), sin tocar etiquetas (#68)")
+    p.add_argument("--margen", type=float, default=0.10,
+                   help="run: colchón en USD: no se arranca un ticket si lo que "
+                        "queda no cubre el costo medio más este margen "
+                        "(por defecto 0.10; #68)")
     p.add_argument("--kind", default="pi",
                    help="run: fallback de kind de agente (por defecto pi); la "
                         "escalera de reintentos (#38) lo fija por ticket")
@@ -188,7 +206,13 @@ def main(argv=None):
     if args.command == "quota":
         return quota_main(args, contexts)
     if args.command == "run":
-        return run_main(args, contexts)
+        try:
+            solo = _solo_de(args.only)
+        except ValueError:
+            sys.stderr.write("harness: --only inválido: se esperaban números "
+                             "separados por coma (p.ej. 38,47)\n")
+            return 2
+        return run_main(args, contexts, solo)
 
     raw = collect(contexts, offline=OFFLINE)
     quota_registros, quota_agg = None, None
@@ -385,6 +409,18 @@ def _sesiones_de_pi():
     return costo, salida
 
 
+def _solo_de(valor):
+    """`--only 38,47` -> {38, 47}, o None si no se pidió. ValueError si no
+    se entiende: el llamador lo convierte en un error de uso, no en una
+    tanda vacía en silencio."""
+    if not valor:
+        return None
+    numeros = {int(x) for x in valor.split(",") if x.strip()}
+    if not numeros:
+        raise ValueError(valor)
+    return numeros
+
+
 def _creditos_usado():
     """Cuánto se llevó usado OpenRouter, para medir el costo de la corrida."""
     data = openrouter_credits()
@@ -403,9 +439,24 @@ def _imprimir_evento(linea):
     sys.stdout.flush()
 
 
-def run_main(args, contexts):
-    """`harness run`: la frontera desbloqueada, en worktrees y panes aislados,
-    con tope de paralelismo, todo anotado en el log JSONL de eventos."""
+def _creditos_restantes():
+    """Cuánto queda en la key de OpenRouter (#68): total menos usado.
+    None si no hay key o la API no contesta — la decisión de la tanda
+    (`dispatch.decidir_tanda`) sabe qué hacer con eso."""
+    data = openrouter_credits()
+    try:
+        return float(data["total_credits"]) - float(data["total_usage"])
+    except (TypeError, KeyError, ValueError):
+        return None
+
+
+def run_main(args, contexts, solo=None):
+    """`harness run`: la frontera desbloqueada, en worktrees y panes
+    aislados, con tope de paralelismo, todo anotado en el log JSONL de
+    eventos. El tamaño de la tanda lo decide el presupuesto (#68): costo
+    medio del historial + margen contra los créditos que quedan, más los
+    topes manuales `--max-tickets`/`--only`; lo que se queda fuera se
+    anota en el log, no se omite en silencio."""
     log_path = (Path(args.log).expanduser() if args.log
                 else _estado_dir() / "harness" / "events.jsonl")
     for ctx in contexts:
@@ -436,6 +487,7 @@ def run_main(args, contexts):
                           if ctx.budget.provider == "openrouter" else None,
                           costo_real=costo_de_pi, salida_real=salida_de_pi)
         jobs, parkeados = [], 0
+        candidatos = []
         for r in snap.contexts[0].repos:
             if not r.slug:
                 continue
@@ -464,13 +516,67 @@ def run_main(args, contexts):
                         "ticket/{}".format(i.number), motivos)
                     parkeados += 1
                     continue
+                # `--only`: los que no están en la lista no son candidatos
+                # de esta tanda (sin tocar etiquetas, #68).
+                if solo is not None and i.number not in solo:
+                    continue
                 gate_tail = (ultimo_gate_rojo(eventos_previos, r.name, i.number)
                             if peldano.get("cola_gate") else None)
-                jobs.append(Job(repo=r.name, repo_path=r.path, slug=r.slug,
-                                issue=i.number, attempt=attempt,
-                                kind=peldano["kind"], model=peldano["model"],
-                                extra_args=tuple(peldano["extra_args"]),
-                                gate_tail=gate_tail))
+                candidatos.append(Job(repo=r.name, repo_path=r.path, slug=r.slug,
+                                      issue=i.number, attempt=attempt,
+                                      kind=peldano["kind"], model=peldano["model"],
+                                      extra_args=tuple(peldano["extra_args"]),
+                                      gate_tail=gate_tail))
+        # El tamaño de la tanda lo decide el presupuesto (#68): los
+        # créditos que quedan contra el costo medio del historial, más el
+        # margen, más los topes manuales. Lo que se queda fuera se anota
+        # en el log, no se omite en silencio.
+        if solo is not None:
+            log.write("corrida", "corrida",
+                      "solo: se despachan solo los issues pedidos ({})".format(
+                          ",".join(str(n) for n in sorted(solo))))
+        if ctx.budget.provider == "openrouter":
+            creditos = _creditos_restantes()
+            # El log es compartido entre contextos: el promedio se mide
+            # sobre el historial de ESTE contexto, no sobre todo el archivo.
+            eventos_ctx = [e for e in eventos_previos
+                           if e.get("contexto") == ctx.name]
+            promedio = costo_promedio(eventos_ctx)
+            if promedio is None:
+                log.write("corrida", "corrida",
+                          "presupuesto: sin costo medio en el historial: la "
+                          "tanda no se dimensiona con la plata")
+            elif creditos is None:
+                log.write("corrida", "corrida",
+                          "presupuesto: créditos desconocidos (no se pudo "
+                          "leer la key): la tanda no se dimensiona con la "
+                          "plata")
+            else:
+                log.write("corrida", "corrida",
+                          "presupuesto: quedan ${:.4f}, costo medio "
+                          "${:.4f}, margen ${:.4f}".format(
+                              creditos, promedio, args.margen))
+        else:
+            # Sin provider de créditos no hay tope por presupuesto, y se
+            # dice: no es que la plata alcanzó, es que el contexto no mide
+            # plata. El tope manual --max-tickets sí sigue aplicando.
+            creditos, promedio = None, None
+            log.write("corrida", "corrida",
+                      "presupuesto: el contexto no mide créditos de "
+                      "OpenRouter: el tope por presupuesto no aplica")
+        decisiones = decidir_tanda(candidatos, creditos, promedio, args.margen,
+                                   max_tickets=args.max_tickets,
+                                   presupuesto=(ctx.budget.provider
+                                                == "openrouter"))
+        for d in decisiones:
+            j = d["job"]
+            if d["despachar"]:
+                jobs.append(j)
+            else:
+                log.write("fuera", "ticket/{}".format(j.issue), d["motivo"],
+                          ticket="{}#{}".format(j.repo, j.issue))
+                sys.stdout.write("  FUERA  #{}/{} {}\n".format(
+                    j.issue, j.repo, d["motivo"]))
         if not jobs:
             extra = " ({} parkeado(s))".format(parkeados) if parkeados else ""
             sys.stdout.write('harness: "{}": nada en la frontera{}\n'.format(

@@ -489,8 +489,12 @@ El dispatcher local de la Fase 2, ya en Python sobre el mismo esqueleto de
 `harness status`. `harness run` toma la frontera desbloqueada del contexto y la
 deja trabajando: un worktree por ticket (`<raíz>/.worktrees/<repo>-ticket-<n>`,
 rama `ticket/<n>`), un pane de herdr por agente, y un tope de paralelismo
-(`--max`, por defecto 2 —24 GB: dos, no cinco). La cola entera se drena: cuando
-uno termina, entra el siguiente.
+(`--max`, por defecto 2 —24 GB: dos, no cinco). La tanda la dimensiona el
+presupuesto (#68): el costo medio por ticket del historial más un margen
+configurable contra los créditos que quedan, más los topes manuales
+`--max-tickets` y `--only`; lo que se queda fuera se anota en el log, no se
+omite en silencio. Dentro de la tanda la cola se drena: cuando uno termina,
+entra el siguiente.
 
 Las reglas que lo hacen seguro para dejarlo corriendo:
 
@@ -516,6 +520,12 @@ Las reglas que lo hacen seguro para dejarlo corriendo:
   issue abierto vuelve a la frontera y se re-trabaja para siempre.
 - Se registra el costo: el de cada agente (el `$` de la línea de estado) y el de
   la corrida (diferencia de créditos de OpenRouter, si el contexto la sigue).
+- El tamaño de la tanda lo decide el presupuesto (#68): no se arranca un
+  ticket si lo que queda no cubre el costo medio del historial más el margen
+  (`--margen`, USD). Un runner que no gasta créditos (claude) no cae por ese
+  tope, y se dice; sin costo medio ni sin crédito leído tampoco se dimensiona,
+  y el log lo anota. `--max-tickets N` y `--only 38,47` acotan la tanda a mano
+  sin tocar etiquetas.
 - Todo queda en un log JSONL append-only (`~/.local/state/harness/events.jsonl`,
   `--log` lo mueve): timestamp, contexto, **origen** (hoy siempre `harness`, para
   que un observador futuro no invalide lo escrito), tipo, referencia y cuerpo.

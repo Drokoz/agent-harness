@@ -7,7 +7,8 @@ preguntas sobre el historial: `de_ticket` (qué le pasó a un ticket),
 `tasas` (éxito/abandono por runner y por repo), `duracion_media`
 (minutos por ticket cerrado, por runner) e `intentos_que_escalan`
 (cuántos abandonos consumen un peldaño de la escalera de reintentos,
-#38); y da el estado de la frontera (`estado_frontier`, ticket #43): qué
+#38); `costo_promedio` (el costo medio por ticket, con el que el
+presupuesto dimensiona la tanda, #68); y da el estado de la frontera (`estado_frontier`, ticket #43): qué
 tickets fueron despachados, y cuáles de esa marca siguen vivos (con
 agente en el worktree) y cuáles no.
 
@@ -210,6 +211,38 @@ def pasos(eventos, repo, issue):
                     motivo=por_run[r]["motivo"], costo=por_run[r]["costo"],
                     inicio=por_run[r]["inicio"], fin=por_run[r]["fin"])
            for r in sorted(orden, key=lambda r: (por_run[r]["attempt"], r))]
+
+
+def costo_promedio(eventos):
+    """El costo medio por ticket del historial (#68): con qué cifra el
+    presupuesto dimensiona la tanda.
+
+    Un ticket puede tener varias líneas `costo` (varios intentos, varios
+    peldaños): su costo es la suma, y el promedio es sobre tickets, no
+    sobre líneas. Dos filtros, por el lado correcto:
+
+    - Sin campo `ticket` no se puede atribuir (línea `corrida`, o línea
+      vieja de antes de #35) y no cuenta en ningún lado (#72): la línea
+      `costo` de la corrida mide el delta de créditos, no un ticket.
+    - Un ticket que en total no gastó (0.0, `de_ticket`) nunca prendió
+      agente y su cero diluiría el promedio para abajo: la tanda crecería
+      más de lo que la plata alcanza.
+
+    Sin tickets con costo medido: None — no hay historia con qué
+    dimensionar, y es el llamador el que dice qué se hace con eso."""
+    por_ticket = {}
+    for e in eventos:
+        if e.get("tipo") != "costo":
+            continue
+        ticket = e.get("ticket")
+        if ticket is None:
+            continue
+        m = COSTO_JOB_RE.match(str(e.get("cuerpo", "")).strip())
+        if not m:
+            continue
+        por_ticket[ticket] = por_ticket.get(ticket, 0.0) + float(m.group(1))
+    gastos = [c for c in por_ticket.values() if c > 0]
+    return sum(gastos) / len(gastos) if gastos else None
 
 
 def intentos_que_escalan(eventos, repo, issue):
