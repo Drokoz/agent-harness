@@ -29,6 +29,8 @@
     harness run --kind pi           fallback: pi | claude | codex | ...
     harness run --model xai/grok    fallback: modelo nativo del agente (opcional)
     harness run --log PATH          dónde va el log JSONL de eventos
+    harness run -q                  sin la salida en vivo de eventos (#81):
+                                    el log JSONL y el listado final no cambian
 
 v0 deliberadamente chico: NO es una app, es un script que imprime. La idea es vivir
 con él dos semanas y recién ahí especificar el dashboard de verdad, con datos de uso
@@ -76,7 +78,7 @@ from harness import costo_pi  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
 from harness.dispatch import (DispatchSpec, Dispatcher, EventLog, Job, cosechar,  # noqa: E402
                               peldano_de)
-from harness.render import render  # noqa: E402
+from harness.render import linea_evento, render  # noqa: E402
 from harness.quota import (agregar, as_dict as quota_as_dict, cuota_por_ventana,  # noqa: E402
                            leer_sesiones, puntos_de_ticket, render_quota,
                            resumen_evento, semana_de)
@@ -116,7 +118,10 @@ def build_parser():
     p.add_argument("--all", action="store_true", dest="todos",
                    help="todos los contextos juntos")
     p.add_argument("-q", "--quiet", action="store_true",
-                   help="sólo lo accionable: sin la tabla de readiness")
+                   help="status: sólo lo accionable, sin la tabla de "
+                        "readiness; run: sin la salida en vivo de eventos "
+                        "(para cron, o para no ensuciar una salida que se "
+                        "parsee: el log JSONL y el listado final no cambian)")
     p.add_argument("--since", metavar="FECHA", default="",
                    help="status: el resumen desde esa fecha (YYYY-MM-DD o ISO "
                         "8601) en vez de desde la última vez que se miró; "
@@ -365,6 +370,15 @@ def _creditos_usado():
         return None
 
 
+def _imprimir_evento(linea):
+    """La salida en vivo de `run` (#81): cada evento del log, en una línea
+    corta a stdout mientras la corrida va. Con color sólo si stdout es un
+    TTY: un log redirigido a archivo queda legible. `--quiet` no inyecta
+    este listener y el comportamiento es el de siempre."""
+    sys.stdout.write(linea_evento(linea, color=sys.stdout.isatty()) + "\n")
+    sys.stdout.flush()
+
+
 def run_main(args, contexts):
     """`harness run`: la frontera desbloqueada, en worktrees y panes aislados,
     con tope de paralelismo, todo anotado en el log JSONL de eventos."""
@@ -383,7 +397,8 @@ def run_main(args, contexts):
         # El intento global de cada ticket: cuántas veces quedó intentado en
         # el historial del log, más uno (ticket #35).
         eventos_previos = leer_eventos(log_path)
-        log = EventLog(log_path, ctx.name)
+        log = EventLog(log_path, ctx.name,
+                       listener=None if args.quiet else _imprimir_evento)
         crudo = collect([ctx])
         # El mismo log que da el historial da el estado de la frontera
         # (ticket #43): un ticket despachado no se re-despacha.

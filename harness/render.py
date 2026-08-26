@@ -12,6 +12,7 @@ demás es por contexto: cada uno con su presupuesto, su trabajo y su readiness.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from harness.snapshot import READINESS
@@ -298,3 +299,48 @@ def render(snap, quiet=False, color=True, resumen=None):
 
     lines.append("")
     return "\n".join(lines) + "\n"
+
+
+# ----------------------------------------------------------------- eventos
+# La hora corta de un timestamp ISO ("…T21:41:00Z" → "21:41"); un reloj de
+# test no es ISO y en ese caso se muestra el timestamp entero, no un invento.
+_HORA_RE = re.compile(r"T(\d{2}:\d{2})")
+
+
+def _hora_evento(ts):
+    m = _HORA_RE.search(str(ts or ""))
+    return m.group(1) if m else str(ts or "")
+
+
+def linea_evento(linea, color=True):
+    """Una línea corta y legible para un evento del log de `harness run`
+    (ticket #81): la hora, el ticket (o `corrida`, si la línea no es de un
+    ticket) y qué pasó. No es el JSON crudo — eso queda en el JSONL — sino
+    lo que se mira mientras la corrida va. `color=False` (salida no TTY) no
+    lleva escapes ni caracteres de control: un log redirigido a archivo
+    tiene que quedar legible como está.
+
+    `linea` es el dict que escribe `EventLog.write`; los campos faltantes
+    no rompen (líneas viejas del JSONL, que no traían todas las claves).
+    """
+    c = COLOR if color else PLAIN
+    ticket = linea.get("ticket")
+    ref = ("#{}".format(str(ticket).rsplit("#", 1)[-1]) if ticket
+           else str(linea.get("ref") or ""))
+    tipo = str(linea.get("tipo") or "")
+    cuerpo = str(linea.get("cuerpo") or "").strip()
+    # `corrida` no repite su nombre: la columna ya dice de qué se trata.
+    msg = cuerpo if tipo == "corrida" else (tipo + (": " + cuerpo if cuerpo else ""))
+    if len(msg) > 100:
+        msg = msg[:97] + "..."
+    col = ""
+    if tipo == "abandono":
+        col = c.red
+    elif tipo == "peldano":
+        col = c.cya
+    elif (tipo == "corrida" and cuerpo.startswith("fin")) or tipo == "pr" \
+            or (tipo == "gate" and cuerpo.startswith("verde")):
+        col = c.grn
+    return "{}  {:<7}  {}{}{}".format(_hora_evento(linea.get("timestamp")),
+                                      ref, col, msg,
+                                      c.off if col else "")

@@ -10,7 +10,7 @@ import unittest
 
 import support
 
-from harness.render import OFFLINE_HINT, render
+from harness.render import OFFLINE_HINT, linea_evento, render
 from harness.snapshot import Agents, Budget, Context, Snapshot, snapshot
 from harness.summary import PrAbierto, Resumen
 
@@ -370,6 +370,96 @@ class TestColor(unittest.TestCase):
     def test_el_texto_es_el_mismo_con_y_sin_color(self):
         limpio = re.sub(r"\033\[[0-9;]*m", "", render(SNAP, color=True))
         self.assertEqual(limpio, render(SNAP, color=False))
+
+
+def evento(**over):
+    """Una línea del log JSONL, como la escribe `EventLog`."""
+    linea = {"timestamp": "2026-08-26T21:41:00Z", "contexto": "personal",
+             "origen": "harness", "run_id": "r1", "ticket": None,
+             "attempt": None, "tipo": "corrida", "ref": "corrida",
+             "cuerpo": "inicio: 3 ticket(s), max 2 en paralelo", "clase": None}
+    linea.update(over)
+    return linea
+
+
+class TestLineaEvento(unittest.TestCase):
+    """La salida en vivo de `harness run` (ticket #81): cada evento del log
+    se imprime en una línea corta y legible, no el JSON crudo."""
+
+    def test_evento_de_corrida(self):
+        self.assertEqual(linea_evento(evento()),
+                         "21:41  corrida  inicio: 3 ticket(s), max 2 en paralelo")
+
+    def test_evento_de_ticket_muestra_el_numero_no_el_repo(self):
+        linea = linea_evento(evento(ticket="agent-harness#64", ref="ticket/64",
+                                    tipo="gate", cuerpo="verde"))
+        self.assertTrue(linea.startswith("21:41  #64"), linea)
+        self.assertIn("gate: verde", linea)
+        self.assertNotIn("agent-harness", linea)
+        self.assertNotIn("ticket/64", linea)
+
+    def test_el_tipo_se_distingue_y_corrida_no_se_repite(self):
+        linea = linea_evento(evento(ticket="koku#7", ref="ticket/7",
+                                    tipo="prompt",
+                                    cuerpo="intento 1: working"))
+        self.assertIn("prompt: intento 1: working", linea)
+        self.assertNotIn("corrida", linea)
+        # `corrida` no repite su nombre en el mensaje: la columna ya dice
+        # de qué se trata.
+        self.assertEqual(linea_evento(evento()).count("corrida"), 1)
+
+    def test_cuerpo_vacio_muestra_solo_el_tipo(self):
+        self.assertIn("limpieza", linea_evento(evento(ticket="koku#7",
+                                                       tipo="limpieza",
+                                                       cuerpo="")))
+
+    def test_no_es_json_crudo(self):
+        self.assertNotIn("{", linea_evento(evento()))
+        self.assertNotIn('"timestamp"', linea_evento(evento()))
+
+    def test_cuerpo_largo_se_corta(self):
+        linea = linea_evento(evento(cuerpo="x" * 300))
+        self.assertLessEqual(len(linea), 120)
+        self.assertTrue(linea.endswith("..."))
+
+    def test_hora_sale_del_timestamp(self):
+        self.assertTrue(linea_evento(evento(
+            timestamp="2026-08-26T22:05:00Z")).startswith("22:05"))
+
+    def test_timestamp_no_iso_no_se_rompe(self):
+        self.assertIn("otra-timestamp",
+                      linea_evento(evento(timestamp="otra-timestamp")))
+
+    def test_sin_color_no_hay_escapes(self):
+        """stdout no TTY: sin escapes ni caracteres de control (AC #81)."""
+        for tipo, cuerpo in (("abandono", "gate rojo"), ("gate", "verde"),
+                             ("corrida", "fin: 1 hecho(s)"), ("peldano", "peldaño 1")):
+            linea = linea_evento(evento(tipo=tipo, cuerpo=cuerpo), color=False)
+            self.assertNotIn("\033", linea)
+            self.assertNotIn("\r", linea)
+
+    def test_color_marca_el_estado(self):
+        """Con TTY el veredicto se distingue: abandono rojo, gate verde y
+        fin de corrida verdes, el peldaño en su propio color."""
+        from harness.render import COLOR
+        self.assertIn(COLOR.red, linea_evento(evento(tipo="abandono",
+                                                     cuerpo="gate rojo"),
+                                              color=True))
+        self.assertIn(COLOR.grn, linea_evento(evento(tipo="gate",
+                                                     cuerpo="verde"), color=True))
+        self.assertIn(COLOR.grn, linea_evento(evento(tipo="corrida",
+                                                     cuerpo="fin: 1 hecho(s)"),
+                                              color=True))
+        self.assertIn(COLOR.cya, linea_evento(evento(tipo="peldano",
+                                                     cuerpo="peldaño 1"),
+                                              color=True))
+
+    def test_el_texto_es_el_mismo_con_y_sin_color(self):
+        for tipo, cuerpo in (("abandono", "gate rojo"), ("gate", "verde"),
+                             ("peldano", "peldaño 1"), ("corrida", "inicio")):
+            con = linea_evento(evento(tipo=tipo, cuerpo=cuerpo), color=True)
+            sin = linea_evento(evento(tipo=tipo, cuerpo=cuerpo), color=False)
+            self.assertEqual(re.sub(r"\033\[[0-9;]*m", "", con), sin)
 
 
 class TestPolaridad(unittest.TestCase):
