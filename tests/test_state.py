@@ -510,5 +510,55 @@ class TestReposQueCompartenNumeroDeIssue(unittest.TestCase):
                           "pi": {"exito": 0, "abandono": 1}})
 
 
+class TestCostoPromedio(unittest.TestCase):
+    """#68: el costo medio por ticket del historial. Con él el presupuesto
+    dimensiona la tanda: sin él el tope por presupuesto no se aplica."""
+
+    def test_promedio_sobre_tickets_con_costo_medido(self):
+        evs = [ev("costo", "ticket/7", "$0.4000", "2026-08-22T12:00:00Z",
+                  run_id="r1", ticket="koku#7"),
+               ev("costo", "ticket/9", "$0.6000", "2026-08-22T13:00:00Z",
+                  run_id="r1", ticket="koku#9")]
+        self.assertAlmostEqual(state.costo_promedio(evs), 0.5)
+
+    def test_el_promedio_es_por_ticket_no_por_linea(self):
+        # dos intentos del mismo ticket: su costo acumulado es uno solo
+        evs = [ev("costo", "ticket/7", "$0.2000", "2026-08-22T12:00:00Z",
+                  run_id="r1"),
+               ev("costo", "ticket/7", "$0.4000", "2026-08-23T12:00:00Z",
+                  run_id="r2"),
+               ev("costo", "ticket/9", "$0.4000", "2026-08-22T13:00:00Z",
+                  run_id="r1", ticket="koku#9")]
+        self.assertAlmostEqual(state.costo_promedio(evs), 0.4)
+
+    def test_un_ticket_que_no_gasto_no_diluye_el_promedio(self):
+        # cero = nunca prendió agente: diluir el promedio con ceros haría
+        # crecer la tanda más de lo que la plata alcanza
+        evs = [ev("costo", "ticket/7", "$0.0000", "2026-08-22T12:00:00Z",
+                  run_id="r1"),
+               ev("costo", "ticket/9", "$0.8000", "2026-08-22T13:00:00Z",
+                  run_id="r1", ticket="koku#9")]
+        self.assertAlmostEqual(state.costo_promedio(evs), 0.8)
+
+    def test_sin_historial_ni_promedio(self):
+        self.assertIsNone(state.costo_promedio([]))
+        evs = [ev("gate", "ticket/7", "verde", "2026-08-22T12:00:00Z")]
+        self.assertIsNone(state.costo_promedio(evs))
+
+    def test_lineas_viejas_no_cuentan(self):
+        evs = [vieja("costo", "ticket/7", "$0.5000", "2026-08-22T12:00:00Z")]
+        self.assertIsNone(state.costo_promedio(evs))
+
+    def test_el_costo_de_corrida_no_es_costo_de_ticket(self):
+        # la línea `costo` de la corrida no tiene `ticket` y su cuerpo no
+        # es un precio plano: entra al log, no al promedio
+        evs = [ev("costo", "corrida",
+                  "creditos antes 0.0 / despues 1.0 / delta $1.0000",
+                  "2026-08-22T12:00:00Z", run_id="r1", ticket=None),
+               ev("costo", "ticket/7", "$0.6000", "2026-08-22T12:30:00Z",
+                  run_id="r1")]
+        self.assertAlmostEqual(state.costo_promedio(evs), 0.6)
+
+
 if __name__ == "__main__":
     unittest.main()
