@@ -457,6 +457,116 @@ class EventLog:
         return linea
 
 
+# --------------------------------------------------------------------- bucle
+@dataclass
+class BucleSpec:
+    """Cómo corre el modo `--loop` (#88). Ningún bucle sin límite: corta
+    por el piso de presupuesto, el tope de pasadas con trabajo, el tope de
+    vueltas con la frontera vacía, o el archivo de freno."""
+
+    piso: float = 3.0            # no arranca otra pasada con menos crédito que esto
+    max_pasadas: int = 12        # tope duro de pasadas CON trabajo
+    espera: float = 60.0         # segundos entre pasadas con trabajo
+    espera_vacia: float = 300.0  # frontera vacía: espera más larga, no es el fin (#101)
+    vueltas_vacias_max: int = 60  # tope contra estar mirando para siempre
+
+
+@dataclass
+class Pasada:
+    """El resultado de una pasada, visto desde el bucle.
+
+    La frontera se recalcula adentro de la pasada (relee el log de eventos
+    y GitHub, no memoria): un ticket que se parkeó deja de entrar y uno que
+    se destrabó entra. El bucle sólo decide si repite.
+
+    `log` es el EventLog de ESTA pasada (nuevo run_id): si hay, el bucle
+    anota la pasada ahí, para que la corrida y su línea `pasada` se lean de
+    la misma corrida; sin `log` se anota en el log que recibió el bucle."""
+
+    trabajo: bool
+    detalle: str = ""
+    log: "EventLog | None" = None
+
+
+def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
+          dormir=None):
+    """El modo `--loop` (#88): repite la pasada hasta que la frontera se
+    vacíe — y la frontera vacía no es el fin de la noche, es una espera
+    (#101): un issue etiquetado a las 4am tiene que encontrar el bucle
+    todavía vivo.
+
+    Ningún bucle sin límite. El corte es siempre por una de estas, y queda
+    anotado en el log de eventos con su motivo:
+    - el archivo de freno aparece — se atiende entre pasadas, nunca en
+      medio de una (#88);
+    - el crédito restante baja del piso (`creditos()` -> float | None; sin
+      medir, el piso no corta, los demás cortes sí);
+    - se agota el tope de pasadas CON trabajo (una vacía no gasta turno, #101);
+    - nada nuevo en `vueltas_vacias_max` vueltas con la frontera vacía.
+
+    Cada pasada queda en el log con su número (`pasada`, ref `bucle/N`).
+    `ejecutar_pasada` -> `Pasada` es una pasada completa; `dormir` es el
+    reloj — los tests inyectan uno que no espera de verdad. `log` es el
+    EventLog de respaldo (las pasadas que no traen su propio log, y el corte
+    si no hubo pasadas). Devuelve el motivo del corte.
+    """
+    if dormir is None:
+        # Sin inyectar: el real. Se resuelve en la llamada, no en el `def`,
+        # para que parchear `time.sleep` alcance a esta corrida.
+        dormir = time.sleep
+    def freno_puesto():
+        return bool(freno) and Path(freno).exists()
+
+    def creditos_restantes():
+        if creditos is None:
+            return None
+        try:
+            v = creditos()
+        except (TypeError, ValueError):
+            return None
+        return None if v is None else float(v)
+
+    pasadas = 0    # las que encontraron trabajo
+    vacias = 0     # las seguidas sin nada en la frontera
+    n = 0
+    alvo = log
+    while True:
+        if freno_puesto():
+            motivo = "freno puesto ({})".format(freno)
+            break
+        c = creditos_restantes()
+        if c is not None and c < spec.piso:
+            motivo = "presupuesto US${:.2f} bajo el piso de US${:.2f}".format(
+                c, spec.piso)
+            break
+        if pasadas >= spec.max_pasadas:
+            motivo = "tope de {} pasadas con trabajo".format(spec.max_pasadas)
+            break
+        if vacias >= spec.vueltas_vacias_max:
+            motivo = "nada nuevo en {} vueltas".format(spec.vueltas_vacias_max)
+            break
+        n += 1
+        p = ejecutar_pasada()
+        if p.log is not None:
+            alvo = p.log
+        if p.trabajo:
+            pasadas += 1
+            vacias = 0
+            alvo.write("pasada", "bucle/{}".format(n),
+                       "pasada {}: {}".format(n, p.detalle))
+            espera = spec.espera
+        else:
+            vacias += 1
+            alvo.write("pasada", "bucle/{}".format(n),
+                       "pasada {}: frontera vacia (vuelta {} de {}), "
+                       "espero {}s".format(n, vacias, spec.vueltas_vacias_max,
+                                           int(spec.espera_vacia)))
+            espera = spec.espera_vacia
+        dormir(espera)
+    alvo.write("bucle", "bucle", "corte: " + motivo)
+    return motivo
+
+
 # --------------------------------------------------------------------- jobs
 @dataclass
 class Job:
@@ -517,7 +627,7 @@ class Dispatcher:
     """Lanza y cosecha la frontera. Todo el mundo entra por callables,
     para que los tests no necesiten herdr ni git de verdad."""
 
-    def __init__(self, spec, log, run_cmd, credits=None, dormir=time.sleep,
+    def __init__(self, spec, log, run_cmd, credits=None, dormir=None,
                  costo_real=None, salida_real=None):
         self.spec = spec
         self.log = log
@@ -533,7 +643,9 @@ class Dispatcher:
         # corrida, para no leer los intentos de anoche.
         self._desde = None
         self.credits = credits or (lambda: None)  # () -> usado (float) | None
-        self.dormir = dormir
+        # Sin inyectar, el reloj real; resuelto en la llamada para que
+        # parchear `time.sleep` alcance a esta instancia.
+        self.dormir = dormir or time.sleep
 
     def _log(self, job, tipo, ref, cuerpo, clase=None):
         """Evento de un job: además de lo fijo, el ticket ("repo#issue") y
