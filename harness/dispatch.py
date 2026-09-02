@@ -548,7 +548,7 @@ class Pasada:
 
 
 def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
-          dormir=None):
+          dormir=None, proposer_vacio=None):
     """El modo `--loop` (#88): repite la pasada hasta que la frontera se
     vacíe — y la frontera vacía no es el fin de la noche, es una espera
     (#101): un issue etiquetado a las 4am tiene que encontrar el bucle
@@ -562,6 +562,13 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
       medir, el piso no corta, los demás cortes sí);
     - se agota el tope de pasadas CON trabajo (una vacía no gasta turno, #101);
     - nada nuevo en `vueltas_vacias_max` vueltas con la frontera vacía.
+
+    La frontera vacía se gasta en proponer trabajo nuevo, no en esperar en
+    blanco (#115): si hay `proposer_vacio`, el bucle lo corre la PRIMERA
+    vez que encuentra la frontera vacía (una vez por bucle, no en cada
+    vuelta: el tope por corrida ya corta, y la cola de triage es de un
+    humano, no de la máquina). Un fallo del proposer no tumba el bucle: se
+    anota y se espera igual.
 
     Cada pasada queda en el log con su número (`pasada`, ref `bucle/N`).
     `ejecutar_pasada` -> `Pasada` es una pasada completa; `dormir` es el
@@ -587,6 +594,7 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
 
     pasadas = 0    # las que encontraron trabajo
     vacias = 0     # las seguidas sin nada en la frontera
+    propuesto = False  # el proposer de frontera vacía corre una vez por bucle
     n = 0
     alvo = log
     while True:
@@ -620,6 +628,18 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
                        "pasada {}: frontera vacia (vuelta {} de {}), "
                        "espero {}s".format(n, vacias, spec.vueltas_vacias_max,
                                            int(spec.espera_vacia)))
+            if proposer_vacio is not None and not propuesto:
+                # #115: la hora más barata de la máquina no se gasta en
+                # preguntar si hay trabajo, se gasta en mirarlo. Una vez por
+                # bucle: después, la cola de needs-triage es del humano.
+                propuesto = True
+                try:
+                    detalle = proposer_vacio()
+                except Exception as e:
+                    detalle = "fallo del proposer: {}".format(e)
+                alvo.write("proponer", "bucle",
+                           "frontera vacia: {} (en vez de solo esperar, "
+                           "#115)".format(detalle))
             espera = spec.espera_vacia
         dormir(espera)
     alvo.write("bucle", "bucle", "corte: " + motivo)
@@ -778,6 +798,15 @@ class Dispatcher:
         trae baseline: la trae el mantenedor de conflictos (#56)."""
         return True
 
+    def _necesita_verificacion(self, job):
+        """¿El trabajo del job se verifica con commits y gate? Sí para un
+        ticket y un PR resuelto: verde significa "no rompe nada", y cero
+        commits significa que no hizo nada. Un job que no escribe código
+        (el proponer, #115) lo vuelve False: su red no es el gate, es la
+        validación mecánica que hace el harness sobre lo que el agente
+        dejó."""
+        return True
+
     def _done(self, job, ref):
         """La condición de terminación del job, después del gate verde:
         para un ticket, que el agente dejó un PR abierto sobre su rama; el
@@ -892,9 +921,11 @@ class Dispatcher:
                 pass  # ya se abandono con su motivo
             elif not self._arbol_limpio(job, ref):
                 pass  # ya se abandono con su motivo
-            elif not self._rama_con_commits(job, ref):
+            elif self._necesita_verificacion(job) \
+                    and not self._rama_con_commits(job, ref):
                 pass  # ya se abandono con su motivo
-            elif not self._gate_verde(job, ref):
+            elif self._necesita_verificacion(job) \
+                    and not self._gate_verde(job, ref):
                 pass  # ya se abandono con su motivo
             else:
                 self._done(job, ref)

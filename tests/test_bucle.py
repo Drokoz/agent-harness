@@ -322,7 +322,9 @@ class LaFronteraSeRecalcula(unittest.TestCase):
 
         def collect_mock(contexts):
             estado["n"] += 1
-            if estado["n"] >= 2:
+            # La vuelta 2 es el proposer de frontera vacía (#115), que hace
+            # su propia llamada de collect: el mundo no cambia por ella.
+            if estado["n"] >= 3:
                 # Un issue que se destraba en la madrugada, y el freno que
                 # corta el bucle entre la pasada 2 y la (inexistente) 3.
                 self.freno.write_text("")
@@ -373,6 +375,13 @@ class LaFronteraSeRecalcula(unittest.TestCase):
                             for e in eventos))
         self.assertIn("#9/agent-harness", texto)
         self.assertIn("parkeado", texto)  # "nada en la frontera (1 parkeado(s))"
+        # Con la frontera vacía, el bucle propone trabajo en vez de sólo
+        # esperar (#115): una vez, en la pasada que la encontró vacía.
+        prop = [e for e in eventos if e["tipo"] == "proponer" and e["ref"] == "bucle"]
+        self.assertEqual(len(prop), 1, "el proposer corre una vez por bucle")
+        self.assertIn("frontera vacia", prop[0]["cuerpo"])
+        self.assertEqual(prop[0]["run_id"], por_pasada[0]["run_id"],
+                         "el proposer escribe en el log de la pasada vacía")
         # El log de la corrida de #9 apunta a la segunda pasada, no a la primera.
         refs_9 = {e["run_id"] for e in eventos if e.get("ticket") == "agent-harness#9"}
         self.assertEqual(refs_9, {por_pasada[1]["run_id"]})
