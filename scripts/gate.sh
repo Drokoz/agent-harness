@@ -14,6 +14,13 @@ cd "$ROOT"
 
 fail() { echo "ROJO: $*" >&2; exit 1; }
 
+# Los chequeos sobre una salida capturada van con here-string, no con
+# `echo "$out" | grep -q`: `grep -q` corta apenas encuentra, `echo` se lleva un
+# SIGPIPE, y `pipefail` propaga ese 141 como si el chequeo hubiera fallado.
+# Es una carrera con el tamaño de la salida --- pasaba local y volteaba el
+# gate en el runner de CI, diciendo "la suite no corrió ningún test" con 721
+# tests en verde arriba.
+
 PY_CANDIDATES="${GATE_PY_CANDIDATES:-python3.9 /usr/bin/python3 python3}"
 PY=""
 TRIED=""
@@ -47,7 +54,7 @@ echo "== unittest"
 out=$("$PY" -m unittest discover -s tests -v 2>&1) \
   || { echo "$out"; fail "unittest"; }
 echo "$out"
-echo "$out" | grep -Eq 'Ran [1-9][0-9]* tests?' \
+grep -Eq 'Ran [1-9][0-9]* tests?' <<<"$out" \
   || fail "la suite no corrió ningún test (¿descubrimiento roto?)"
 
 # 3) Las reglas del guard son TypeScript y viven fuera de la suite de Python.
@@ -58,9 +65,9 @@ command -v node >/dev/null 2>&1 \
   || fail "no hay node y las reglas de extensions/harness-guard no se pueden testear"
 out=$(node --experimental-strip-types --test extensions/harness-guard/reglas.test.ts extensions/harness-guard/index.test.ts 2>&1) \
   || { echo "$out"; fail "tests de harness-guard"; }
-echo "$out" | grep -Eq '^# pass [1-9][0-9]*' \
+grep -Eq '^# pass [1-9][0-9]*' <<<"$out" \
   || { echo "$out"; fail "los tests de harness-guard no corrieron ninguno"; }
-echo "$out" | grep -E '^# (pass|fail)'
+grep -E '^# (pass|fail)' <<<"$out"
 
 # 4) Corrida real del CLI, punta a punta y sin red: modo sin adaptadores.
 echo "== harness status (offline)"
