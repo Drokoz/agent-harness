@@ -337,6 +337,38 @@ def motivos_de_abandono_pr(eventos, repo, pr):
            if e.get("ticket") == clave and e.get("tipo") == "abandono"]
 
 
+def ultimo_wip(eventos, repo, issue):
+    """El último commit WIP que quedó en la rama de este ticket (#80):
+    `(intento, motivo del abandono de esa corrida)`, o None si no hay.
+
+    Lo que el prompt del intento siguiente le dice al agente que lo
+    espera en la rama: de qué intento viene y con qué motivo se
+    abandonó. Cuenta sólo la línea `wip` con cuerpo "WIP:": es el
+    commit que de verdad quedó en la rama; el dispatcher escribe la
+    misma línea cuando el commit WIP FALLÓ ("el commit WIP fallo", etc.)
+    y ahí no hay nada que retomar.
+
+    Sobrevive a los abandonos posteriores: el commit sigue en la rama
+    aunque un intento después no haya dejado nada nuevo, y el próximo
+    prompt tiene que hablarlo igual. El motivo es el cuerpo de la línea
+    `abandono` de la misma corrida del WIP; sin ella (línea huérfana)
+    el WIP existe igual y el motivo sale vacío, no se calla."""
+    wip = None
+    for e in eventos:
+        if (_es_de(e, repo, issue) and e.get("tipo") == "wip"
+                and str(e.get("cuerpo", "")).startswith("WIP:")):
+            wip = (e.get("attempt") or 1, e.get("run_id") or _SIN_RUN)
+    if wip is None:
+        return None
+    intento, run = wip
+    motivo = ""
+    for e in eventos:
+        if (_es_de(e, repo, issue) and e.get("tipo") == "abandono"
+                and (e.get("run_id") or _SIN_RUN) == run):
+            motivo = str(e.get("cuerpo", ""))
+    return (intento, motivo)
+
+
 def ultimo_gate_rojo(eventos, repo, issue):
     """La cola del gate rojo más reciente de este ticket (sin el prefijo
     "rojo:"), o None si no hubo ninguno: lo que el peldaño 2 de la escalera

@@ -480,6 +480,76 @@ class TestUltimoGateRojo(unittest.TestCase):
         self.assertIsNone(state.ultimo_gate_rojo(evs, "koku", 7))
 
 
+class TestUltimoWip(unittest.TestCase):
+    """El último commit WIP en la rama de un ticket (#80): el intento
+    que lo dejó y el motivo con que ese intento se abandonó. Lo que el
+    prompt del intento siguiente le dice al agente que lo espera en la
+    rama. None si no hubo ningún commit WIP: sin WIP, prompt de siempre."""
+
+    def test_wip_devuelve_intento_y_motivo_de_su_abandono(self):
+        evs = [
+            ev("abandono", "ticket/7", "gate rojo en el worktree: sin PR",
+               "2026-08-22T12:10:00Z", run_id="r1", attempt=1, clase="modelo"),
+            ev("wip", "ticket/7",
+               "WIP: trabajo sin commitear que dejo el abandono de ticket/7 (intento 1)",
+               "2026-08-22T12:10:05Z", run_id="r1", attempt=1),
+        ]
+        self.assertEqual(state.ultimo_wip(evs, "koku", 7),
+                         (1, "gate rojo en el worktree: sin PR"))
+
+    def test_wip_fallido_no_cuenta(self):
+        """La línea `wip` se escribe también cuando el commit WIP FALLÓ:
+        ahí no hay commit en la rama y el prompt no debe prometer uno."""
+        evs = [
+            ev("abandono", "ticket/7", "arbol sucio",
+               "2026-08-22T12:10:00Z", run_id="r1", attempt=1, clase="modelo"),
+            ev("wip", "ticket/7", "el commit WIP fallo: nada que commitear",
+               "2026-08-22T12:10:05Z", run_id="r1", attempt=1),
+            ev("wip", "ticket/7", "no se pudieron agregar los cambios: fallo",
+               "2026-08-22T12:10:06Z", run_id="r1", attempt=1),
+        ]
+        self.assertIsNone(state.ultimo_wip(evs, "koku", 7))
+
+    def test_toma_el_mas_reciente_y_su_motivo(self):
+        evs = [
+            ev("abandono", "ticket/7", "gate rojo",
+               "2026-08-22T12:10:00Z", run_id="r1", attempt=1, clase="modelo"),
+            ev("wip", "ticket/7", "WIP: ... (intento 1)",
+               "2026-08-22T12:10:05Z", run_id="r1", attempt=1),
+            ev("abandono", "ticket/7", "timeout de espera",
+               "2026-08-23T12:10:00Z", run_id="r2", attempt=2, clase="modelo"),
+            ev("wip", "ticket/7", "WIP: ... (intento 2)",
+               "2026-08-23T12:10:05Z", run_id="r2", attempt=2),
+        ]
+        self.assertEqual(state.ultimo_wip(evs, "koku", 7), (2, "timeout de espera"))
+
+    def test_sobrevive_a_un_abandono_posterior_sin_wip(self):
+        """El commit WIP sigue en la rama aunque el intento siguiente se
+        abandone sin dejar nada nuevo: el prompt del próximo intento tiene
+        que hablar del WIP del intento 1, no callarlo."""
+        evs = [
+            ev("abandono", "ticket/7", "gate rojo",
+               "2026-08-22T12:10:00Z", run_id="r1", attempt=1, clase="modelo"),
+            ev("wip", "ticket/7", "WIP: ... (intento 1)",
+               "2026-08-22T12:10:05Z", run_id="r1", attempt=1),
+            ev("abandono", "ticket/7", "timeout de espera",
+               "2026-08-23T12:10:00Z", run_id="r2", attempt=2, clase="modelo"),
+        ]
+        self.assertEqual(state.ultimo_wip(evs, "koku", 7), (1, "gate rojo"))
+
+    def test_otro_ticket_no_contamina(self):
+        evs = [ev("wip", "ticket/8", "WIP: ... (intento 1)",
+                  "2026-08-22T12:10:05Z", ticket="koku#8")]
+        self.assertIsNone(state.ultimo_wip(evs, "koku", 7))
+
+    def test_wip_sin_abandono_en_el_log_tiene_motivo_vacio(self):
+        """Línea huérfana (el abandono se perdió): el WIP existe igual,
+        y el prompt lo dice con el motivo vacío en vez de no decirlo."""
+        evs = [ev("wip", "ticket/7", "WIP: ... (intento 1)",
+                  "2026-08-22T12:10:05Z", run_id="r1", attempt=1)]
+        self.assertEqual(state.ultimo_wip(evs, "koku", 7), (1, ""))
+
+
 class TestReposQueCompartenNumeroDeIssue(unittest.TestCase):
     """#72: dos repos que comparten el número de issue, con líneas de
     ambos esquemas en el mismo log. Las viejas (sin `ticket`) no se

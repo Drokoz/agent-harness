@@ -142,10 +142,11 @@ def spec(**kw):
 
 
 def job(issue=7, repo="koku", path="/repos/koku", slug="Drokoz/koku",
-        attempt=1, kind="", model="", extra_args=(), gate_tail=None):
+        attempt=1, kind="", model="", extra_args=(), gate_tail=None,
+        wip=None):
     return Job(repo=repo, repo_path=path, slug=slug, issue=issue,
                attempt=attempt, kind=kind, model=model,
-               extra_args=extra_args, gate_tail=gate_tail)
+               extra_args=extra_args, gate_tail=gate_tail, wip=wip)
 
 
 def job_de_peldano(escalados, **kw):
@@ -336,6 +337,42 @@ class TestPuros(unittest.TestCase):
         self.assertNotIn("\n", p)
         self.assertIn("TypeError: x is undefined", p)
         self.assertIn("at foo.js:12", p)
+
+    def test_prompt_sin_wip_es_el_de_siempre(self):
+        """#80: un ticket sin WIP previo no recibe ruido extra: el prompt
+        es idéntico al de siempre."""
+        self.assertEqual(prompt_de(7), prompt_de(7, wip=None))
+        self.assertEqual(prompt_de(7), prompt_de(7, wip=()))
+        self.assertNotIn("WIP", prompt_de(7))
+
+    def test_prompt_con_wip_lo_dice_todo(self):
+        """#80: que existe el WIP, de qué intento viene y con qué motivo se
+        abandonó; las dos opciones (retomar o descartar y empezar de cero);
+        que descartar es legítimo; dónde está la transcripción (#66); y que
+        la decisión queda registrada."""
+        wip = (2, "gate rojo en el worktree: sin PR",
+               "/logs/koku-ticket-7-intento-2.log")
+        p = prompt_de(7, wip=wip)
+        self.assertNotIn("\n", p)
+        # Existe, y de dónde viene.
+        self.assertIn("WIP commit left by the abandoned attempt 2", p)
+        self.assertIn("gate rojo en el worktree: sin PR", p)
+        # Las dos opciones, y que descartar no es un fracaso.
+        self.assertIn("resume from that WIP commit", p)
+        self.assertIn("discard it and start from scratch", p)
+        self.assertIn("legitimate choice", p)
+        self.assertIn("not a failure", p)
+        # La transcripción del intento anterior (#66).
+        self.assertIn("transcript at /logs/koku-ticket-7-intento-2.log", p)
+        # La decisión queda registrada, medible.
+        self.assertIn("WIP decision", p)
+
+    def test_prompt_con_wip_y_cola_de_gate_juntos(self):
+        """#80 + #38: las dos adiciones conviven en una sola línea."""
+        p = prompt_de(7, gate_tail="boom", wip=(1, "arbol sucio", "/t.log"))
+        self.assertNotIn("\n", p)
+        self.assertIn("boom", p)
+        self.assertIn("arbol sucio", p)
 
 
 class TestPeldanoDe(unittest.TestCase):
@@ -1842,6 +1879,50 @@ class TestEscaleraDispatcher(unittest.TestCase):
         args = self._args_de_start(m)
         cola = args[args.index("--") + 1:]
         self.assertEqual(cola, ["--model", "opus", "--effort", "medium"])
+
+
+class TestWipEnElPrompt(unittest.TestCase):
+    """#80: el dispatcher le manda al agente el prompt con el WIP cuando el
+    job lo trae (lo arma `bin/harness` de `state.ultimo_wip`), y el de
+    siempre cuando no. Mismo patrón que la cola del gate (#38): el Job ya
+    resuelto entra, y se verifica lo que sale por `herdr agent prompt`."""
+
+    def _prompt_enviado(self, m):
+        (prompt,) = m.llamo("herdr", "agent", "prompt")
+        return prompt[0][4]
+
+    def test_un_job_con_wip_envia_el_prompt_con_wip(self):
+        m = Mundo()
+        j = job(wip=(2, "gate rojo en el worktree: sin PR",
+                     "/logs/koku-ticket-7-intento-2.log"))
+        res, _ = despachar(m, [j])
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        texto = self._prompt_enviado(m)
+        self.assertIn("WIP commit left by the abandoned attempt 2", texto)
+        self.assertIn("gate rojo en el worktree: sin PR", texto)
+        self.assertIn("resume from that WIP commit", texto)
+        self.assertIn("discard it and start from scratch", texto)
+        self.assertIn("legitimate choice", texto)
+        self.assertIn("transcript at /logs/koku-ticket-7-intento-2.log", texto)
+        self.assertIn("WIP decision", texto)
+        self.assertNotIn("\n", texto)
+
+    def test_un_job_sin_wip_envia_el_prompt_de_siempre(self):
+        """Sin WIP previo, nada de ruido extra: el prompt no lo menciona."""
+        m = Mundo()
+        despachar(m, [job()])
+        texto = self._prompt_enviado(m)
+        self.assertNotIn("WIP", texto)
+        self.assertNotIn("transcript", texto)
+
+    def test_wip_y_cola_de_gate_viajan_juntos(self):
+        m = Mundo()
+        j = job(gate_tail="boom", wip=(1, "arbol sucio", "/t.log"))
+        despachar(m, [j])
+        texto = self._prompt_enviado(m)
+        self.assertIn("boom", texto)
+        self.assertIn("WIP", texto)
+        self.assertNotIn("\n", texto)
 
 
 class TestRouterSeam(unittest.TestCase):
