@@ -2033,8 +2033,15 @@ class TestBaseConGitReal(unittest.TestCase):
     hacer `git pull`—, rama nueva y rama reutilizada terminan sobre la
     misma base."""
 
+    # La identidad va en CADA llamada, no configurada en un repo: el
+    # `avance` es un `clone` y nadie se la ponía, así que `commit` salía 128
+    # en cualquier máquina sin identidad global -- el runner de CI, por
+    # ejemplo, donde el gate venía rojo desde el 2026-08-26 sin que nadie
+    # mirara.
+    IDENT = ("-c", "user.email=t@e.com", "-c", "user.name=T")
+
     def _g(self, cwd, *args):
-        subprocess.run(["git", *args], cwd=cwd, check=True,
+        subprocess.run(["git", *self.IDENT, *args], cwd=cwd, check=True,
                        capture_output=True, text=True)
 
     def _sha(self, cwd, ref):
@@ -2050,8 +2057,6 @@ class TestBaseConGitReal(unittest.TestCase):
         local = Path(tmp) / "koku"
         local.mkdir()
         self._g(local, "init", "-b", "main")
-        self._g(local, "config", "user.email", "t@e.com")
-        self._g(local, "config", "user.name", "T")
         self._g(local, "remote", "add", "origin", str(origen))
         (local / "f.txt").write_text("1\n")
         self._g(local, "add", ".")
