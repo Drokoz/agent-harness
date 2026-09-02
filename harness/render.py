@@ -90,6 +90,16 @@ def _resumen(r, c, out):
         out(f"   {c.red}⊘{c.off} {len(r.trabados)} trabado(s)")
         for t in r.trabados:
             out(f"     · {t.contexto} {t.ref}: {t.motivo[:72]}")
+    if r.bloqueos:
+        # Lo que más dice de una noche (#95): un agente que volvió a
+        # intentar lo que el guard le bloqueó es una señal sobre el
+        # prompt, el modelo o el ticket. Repetidos (mismo ticket, mismo
+        # motivo) van agrupados con su conteo, no repetidos.
+        total = sum(b.conteo for b in r.bloqueos)
+        out(f"   {c.red}⛔{c.off} {total} bloqueo(s) del guard")
+        for b in r.bloqueos:
+            x = f" {c.dim}x{b.conteo}{c.off}" if b.conteo > 1 else ""
+            out(f"     · {b.ticket or '?'} {b.motivo[:72]}{x}")
     if r.prs:
         out(f"   {c.yel}◌{c.off} {len(r.prs)} PR abierto(s) esperando review")
         for p in r.prs:
@@ -334,7 +344,7 @@ def linea_evento(linea, color=True):
     if len(msg) > 100:
         msg = msg[:97] + "..."
     col = ""
-    if tipo == "abandono":
+    if tipo in ("abandono", "guard"):
         col = c.red
     elif tipo == "peldano":
         col = c.cya

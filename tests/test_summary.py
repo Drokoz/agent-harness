@@ -17,9 +17,10 @@ from pathlib import Path
 
 import support  # noqa: F401  (pone la raíz en sys.path)
 
-from harness.summary import (PrAbierto, Resumen, Ticket, con_cuota, construir,
-                             filtrar, guardar_marca, leer_eventos, leer_marca,
-                             parse_evento, parse_fecha, reconciliar, resumir)
+from harness.summary import (Bloqueo, PrAbierto, Resumen, Ticket, bloqueos_de,
+                             con_cuota, construir, filtrar, guardar_marca,
+                             leer_eventos, leer_marca, parse_evento, parse_fecha,
+                             reconciliar, resumir)
 
 HARNESS = support.ROOT / "bin" / "harness"
 
@@ -186,6 +187,62 @@ class TestResumir(unittest.TestCase):
         eventos = [json.loads(evento("2026-08-22T01:00:00Z", "gate",
                                      "ticket/3", cuerpo="verde"))]
         self.assertEqual(resumir(eventos), ([], [], 0.0))
+
+
+class TestBloqueos(unittest.TestCase):
+    """Los bloqueos del guard (#95) sobre logs sintéticos: sin bloqueos,
+    uno, y varios del mismo ticket con el mismo motivo — que se agrupan
+    en vez de repetirse."""
+
+    def guard(self, ts, ticket="agent-harness#95",
+              cuerpo="gh pr merge --yes -- el merge es decision humana"):
+        return json.loads(evento(ts, "guard", "ticket/95", cuerpo=cuerpo,
+                                 ticket=ticket))
+
+    def test_sin_bloqueos(self):
+        self.assertEqual(bloqueos_de([json.loads(l) for l in LOG_NORMAL]), [])
+
+    def test_un_bloqueo(self):
+        out = bloqueos_de([self.guard("2026-08-22T03:00:00Z")])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].ticket, "agent-harness#95")
+        # El motivo es lo que va después del " -- " que escribe el guard.
+        self.assertEqual(out[0].motivo, "el merge es decision humana")
+        self.assertEqual(out[0].conteo, 1)
+
+    def test_repetidos_del_mismo_ticket_se_agrupan(self):
+        """Tres intentos del mismo merge = una señal, no tres líneas."""
+        eventos = [self.guard(f"2026-08-22T03:0{i}:00Z") for i in range(3)]
+        eventos.append(self.guard(
+            "2026-08-22T04:00:00Z",
+            cuerpo="git push --force origin ticket/95 -- reescribe historia"))
+        out = bloqueos_de(eventos)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0].conteo, 3)
+        self.assertEqual(out[0].motivo, "el merge es decision humana")
+        self.assertEqual(out[1].conteo, 1)
+        self.assertEqual(out[1].motivo, "reescribe historia")
+
+    def test_mismo_motivo_distinto_ticket_no_se_agrupa(self):
+        eventos = [self.guard("2026-08-22T03:00:00Z"),
+                   self.guard("2026-08-22T03:10:00Z", ticket="agent-harness#96")]
+        self.assertEqual(len(bloqueos_de(eventos)), 2)
+
+    def test_cuerpo_sin_separador_no_se_pierde(self):
+        out = bloqueos_de([self.guard("2026-08-22T03:00:00Z",
+                                      cuerpo="formato inesperado")])
+        self.assertEqual(out[0].motivo, "formato inesperado")
+
+    def test_ticket_faltante_no_rompe(self):
+        out = bloqueos_de([self.guard("2026-08-22T03:00:00Z", ticket=None)])
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0].ticket)
+
+    def test_construir_incluye_bloqueos_y_paso_algo(self):
+        """Un log con SÓLO un bloqueo ya cuenta como "pasó algo"."""
+        r = construir([self.guard("2026-08-22T03:00:00Z")], [])
+        self.assertTrue(r.paso_algo)
+        self.assertEqual(len(r.bloqueos), 1)
 
 
 class TestReconciliar(unittest.TestCase):

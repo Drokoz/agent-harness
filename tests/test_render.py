@@ -130,6 +130,30 @@ class TestResumen(unittest.TestCase):
         self.assertIn("· agent-harness #19 Fix", salida)
         self.assertIn("costo del período: $0.77", salida)
 
+    def test_bloqueos_del_guard_con_repetidos_agrupados(self):
+        """(#95) El bloqueo repetido (mismo ticket, mismo motivo) aparece una
+        sola vez con su conteo, y el total cuenta intentos, no líneas."""
+        from harness.summary import Bloqueo
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    bloqueos=[Bloqueo(ticket="agent-harness#95",
+                                      motivo="el merge es decision humana",
+                                      conteo=3),
+                              Bloqueo(ticket=None,
+                                      motivo="reescribe historia", conteo=1)])
+        salida = self.pantalla(r)
+        self.assertIn("4 bloqueo(s) del guard", salida)
+        self.assertIn("agent-harness#95 el merge es decision humana x3", salida)
+        # Sin ticket no se inventa uno: va con "?".
+        self.assertIn("· ? reescribe historia", salida)
+
+    def test_cero_bloqueos_no_ocupan_lugar(self):
+        """(#95) No gastar pantalla para decir que no pasó nada."""
+        from harness.summary import Trabado
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    trabados=[Trabado(contexto="personal", ref="ticket/11",
+                                      motivo="gate rojo")])
+        self.assertNotIn("bloqueos del guard", self.pantalla(r))
+
     def test_offline(self):
         salida = self.pantalla(Resumen(estado="offline"))
         self.assertIn("Resumen", salida)
@@ -444,6 +468,11 @@ class TestLineaEvento(unittest.TestCase):
         from harness.render import COLOR
         self.assertIn(COLOR.red, linea_evento(evento(tipo="abandono",
                                                      cuerpo="gate rojo"),
+                                              color=True))
+        # El bloqueo del guard es la línea que más dice de una noche (#95).
+        self.assertIn(COLOR.red, linea_evento(evento(tipo="guard",
+                                                     cuerpo="gh pr merge --yes -- "
+                                                           "el merge es decision humana"),
                                               color=True))
         self.assertIn(COLOR.grn, linea_evento(evento(tipo="gate",
                                                      cuerpo="verde"), color=True))

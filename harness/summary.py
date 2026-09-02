@@ -78,6 +78,22 @@ class Trabado:
 
 
 @dataclass
+class Bloqueo:
+    """Un bloqueo del guard (`extensions/harness-guard`): una llamada a una
+    tool que el agente intentó y el guard rechazó antes de ejecutarla.
+
+    `ticket` es el campo del evento ("repo#issue"); None si la línea no lo
+    trae. `conteo` agrupa los intentos repetidos — mismo ticket, mismo
+    motivo: un agente que prueba `gh pr merge` tres veces es una señal,
+    no tres líneas iguales (#95).
+    """
+
+    ticket: Optional[str]
+    motivo: str
+    conteo: int = 1
+
+
+@dataclass
 class PrAbierto:
     """Un PR abierto ahora, traído por el snapshot, no por el log."""
 
@@ -105,6 +121,7 @@ class Resumen:
     hasta: Optional[str] = None
     tickets: List[Ticket] = field(default_factory=list)
     trabados: List[Trabado] = field(default_factory=list)
+    bloqueos: List[Bloqueo] = field(default_factory=list)
     prs: List[PrAbierto] = field(default_factory=list)
     costo: float = 0.0
     cuota_semana: Optional[float] = None
@@ -112,7 +129,8 @@ class Resumen:
 
     @property
     def paso_algo(self):
-        return bool(self.tickets or self.trabados or self.prs or self.costo > 0)
+        return bool(self.tickets or self.trabados or self.bloqueos
+                    or self.prs or self.costo > 0)
 
 
 # --------------------------------------------------------------------- eventos
@@ -209,6 +227,43 @@ def resumir(eventos):
     return tickets, trabados, costo
 
 
+def _motivo_guard(cuerpo):
+    """El motivo de un evento `guard`.
+
+    El guard escribe `<detalle> -- <motivo>`; el motivo es la razón de la
+    regla que disparó, y es con lo que se agrupan los repetidos. Sin el
+    separador (línea extraña) el cuerpo entero es el motivo: no se pierde
+    un bloqueo por un formato que no se esperaba.
+    """
+    cuerpo = str(cuerpo).strip()
+    if " -- " in cuerpo:
+        return cuerpo.rsplit(" -- ", 1)[1].strip() or cuerpo
+    return cuerpo
+
+
+def bloqueos_de(eventos):
+    """Los bloqueos del período, agrupados por (ticket, motivo) (#95).
+
+    El orden es el de primera aparición. Un log sin bloqueos da `[]`:
+    con cero bloqueos no se ocupa espacio para decir que no pasó nada.
+    """
+    grupos = {}
+    orden = []
+    for e in eventos:
+        if e.get("tipo") != "guard":
+            continue
+        ticket = e.get("ticket")
+        if not isinstance(ticket, str) or not ticket:
+            ticket = None
+        clave = (ticket, _motivo_guard(e.get("cuerpo")))
+        if clave in grupos:
+            grupos[clave].conteo += 1
+        else:
+            grupos[clave] = Bloqueo(ticket=ticket, motivo=clave[1])
+            orden.append(grupos[clave])
+    return orden
+
+
 def reconciliar(tickets, resolver):
     """Los tickets con su estado en vivo, cuando se puede consultar.
 
@@ -238,7 +293,8 @@ def construir(eventos, prs, estado="ok", desde=None, hasta=None, resolver_pr=Non
     if resolver_pr is not None:
         tickets = reconciliar(tickets, resolver_pr)
     return Resumen(estado=estado, desde=desde, hasta=hasta,
-                   tickets=tickets, trabados=trabados, prs=list(prs), costo=costo)
+                   tickets=tickets, trabados=trabados,
+                   bloqueos=bloqueos_de(eventos), prs=list(prs), costo=costo)
 
 
 def con_cuota(resumen, cuota_semana=None, cuota_semana_harness=None,
@@ -296,6 +352,7 @@ def as_dict(r: Resumen):
         "hasta": r.hasta,
         "tickets": [asdict(t) for t in r.tickets],
         "trabados": [asdict(t) for t in r.trabados],
+        "bloqueos": [asdict(b) for b in r.bloqueos],
         "prs": [asdict(p) for p in r.prs],
         "costo": r.costo,
         "cuota_semana": r.cuota_semana,
