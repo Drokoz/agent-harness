@@ -596,6 +596,9 @@ class Job:
     model: str = ""
     extra_args: Tuple[str, ...] = ()          # --thinking/--effort del peldaño
     gate_tail: Optional[str] = None           # cola del gate rojo del intento anterior
+    # El primer prompt no llego (#113): no es un veredicto todavía, lo
+    # decide `dispatch` al ver si quedan vueltas para recolocarlo.
+    prompt_perdido: bool = False
 
 
 @dataclass
@@ -613,9 +616,21 @@ class DispatchSpec:
     install_timeout: int = 900    # segundos para instalar dependencias
     start_retries: int = 4        # reintentos de agent start (pane sin shell)
     start_wait_s: float = 2.0     # espera entre reintentos de arranque
-    verify_retries: int = 3       # reintentos si el primer prompt se pierde
+    # La carrera del primer prompt (#113), medida en el log de la noche del
+    # 2026-08-26: el `agent prompt --wait` devuelve `agent_prompt_stalled`
+    # en ~3s en vez de esperar `verify_wait_s`, así que los 3 reintentos
+    # antiguos entraban en una ventana de 16s y, con la máquina cargada,
+    # 5 de 9 tickets agotaban la corrida entera. El agente sano se cura en
+    # ~3s, así que la ventana se ensancha repartiendo la espera en vez de
+    # apretar los intentos:
+    verify_retries: int = 5       # reintentos si el primer prompt se pierde (#113)
     verify_wait_s: float = 30.0   # cuánto esperar a que el contexto salga de 0%
-    verify_poll_s: float = 2.0
+    verify_poll_s: float = 10.0   # espera entre intentos del prompt (#113)
+    # Si la ventana entera termina sin que el prompt llegue, el job no
+    # abandona la corrida: vuelve a la cola de la MISMA corrida (no de la
+    # pasada siguiente), hasta estas veces (#113); agotadas, se abandona
+    # `infra`.
+    prompt_requeues: int = 2
     infra_retries: int = 2        # reintentos en el acto de un abandono infra (#37)
     infra_retry_wait_s: float = 2.0
     # El router (#38, seam para #45): si no es None, se consulta antes de
@@ -710,7 +725,13 @@ class Dispatcher:
     def dispatch(self, jobs):
         """Toda la corrida: los jobs en paralelo (hasta el tope), el costo
         medido con los creditos de antes y después, y las líneas de principio
-        y fin. Devuelve los jobs con su estado final."""
+        y fin. Devuelve los jobs con su estado final.
+
+        Un job que pierde el primer prompt no abandona la corrida: vuelve a
+        la cola de ESTA misma corrida (su worktree y pane ya quedaron
+        limpios en `_limpiar`) hasta `spec.prompt_requeues` veces — perder
+        una pasada entera por la carrera con la TUI de pi cuesta una hora;
+        reintentar cuesta un arranque de agente (#113)."""
         ref = "corrida"
         self.log.write(self._tipo_corrida, ref,
                        "inicio: {} ticket(s), max {} en paralelo".format(
@@ -723,8 +744,25 @@ class Dispatcher:
         # ticket (#85): sin fetch, origin/<rama por defecto> puede estar
         # viejo y rebasar contra él da la sensación de estar al día.
         self._fetch_base(jobs)
+        resultados = []
+        vueltas_prompt = {}
         with cf.ThreadPoolExecutor(max_workers=max(1, self.spec.max_parallel)) as ex:
-            resultados = list(ex.map(self.run_job, jobs))
+            cola = list(jobs)
+            en_vuelo = set()
+            while cola or en_vuelo:
+                for j in cola:
+                    en_vuelo.add(ex.submit(self.run_job, j))
+                cola = []
+                # Sin barrera: al primer job que termina se lo procesa de
+                # inmediato, y si perdió el prompt se recoloca para ocupar
+                # el slot liberado mientras los otros siguen corriendo.
+                hecho, _ = cf.wait(en_vuelo, return_when=cf.FIRST_COMPLETED)
+                en_vuelo.difference_update(hecho)
+                for f in hecho:
+                    j = f.result()
+                    resultados.append(j)
+                    if self._volver_a_cola(j, vueltas_prompt):
+                        cola.append(j)
         despues = self.credits()
         self._repartir_costo(resultados, antes, despues, desde)
         if antes is not None and despues is not None:
@@ -777,9 +815,10 @@ class Dispatcher:
             elif not self._agente(job, ref):
                 self._abandonar(job, ref, "no arranco el agente", clase="infra")
             elif not self._prompt_verificado(job, ref):
-                self._abandonar(job, ref, "primer prompt perdido: el contexto "
-                                          "no salio de 0% en {} intentos".format(
-                                              self.spec.verify_retries), clase="infra")
+                # No se abandona acá (#113): `dispatch` decide si el job
+                # vuelve a la cola de esta misma corrida o si se abandona
+                # al agotarse las vueltas. El resto de la cadena se salta.
+                job.prompt_perdido = True
             elif self._bloqueado(job, ref):
                 pass  # ya se abandono con su motivo
             elif not self._arbol_limpio(job, ref):
@@ -793,6 +832,36 @@ class Dispatcher:
         finally:
             self._limpiar(job, ref)
         return job
+
+    def _volver_a_cola(self, job, vueltas):
+        """(#113) La ventana entera de reintentos terminó y el prompt no
+        llegó: en vez de abandonar la corrida, el job vuelve a la cola de
+        ESTA misma corrida. `_limpiar` ya cerró el pane y quitó el
+        worktree (la rama quedó: `_worktree` la reutiliza y rebasa, igual
+        que entre pasadas), así que aquí solo se reinicia el estado del
+        job. Agotadas `spec.prompt_requeues`, sí abandona `infra`."""
+        if not getattr(job, "prompt_perdido", False):
+            return False
+        clave = id(job)
+        n = vueltas.get(clave, 0)
+        ref = self._ref_de(job)
+        if n >= self.spec.prompt_requeues:
+            self._abandonar(job, ref, "primer prompt perdido: el contexto "
+                                      "no salio de 0% en {} intentos".format(
+                                          self.spec.verify_retries),
+                            clase="infra")
+            return False
+        vueltas[clave] = n + 1
+        job.estado = "pendiente"
+        job.motivo = ""
+        job.clase_abandono = ""
+        job.prompt_perdido = False
+        job.pane = ""
+        job.agent = ""
+        self._log(job, "prompt", ref,
+                  "prompt perdido: vuelve a la cola de la misma corrida "
+                  "(vuelta {} de {})".format(n + 1, self.spec.prompt_requeues))
+        return True
 
     def _permitir_claude(self, job):
         """(permitido, motivo). Sólo se consulta si el peldaño de este job
