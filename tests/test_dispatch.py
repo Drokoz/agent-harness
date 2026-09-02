@@ -675,13 +675,82 @@ class TestPromptPerdido(unittest.TestCase):
         self.assertEqual(len(intentos), 2)
 
     def test_si_nunca_sube_se_abandona(self):
+        # `prompt_requeues=0` desactiva la recolocación de la misma corrida
+        # (#113) y deja el comportamiento antiguo: la ventana entera de
+        # intentos es todo lo que el job recibe.
         m = Mundo(pane_out=PANE_CERO)
         res, lineas = despachar(m, [job()], verify_wait_s=0.01,
-                                verify_poll_s=0.01, verify_retries=3)
+                                verify_poll_s=0.01, verify_retries=3,
+                                prompt_requeues=0)
         self.assertEqual(res[0].estado, "abandonado")
         self.assertIn("0%", res[0].motivo)
         self.assertEqual(len(m.llamo("herdr", "agent", "prompt")), 3)
         self.assertIn("abandono", [l["tipo"] for l in lineas])
+
+
+class TestPromptPerdidoMismaCorrida(unittest.TestCase):
+    """#113: el prompt perdido no termina la corrida del ticket en esa
+    corrida: si no llega, el job vuelve a la cola de la MISMA corrida, no
+    de la pasada siguiente. La evidencia es la noche del 2026-08-26: 4 de
+    9 tickets perdieron el primer prompt en dos pasadas seguidas (los
+    reintentos entraban en 16s, porque `agent prompt --wait` devuelve
+    `agent_prompt_stalled` en ~3s en vez de esperar) y recién corrieron
+    en la tercera, dos horas después.
+    """
+
+    def test_prompt_que_llega_tarde_se_recupera_en_la_misma_corrida(self):
+        # El agente recién recibe el prompt en su segundo arranque: la
+        # primera vuelta (worktree, pane, agente, prompt) lo pierde y el
+        # job vuelve a la cola; en la segunda llega.
+        m = Mundo(pane_out=PANE_CERO)
+        lanzamientos = {"n": 0}
+
+        def agente_start(args):
+            lanzamientos["n"] += 1
+            if lanzamientos["n"] >= 2:
+                return (True, '{"result":{"agent":{"agent_status":"working"}}}')
+            return (True, '{"result":{"agent":{"agent_status":"stalled"}}}')
+
+        def prompt(args):
+            # La TUI recién acepta el prompt desde el segundo arranque:
+            # antes, el envío no levanta el estado.
+            if lanzamientos["n"] >= 2:
+                return (True, '{"result":{"agent":{"agent_status":"working"}}}')
+            return (True, '{"result":{"agent":{"agent_status":"stalled"}}}')
+
+        m.responder(lambda a: a[:3] == ["herdr", "agent", "start"], agente_start)
+        m.responder(lambda a: a[:3] == ["herdr", "agent", "prompt"], prompt)
+        res, lineas = despachar(m, [job()], verify_wait_s=0.01,
+                                verify_poll_s=0.01, verify_retries=2)
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        self.assertEqual(lanzamientos["n"], 2, "el job se re-arrancó una vez")
+        self.assertEqual(len(m.llamo("herdr", "agent", "prompt")), 3,
+                         "2 intentos perdidos + 1 que llegó")
+        recolocaciones = [l for l in lineas if "vuelve a la cola" in l["cuerpo"]]
+        self.assertEqual(len(recolocaciones), 1)
+        # Nada de abandono: un prompt perdido no gasta peldaño de escalada.
+        self.assertNotIn("abandono", [l["tipo"] for l in lineas])
+
+    def test_prompt_que_nunca_llega_agota_las_vueltas_y_abandona_infra(self):
+        m = Mundo(pane_out=PANE_CERO)
+        res, lineas = despachar(m, [job()], verify_wait_s=0.01,
+                                verify_poll_s=0.01, verify_retries=2,
+                                prompt_requeues=2)
+        self.assertEqual(res[0].estado, "abandonado")
+        self.assertEqual(res[0].clase_abandono, "infra")
+        self.assertIn("0%", res[0].motivo)
+        # 3 vueltas x 2 intentos: la corrida entera se agota antes de ceder.
+        self.assertEqual(len(m.llamo("herdr", "agent", "prompt")), 6)
+        self.assertEqual(len(m.llamo("herdr", "agent", "start")), 3)
+        recolocaciones = [l for l in lineas if "vuelve a la cola" in l["cuerpo"]]
+        self.assertEqual(len(recolocaciones), 2)
+        self.assertEqual(len([l for l in lineas
+                              if l["tipo"] == "abandono"]), 1)
+        self.assertEqual(self._clase_de(lineas), ["infra"])
+
+    @staticmethod
+    def _clase_de(lineas):
+        return [l.get("clase") for l in lineas if l["tipo"] == "abandono"]
 
 
 class TestLimpieza(unittest.TestCase):
@@ -1618,7 +1687,8 @@ class TestClasificacionDeAbandonos(unittest.TestCase):
     def test_prompt_perdido_es_infra(self):
         m = Mundo(pane_out=PANE_CERO)
         res, lineas = despachar(m, [job()], verify_wait_s=0.01,
-                                verify_poll_s=0.01, verify_retries=1)
+                                verify_poll_s=0.01, verify_retries=1,
+                                prompt_requeues=0)
         self.assertEqual(res[0].estado, "abandonado")
         self.assertEqual(self._clase(lineas), "infra")
 
