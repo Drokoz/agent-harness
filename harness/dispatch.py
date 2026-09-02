@@ -419,6 +419,23 @@ def decidir_tanda(candidatos, creditos, costo_promedio, margen,
     return decisiones
 
 
+def motivo_presupuesto_reloj(minutos, budget_minutos):
+    """El motivo con que se parkea un ticket que agotó el presupuesto de
+    reloj de la corrida (#116): sus minutos de agente acumulados en el
+    historial (`state.de_ticket(...).duracion_min`) alcanzaron el tope
+    `budget_minutos`. Sin tope (0) o con presupuesto, "": sigue entrando.
+
+    No es un `abandono` ni gasta peldaño de escalera: no falló el modelo,
+    se acabó la noche. El ticket no se marca para humano ni deja línea que
+    la escalera cuente: la próxima corrida lo vuelve a intentar con el
+    presupuesto de esa noche."""
+    if budget_minutos > 0 and minutos >= budget_minutos:
+        return ("presupuesto de reloj: {} min de agente (tope {} min): se "
+                "acabó la noche, no falló el modelo".format(
+                    int(minutos), int(budget_minutos)))
+    return ""
+
+
 def _json_field(texto, claves):
     """`texto["a"]["b"]...` sin excepción: None si el JSON no coopera."""
     try:
@@ -1160,8 +1177,10 @@ class Dispatcher:
         Watchdog de progreso (#41): esperar una hora a un agente en bucle
         gasta la noche sin una línea escrita. La espera se corta cada
         `watchdog_check_min` minutos y en cada corte se mide si hay
-        progreso — un commit nuevo en la rama, el contexto que sube o el
-        costo que sube. Sin progreso durante `watchdog_kill_min` minutos,
+        progreso — un commit nuevo en la rama o el gate corriendo; un
+        costo o un contexto que suben es movimiento, no progreso (#116):
+        un costo que sube de a centavos no renueva el reloj para siempre.
+        Sin progreso durante `watchdog_kill_min` minutos,
         se corta al agente y se abandona `modelo`: reintentarlo no va a
         cambiar nada. Un agente corriendo el gate es la excepción
         explícita: el gate de un worktree limpio puede pasar de los 12
@@ -1234,10 +1253,11 @@ class Dispatcher:
         """Lo que el agente ha producido, para el watchdog de progreso
         (#41): `(HEAD de la rama, contexto %, costo, corriendo el gate)`.
 
-        Que suba cualquiera de los tres primeros cuenta como progreso. El
-        gate se lleva aparte porque su espera es legítima y puede pasar
-        el umbral: un worktree limpio instala y corre el gate entero, y
-        mientras tanto no hay commits, ni contexto, ni costo que suban."""
+        Progreso (reinicia el reloj del watchdog, #116) es un commit
+        nuevo (cambia el HEAD) o el gate corriendo (su espera es
+        legítima: un worktree limpio instala y corre el gate entero). El
+        contexto y el costo se miden igual, pero es movimiento, no
+        progreso: lo anota el watchdog y no renuevan el reloj."""
         head = ""
         if job.worktree:
             ok, out = self.run_cmd(["git", "-C", job.worktree, "rev-parse",
@@ -1261,12 +1281,17 @@ class Dispatcher:
         return (head, ctx, costo, en_gate)
 
     def _watchdog(self, job, ref, senal, sin_progreso):
-        """Un tick del watchdog (#41): ¿el agente avanzó desde el corte
-        anterior? Devuelve `(senal, sin_progreso, matado)`. Cada corte sin
-        progreso anota sus minutos en el log, para calibrar el umbral con
-        datos después."""
+        """Un tick del watchdog (#41, piso de progreso #116): ¿el agente
+        PROGRESÓ desde el corte anterior — un commit nuevo en la rama o el
+        gate corriendo? El costo o el contexto que suben no renuevan el
+        reloj: es movimiento, y un costo que sube de a centavos le
+        regalaba al agente una hora sin que nadie la decidiera.
+
+        Devuelve `(senal, sin_progreso, matado)`. Cada corte sin progreso
+        anota sus minutos en el log, para calibrar el umbral con datos
+        después."""
         nueva = self._senal(job)
-        if nueva != senal:
+        if nueva[0] != senal[0]:
             return nueva, 0, False
         sin_progreso += self.spec.watchdog_check_min
         if nueva[3]:
@@ -1274,9 +1299,15 @@ class Dispatcher:
                       "sin progreso {} min, pero el agente esta corriendo el "
                       "gate: espera legitima, se lo deja".format(sin_progreso))
             return nueva, 0, False
-        self._log(job, "watchdog", ref,
-                  "sin progreso {} min (commits, contexto y costo quietos)"
-                  .format(sin_progreso))
+        if (nueva[1], nueva[2]) != (senal[1], senal[2]):
+            self._log(job, "watchdog", ref,
+                      "movimiento (costo o contexto subiendo) pero sin "
+                      "commits: no cuenta como progreso, {} min sin "
+                      "progreso".format(sin_progreso))
+        else:
+            self._log(job, "watchdog", ref,
+                      "sin progreso {} min (commits y gate quietos)"
+                      .format(sin_progreso))
         if sin_progreso >= self.spec.watchdog_kill_min:
             self._matar(job, ref, sin_progreso)
             return nueva, sin_progreso, True
@@ -1294,7 +1325,8 @@ class Dispatcher:
                   "sin progreso {} min: agente matado".format(sin_progreso))
         self._abandonar(job, ref,
                         "watchdog: sin progreso durante {} min (sin commits "
-                        "nuevos, contexto quieto, costo quieto)"
+                        "nuevos ni gate en marcha; costo y contexto no "
+                        "cuentan como progreso)"
                         .format(sin_progreso),
                         clase="modelo")
 
