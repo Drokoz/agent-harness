@@ -183,6 +183,50 @@ class TestPasos(unittest.TestCase):
         self.assertIsNone(pasos[0].cuota)
         self.assertIsNone(pasos[1].cuota)
 
+    def test_la_etiqueta_del_peldano_y_la_clase_llegan_al_paso(self):
+        """#112: la etiqueta que el dispatcher anotó en su línea `peldano`
+        (el peldaño de verdad: el índice en `ESCALERA` con su runner y su
+        modelo) y la clase del abandono llegan a cada corrida: con esas
+        dos, el status distingue el intento del peldaño."""
+        evs = [
+            ev("peldano", "ticket/7",
+               "peldaño 1 · pi qwen/qwen3.8-27b --thinking medium",
+               "2026-08-22T12:00:30Z", run_id="r1"),
+            ev("abandono", "ticket/7", "gate rojo en el worktree: sin PR",
+               "2026-08-22T12:10:00Z", run_id="r1", clase="modelo"),
+            ev("peldano", "ticket/7",
+               "peldaño 1 · pi qwen/qwen3.8-27b --thinking medium",
+               "2026-08-22T12:11:30Z", run_id="r2"),
+            ev("abandono", "ticket/7", "no arranco el agente",
+               "2026-08-22T12:12:00Z", run_id="r2", clase="infra"),
+        ]
+        pasos = state.pasos(evs, "koku", 7)
+        self.assertEqual(pasos[0].peldano,
+                         "peldaño 1 · pi qwen/qwen3.8-27b --thinking medium")
+        self.assertEqual(pasos[0].clase, "modelo")
+        self.assertEqual(pasos[1].peldano,
+                         "peldaño 1 · pi qwen/qwen3.8-27b --thinking medium")
+        self.assertEqual(pasos[1].clase, "infra")
+
+    def test_sin_linea_peldano_el_campo_queda_vacio(self):
+        """#112: log viejo, escrito antes de #81: no hay etiqueta que
+        leer y `peldano` queda en None — el render cae al fallback."""
+        evs = [ev("agente", "ticket/7", "koku-7 (kind pi, pane w9:p1)",
+                  "2026-08-22T12:01:00Z", run_id="r1")]
+        pasos = state.pasos(evs, "koku", 7)
+        self.assertIsNone(pasos[0].peldano)
+        self.assertIsNone(pasos[0].clase)
+
+    def test_el_aplazo_del_router_no_es_un_peldano(self):
+        """#112/#38: el job que el router aplazó reusa el tipo `peldano`,
+        pero su línea es un mensaje, no la etiqueta del peldaño: no se
+        lee como peldaño — el job aplazado no se despachó."""
+        evs = [ev("peldano", "ticket/7",
+                  "claude no permitido ahora (router): cuota",
+                  "2026-08-22T12:00:00Z", run_id="r1")]
+        pasos = state.pasos(evs, "koku", 7)
+        self.assertIsNone(pasos[0].peldano)
+
     def test_lineas_viejas_no_dan_peldano(self):
         """#72: sin `ticket` no se pueden atribuir, así que no aparecen
         en la escalera: un peldaño fantasma haría escalar de más."""

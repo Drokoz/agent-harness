@@ -212,7 +212,11 @@ def pasos(eventos, repo, issue):
             if e.get("clase") is not None:
                 acc["clase"] = e["clase"]
         elif tipo == "peldano":
-            acc["peldano"] = cuerpo
+            # El aplazo del router reusa el tipo `peldano` (#38), pero su
+            # cuerpo es un mensaje, no la etiqueta del peldaño: no la
+            # tomamos — el job aplazado no se despachó.
+            if not cuerpo.startswith("claude no permitido"):
+                acc["peldano"] = cuerpo
         elif tipo == "costo":
             m = COSTO_JOB_RE.match(cuerpo.strip())
             if m:

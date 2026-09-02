@@ -151,13 +151,24 @@ class TestCuota(unittest.TestCase):
         s["resumen"]["tickets"] = [{
             "repo": "agent-harness", "number": 2, "title": "Gate",
             "costo": 0.05, "cuota": 8200.0,
-            "peldanos": [{"attempt": 1, "runner": "pi", "costo": 0.05, "cuota": 0.0},
-                        {"attempt": 2, "runner": "claude", "costo": 0.0, "cuota": 8200.0}],
+            "peldanos": [
+                {"attempt": 1, "runner": "pi", "costo": 0.05, "cuota": 0.0,
+                 "peldano": "peldaño 1 · pi qwen/qwen3.8-27b --thinking medium",
+                 "clase": "modelo"},
+                {"attempt": 2, "runner": "pi", "costo": 0.0, "cuota": 0.0,
+                 "peldano": "peldaño 1 · pi qwen/qwen3.8-27b --thinking medium",
+                 "clase": "infra"},
+                {"attempt": 3, "runner": "pi", "costo": 0.0, "cuota": 8200.0,
+                 "peldano": "peldaño 2 · pi qwen/qwen3.8-27b --thinking high",
+                 "clase": None}],
         }]
         h = render_html(s)
-        self.assertIn("peldaño 1", h)
-        self.assertIn("peldaño 2", h)
-        self.assertIn("claude", h)
+        # #112: el peldaño de verdad (la etiqueta del dispatcher) y el
+        # intento, como intento; el intento `infra` se marca.
+        self.assertIn("int. 1 · peldaño 1 · pi qwen/qwen3.8-27b --thinking medium", h)
+        self.assertIn("int. 2 · peldaño 1 · pi qwen/qwen3.8-27b --thinking medium", h)
+        self.assertIn("int. 3 · peldaño 2 · pi qwen/qwen3.8-27b --thinking high", h)
+        self.assertEqual(h.count("no gasta peldaño"), 1)
         self.assertIn("8,200 tok", h)
 
     def test_un_solo_peldano_no_desglosa(self):
