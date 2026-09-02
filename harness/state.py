@@ -172,6 +172,15 @@ class Peldano:
     inicio: Optional[datetime] = None
     fin: Optional[datetime] = None
     cuota: Optional[float] = None
+    # #112: la etiqueta con que el dispatcher anotó la corrida en su línea
+    # `peldano` ("peldaño 1 · pi qwen/qwen3.8-27b --thinking medium"): el
+    # peldaño de verdad, el índice en `ESCALERA` con su runner y modelo.
+    # Otra cosa que `attempt`: un abandono `infra` gasta intento y no
+    # gasta peldaño. Sin línea `peldano` (log viejo, fallback) queda None.
+    peldano: Optional[str] = None
+    # La clase del abandono de esta corrida (#37): `infra` no consumió
+    # peldaño. None = sin línea `abandono` o línea vieja sin `clase`.
+    clase: Optional[str] = None
 
 
 def pasos(eventos, repo, issue):
@@ -187,7 +196,8 @@ def pasos(eventos, repo, issue):
         run = e.get("run_id") or _SIN_RUN
         if run not in por_run:
             por_run[run] = {"attempt": e.get("attempt") or 1, "runner": None,
-                            "motivo": None, "costo": 0.0, "inicio": None, "fin": None}
+                            "motivo": None, "costo": 0.0, "inicio": None,
+                            "fin": None, "peldano": None, "clase": None}
             orden.append(run)
         acc = por_run[run]
         if e.get("attempt") is not None:
@@ -199,6 +209,10 @@ def pasos(eventos, repo, issue):
                 acc["runner"] = mkt.group(1)
         elif tipo == "abandono":
             acc["motivo"] = cuerpo
+            if e.get("clase") is not None:
+                acc["clase"] = e["clase"]
+        elif tipo == "peldano":
+            acc["peldano"] = cuerpo
         elif tipo == "costo":
             m = COSTO_JOB_RE.match(cuerpo.strip())
             if m:
@@ -209,7 +223,8 @@ def pasos(eventos, repo, issue):
             acc["fin"] = dt if acc["fin"] is None else max(acc["fin"], dt)
     return [Peldano(attempt=por_run[r]["attempt"], run_id=r, runner=por_run[r]["runner"],
                     motivo=por_run[r]["motivo"], costo=por_run[r]["costo"],
-                    inicio=por_run[r]["inicio"], fin=por_run[r]["fin"])
+                    inicio=por_run[r]["inicio"], fin=por_run[r]["fin"],
+                    peldano=por_run[r]["peldano"], clase=por_run[r]["clase"])
            for r in sorted(orden, key=lambda r: (por_run[r]["attempt"], r))]
 
 

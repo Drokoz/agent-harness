@@ -416,7 +416,8 @@ def _con_cuota(resumen, eventos_todos, contexts, quota_agg, quota_registros):
         costos[clave] = sum(p.costo for p in pasos_t)
         cuotas[clave] = sum(peso for _, peso in puntos)
         peldanos[clave] = [{"attempt": p.attempt, "runner": p.runner,
-                            "motivo": p.motivo, "costo": p.costo, "cuota": p.cuota}
+                            "motivo": p.motivo, "costo": p.costo, "cuota": p.cuota,
+                            "peldano": p.peldano, "clase": p.clase}
                            for p in pasos_t]
     return con_cuota(resumen, cuota_semana=harness_sem + resto_sem,
                      cuota_semana_harness=harness_sem, costos_por_ticket=costos,

@@ -124,9 +124,17 @@ def _gasto_ticket(t, c):
 
 
 def _peldanos(t, c, out):
-    """El desglose por peldaño de un ticket escalado (#38, #47): sólo tiene
-    sentido mostrarlo cuando hubo más de un intento — uno solo no "escaló",
-    y repetir el mismo número no agrega nada."""
+    """El desglose por intento de un ticket escalado (#38, #47, #112): sólo
+    tiene sentido mostrarlo cuando hubo más de un intento — uno solo no
+    "escaló", y repetir el mismo número no agrega nada.
+
+    Cada línea es una corrida: el intento, como intento (no es el peldaño),
+    el peldaño de verdad —la etiqueta que el dispatcher anotó en su línea
+    `peldano`: índice en `ESCALERA` con runner y modelo— y su gasto. Un
+    intento que no gastó peldaño (abandono `infra`, #37) se marca: es la
+    información que ordena la escalera. Dos corridas que comparten intento
+    (dos `run_id` distintos) se dibujan igual, con su peldaño y su runner.
+    """
     if len(t.peldanos) <= 1:
         return
     for p in t.peldanos:
@@ -137,8 +145,12 @@ def _peldanos(t, c, out):
             partes.append(f"{_tok(p['cuota'])} tok")
         gasto = " · ".join(partes) if partes else "sin medir"
         motivo = f" — {p['motivo'][:50]}" if p.get("motivo") else ""
-        out(f"       {c.dim}peldaño {p['attempt']} ({p.get('runner') or '?'}): "
-            f"{gasto}{motivo}{c.off}")
+        # Sin línea `peldano` en el log (corrida vieja, fallback de la
+        # corrida) no hay peldaño que mostrar: el runner, o ni eso.
+        peldano = p.get("peldano") or p.get("runner") or "?"
+        nota = " (no gasta peldaño)" if p.get("clase") == "infra" else ""
+        out(f"       {c.dim}int. {p.get('attempt') or '?'} · {peldano}: "
+            f"{gasto}{motivo}{nota}{c.off}")
 
 
 def _detalle_ticket(t):
