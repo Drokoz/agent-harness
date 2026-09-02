@@ -249,8 +249,11 @@ def prompt_de(issue, gate_tail=None, wip=None):
     texto = (
         "Read AGENTS.md and CONTEXT.md, then implement GitHub issue {} in this "
         "worktree (branch ticket/{}). Follow this sequence to the end: write the "
-        "code; commit every change, so that `git status --porcelain` is empty; "
-        "run ./scripts/gate.sh; and only if it exits 0, push the branch and open "
+        "code, and commit early — as soon as there is anything worth keeping, "
+        "commit it, so that a watchdog that cuts the attempt does not discard "
+        "the whole hour — then commit the rest so that "
+        "`git status --porcelain` is empty; run ./scripts/gate.sh; and only if "
+        "it exits 0, push the branch and open "
         "the PR with 'Closes {}' in the body. Finishing with uncommitted changes, "
         "or without an open PR, counts as failure and the work is discarded: the "
         "worktree is deleted and only the branch survives. Never merge and never "
@@ -614,6 +617,10 @@ class Job:
     # Un cero por default se confunde con "no costó nada"; ver `_repartir_costo`.
     costo: Optional[float] = None
     attempt: int = 1  # el intento global: lo numera el dispatcher con el historial
+    # Minutos de agente acumulados en el historial del log (#116): los pone
+    # quien arma el Job (`state.de_ticket(...).duracion_min`). 0.0 en los
+    # jobs que no pasan por el historial (tests, mantenedor).
+    minutos_acumulado: float = 0.0
     # El peldaño de la escalera (#38), ya resuelto por quien arma el Job
     # (`state.intentos_que_escalan` + `peldano_de`): "" = usa spec.kind/model,
     # para no romper a quien todavía no pasa por la escalera.
@@ -640,6 +647,11 @@ class DispatchSpec:
     wait_ms: int = 3_600_000      # espera máxima por agente (una noche)
     watchdog_check_min: int = 5   # cada N minutos se mide si el agente avanza (#41)
     watchdog_kill_min: int = 12   # sin progreso X minutos: matar y abandonar (#41)
+    # Presupuesto de reloj por ticket (#116): minutos de agente acumulados en
+    # el historial del log. Un ticket que llegó hasta acá se parkea con su
+    # motivo -- no falló el modelo, se acabó la noche -- y no gasta peldaño
+    # de escalera. 0 = sin presupuesto de reloj.
+    budget_minutos: float = 180.0
     gate_timeout: int = 1800      # segundos para gate.sh dentro del worktree
     install_timeout: int = 900    # segundos para instalar dependencias
     start_retries: int = 4        # reintentos de agent start (pane sin shell)
