@@ -28,6 +28,18 @@
                                     no se pueda leer se salta y el total se
                                     marca como piso (≥).
 
+    harness costo                   el costo real por peldaño de la escalera
+                                    (#96) y su tasa de éxito: cruza las sesiones
+                                    de pi (el costo por mensaje, #90) contra el
+                                    log de eventos (quién lo intentó, qué cerró).
+                                    Todo disco local: igual sin adaptadores
+    harness costo --json            el desglose por ticket y por intento, el
+                                    agregado por peldaño y los tokens crudos,
+                                    parseable
+    harness costo --sessions RUTA   otra carpeta de sesiones de pi (por
+                                    defecto ~/.pi/agent/sessions); el log se
+                                    apunta con --log como en `run`
+
     harness run                     lanza la frontera del contexto por defecto;
                                     cada ticket corre en el peldaño de la escalera
                                     de reintentos que le toca (#38): --kind/--model
@@ -101,6 +113,7 @@ from harness import adapters  # noqa: E402
 from harness.adapters import (adr_files, collect, load_config, openrouter_credits,
                               repo_paths, vault_decision_files)  # noqa: E402
 from harness.config import ConfigError  # noqa: E402
+from harness import costo  # noqa: E402
 from harness import costo_pi  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
 from harness.dispatch import (BucleSpec, DispatchSpec, Dispatcher, EventLog,  # noqa: E402
@@ -147,11 +160,12 @@ def build_parser():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", nargs="?", default="status",
                    choices=["status", "decisions", "run", "maintain", "report",
-                            "quota"],
+                            "quota", "costo"],
                    help="status (la pantalla), decisions (las decisiones), "
                         "run (el dispatcher de la frontera), "
-                        "maintain (el mantenedor de conflictos, #56) o "
-                        "quota (la cuota de Claude por sesiones locales)")
+                        "maintain (el mantenedor de conflictos, #56), "
+                        "quota (la cuota de Claude por sesiones locales) o "
+                        "costo (el costo real por peldaño, #96)")
     p.add_argument("--context", metavar="NOMBRE",
                    help="un contexto en vez del de por defecto")
     p.add_argument("--all", action="store_true", dest="todos",
@@ -203,6 +217,9 @@ def build_parser():
                    help="quota: carpeta(s) de sesiones separadas por coma "
                         "(por defecto ~/.claude/projects de este usuario, o la "
                         "lista que declare quota.projects en config)")
+    p.add_argument("--sessions", default="",
+                   help="costo: carpeta de sesiones de pi (por defecto "
+                        "~/.pi/agent/sessions)")
     return p
 
 
@@ -247,6 +264,8 @@ def main(argv=None):
         return run_main(args, contexts, solo)
     if args.command == "maintain":
         return maintain_main(args, contexts)
+    if args.command == "costo":
+        return costo_main(args)
 
     raw = collect(contexts, offline=OFFLINE)
     quota_registros, quota_agg = None, None
@@ -815,6 +834,25 @@ def _run_loop(args, contexts, log_path):
     corte = bucle(ejecutar, spec, EventLog(log_path, nombre),
                   creditos=creditos, freno=args.freno or None)
     sys.stdout.write("harness: bucle: corte: {}\n".format(corte))
+    return 0
+
+
+def costo_main(args):
+    """`harness costo` (#96): el costo real por peldaño de la escalera y su
+    tasa de éxito. Todo el dato está en disco local (sesiones de pi + log de
+    eventos), así que igual que `quota` no necesita adaptadores: en modo
+    offline se mira contra las sesiones del propio usuario, que es lo que el
+    gate y el humo del CLI no deben romper."""
+    sesiones = costo_pi.leer_sesiones(args.sessions or costo_pi.SESIONES)
+    log_path = (Path(args.log).expanduser() if args.log
+                else _estado_dir() / "harness" / "events.jsonl")
+    eventos = leer_eventos(log_path)
+    v = costo.vista(sesiones, eventos)
+    if args.como_json:
+        json.dump(v, sys.stdout, indent=2, ensure_ascii=False, sort_keys=True)
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(costo.render(v))
     return 0
 
 
