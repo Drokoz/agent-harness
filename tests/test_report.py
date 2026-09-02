@@ -191,6 +191,33 @@ class TestCuota(unittest.TestCase):
         self.assertIn("Reporte del Harness", h)
 
 
+class TestBloqueos(unittest.TestCase):
+    """Los bloqueos del guard en el reporte (#95): entran al resumen como
+    el resto, y con cero bloqueos no se ocupa espacio para decir que no
+    pasó nada."""
+
+    def test_bloqueos_entran_al_reporte(self):
+        s = snap()
+        s["resumen"]["bloqueos"] = [
+            {"ticket": "agent-harness#95", "motivo": "el merge es decision humana",
+             "conteo": 3},
+            {"ticket": None, "motivo": "reescribe historia", "conteo": 1},
+        ]
+        h = render_html(s)
+        # KPI (total en intentos, no en líneas) + sección con el detalle.
+        self.assertEqual(h.count("Bloqueos del guard"), 2)
+        # El KPI cuenta intentos (3+1), no líneas de log.
+        self.assertIn('<span class="kpi-n is-human">4</span>', h)
+        self.assertIn("agent-harness#95", h)
+        self.assertIn("el merge es decision humana", h)
+        # El repetido sale una sola vez, con su conteo.
+        self.assertIn("x3", h)
+        self.assertEqual(h.count("el merge es decision humana"), 1)
+
+    def test_cero_bloqueos_no_ocupan_lugar(self):
+        self.assertNotIn("Bloqueos del guard", render_html(snap()))
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -123,11 +123,16 @@ def _resumen(r):
         return '<p class="muted">Sin log todavía: nada que resumir.</p>'
     tickets, prs = r.get("tickets") or [], r.get("prs") or []
     trabados, costo = r.get("trabados") or [], r.get("costo") or 0
+    bloqueos = r.get("bloqueos") or []
 
     cifras = [("Tickets cerrados", len(tickets), "machine"),
               ("PRs esperando review", len(prs), "human" if prs else "machine"),
               ("Agentes trabados", len(trabados), "human" if trabados else "machine"),
               ("Costo del período", f"US${costo:.2f}", "machine")]
+    # Con cero bloqueos no se ocupa espacio para decir que no pasó nada (#95).
+    if bloqueos:
+        cifras.append(("Bloqueos del guard",
+                       sum(b.get("conteo") or 1 for b in bloqueos), "human"))
     cuota_semana = r.get("cuota_semana")
     if cuota_semana is not None:
         harness = r.get("cuota_semana_harness") or 0
@@ -145,6 +150,18 @@ def _resumen(r):
         filas = "".join(_fila_resumen(i, marca) for i in items[:8])
         extra = (f'<li class="muted">… y {len(items)-8} más</li>' if len(items) > 8 else "")
         detalle += f'<h3>{_esc(titulo)}</h3><ul class="list">{filas}{extra}</ul>'
+
+    # Lo que más dice de una noche: los intentos que el guard rechazó, ya
+    # agrupados por (ticket, motivo) en `summary.bloqueos_de` (#95).
+    if bloqueos:
+        filas = "".join(
+            f'<li><span class="mark is-block"></span>'
+            f'<span class="ref">{_esc(b.get("ticket") or "?")}</span> '
+            f'{_esc(str(b.get("motivo") or "")[:88])} '
+            f'<span class="muted small">{"x" + str(b.get("conteo") or 1) if (b.get("conteo") or 1) > 1 else ""}</span></li>'
+            for b in bloqueos[:8])
+        extra = (f'<li class="muted">… y {len(bloqueos)-8} más</li>' if len(bloqueos) > 8 else "")
+        detalle += f'<h3>Bloqueos del guard</h3><ul class="list">{filas}{extra}</ul>'
 
     ventana = f'{_fecha(r.get("desde"))} → {_fecha(r.get("hasta"))}'
     return (f'<p class="muted window">{_esc(ventana)}</p>'
