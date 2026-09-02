@@ -71,6 +71,27 @@
                                     antes que los tickets nuevos: `harness run`
                                     lo procesa primero, y acá solo, da igual
 
+    harness proponer                el generador y el juez de trabajo nuevo
+                                    (#115): el generador (peldaño barato) mira
+                                    el código y el historial de issues y propone;
+                                    el harness valida (evidencia real, dedup
+                                    contra abiertos Y cerrados, tope) y abre a
+                                    needs-triage; el juez (caro, adversarial)
+                                    decide qué pasa la barra. Devuelve qué abrió
+                                    y qué promovió; cero promovidos no es un error
+    harness proponer --max-propuestas N  tope duro de issues nuevos por
+                                    corrida (por defecto 5)
+    harness proponer --juez-qwen    el juez corre entero en Qwen (peldaño 2) en
+                                    vez de en Claude: si la semana viene
+                                    ajustada
+    harness proponer --piso-cuota F  fracción del tope semanal de cuota (0-1,
+                                    por defecto 0.25): sin más de eso restante,
+                                    el juez no corre en Claude
+
+`harness run --loop` lo llama solo: cuando la frontera queda vacía, en vez de
+sólo esperar, corre una pasada de `proponer` (una vez por bucle; `--sin-proponer`
+lo desactiva).
+
 v0 deliberadamente chico: NO es una app, es un script que imprime. La idea es vivir
 con él dos semanas y recién ahí especificar el dashboard de verdad, con datos de uso
 en vez de suposiciones. Ver ../PLAN.md §"centralizar" y §11 para `run`.
@@ -122,6 +143,9 @@ from harness.dispatch import (BucleSpec, DispatchSpec, Dispatcher, EventLog,  # 
                               transcripcion_path)
 from harness.maintain import (CONFLICTING, MantenJob, Mantener,  # noqa: E402
                               mergeable_de)
+from harness.proposal import (GENERADOR, JUEZ_CLAUDE, JUEZ_QWEN,  # noqa: E402
+                              MAX_PROPOSITAS_DEFAULT, Proponer,
+                              decidir_peldano_juez)
 from harness.render import linea_evento, render  # noqa: E402
 from harness.quota import (agregar, as_dict as quota_as_dict, cuota_por_ventana,  # noqa: E402
                            fuentes_desde_spec, leer_fuentes, puntos_de_ticket,
@@ -161,12 +185,13 @@ def build_parser():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", nargs="?", default="status",
                    choices=["status", "decisions", "run", "maintain", "report",
-                            "quota", "costo"],
+                            "quota", "costo", "proponer"],
                    help="status (la pantalla), decisions (las decisiones), "
                         "run (el dispatcher de la frontera), "
                         "maintain (el mantenedor de conflictos, #56), "
                         "quota (la cuota de Claude por sesiones locales) o "
-                        "costo (el costo real por peldaño, #96)")
+                        "costo (el costo real por peldaño, #96) o "
+                        "proponer (el generador y el juez de trabajo nuevo, #115)")
     p.add_argument("--context", metavar="NOMBRE",
                    help="un contexto en vez del de por defecto")
     p.add_argument("--all", action="store_true", dest="todos",
@@ -221,6 +246,21 @@ def build_parser():
     p.add_argument("--sessions", default="",
                    help="costo: carpeta de sesiones de pi (por defecto "
                         "~/.pi/agent/sessions)")
+    p.add_argument("--max-propuestas", type=int, default=MAX_PROPOSITAS_DEFAULT,
+                   dest="max_propuestas",
+                   help="proponer: tope duro de issues nuevos por corrida "
+                        "(por defecto 5)")
+    p.add_argument("--juez-qwen", action="store_true", dest="juez_qwen",
+                   help="proponer: el juez corre entero en Qwen (peldaño 2) "
+                        "en vez de en Claude: si la semana viene ajustada")
+    p.add_argument("--piso-cuota", type=float, default=0.25,
+                   dest="piso_cuota",
+                   help="proponer: fracción del tope semanal de cuota (0-1, "
+                        "por defecto 0.25): sin más de eso restante, el juez "
+                        "no corre en Claude")
+    p.add_argument("--sin-proponer", action="store_true", dest="sin_propone",
+                   help="run --loop: no correr proponer con la frontera "
+                        "vacía: esperar en blanco, como antes de #115")
     return p
 
 
@@ -267,6 +307,14 @@ def main(argv=None):
         return maintain_main(args, contexts)
     if args.command == "costo":
         return costo_main(args)
+    if args.command == "proponer":
+        if args.max_propuestas < 1:
+            sys.stderr.write("harness: --max-propuestas tiene que ser >= 1\n")
+            return 2
+        if not 0 <= args.piso_cuota <= 1:
+            sys.stderr.write("harness: --piso-cuota tiene que estar entre 0 y 1\n")
+            return 2
+        return proponer_main(args, contexts)
 
     raw = collect(contexts, offline=OFFLINE)
     quota_registros, quota_agg = None, None
@@ -856,7 +904,7 @@ def _run_loop(args, contexts, log_path):
     creditos = (_creditos_restantes if provider == "openrouter" else None)
     nombre = contexts[0].name if contexts else "harness"
 
-    def ejecutar():
+    def _una_corrida():
         # Una corrida nueva por pasada: su propio run_id, y la línea
         # `pasada` se anota en ella, no en una corrida fantasma.
         log = EventLog(log_path, nombre)
@@ -867,11 +915,30 @@ def _run_loop(args, contexts, log_path):
             partes.append(p.detalle)
         return Pasada(trabajo, "; ".join(partes), log=log)
 
+    log_corriente = {"log": None}
+
+    def ejecutar():
+        p = _una_corrida()
+        # El proposer de frontera vacía (#115) escribe en el log de la
+        # pasada que encontró la frontera vacía, no en una corrida fantasma.
+        log_corriente["log"] = p.log
+        return p
+
     spec = BucleSpec(piso=args.piso, max_pasadas=args.max_pasadas)
+    # El proposer de frontera vacía (#115): la hora más barata de la máquina
+    # no se gasta en preguntar si hay trabajo, se gasta en mirarlo. Corre
+    # una vez por bucle; `--sin-proponer` lo desactiva.
+    proposer = None
+    if not args.sin_propone:
+        def proposer():
+            partes = [_proponer_ctx(args, ctx, log_corriente["log"])
+                      for ctx in contexts]
+            return "; ".join(partes)
     # El log de respaldo: las pasadas traen el suyo, pero el corte se tiene
     # que anotar aunque no haya corrido ninguna (piso bajo al arrancar).
     corte = bucle(ejecutar, spec, EventLog(log_path, nombre),
-                  creditos=creditos, freno=args.freno or None)
+                  creditos=creditos, freno=args.freno or None,
+                  proposer_vacio=proposer)
     sys.stdout.write("harness: bucle: corte: {}\n".format(corte))
     return 0
 
@@ -892,6 +959,83 @@ def costo_main(args):
         sys.stdout.write("\n")
     else:
         sys.stdout.write(costo.render(v))
+def _peldano_juez_para(args, ctx, log, repo):
+    """El peldaño del juez (#115) con su decisión anotada en el log: por
+    defecto Claude —el primer consumidor rutinario de Claude dentro del
+    bucle de la noche— respetando el piso de cuota (`--piso-cuota` contra
+    `quota.tope_semanal`, la misma fuente que `harness quota`); sin cuota
+    para gastarla, o forzado a mano (`--juez-qwen`), corre entero en Qwen."""
+    usado = 0.0
+    if ctx.quota.tope_semanal:
+        registros, fuentes = leer_fuentes(_rutas_sesiones(args, [ctx]))
+        agg = agregar(registros, [Path(ctx.repos.root).expanduser()],
+                      fuentes=fuentes)
+        harness_sem, resto_sem = semana_de(agg, datetime.now(timezone.utc))
+        usado = harness_sem + resto_sem
+    peldano, motivo = decidir_peldano_juez(args.juez_qwen,
+                                           ctx.quota.tope_semanal, usado,
+                                           args.piso_cuota)
+    etiqueta = peldano["kind"]
+    if peldano.get("model"):
+        etiqueta += " " + peldano["model"]
+    if peldano.get("extra_args"):
+        etiqueta += " " + " ".join(peldano["extra_args"])
+    log.write("proponer", "propuesta/juez",
+              "juez de {} en {}: {}".format(repo, etiqueta, motivo))
+    return peldano
+
+
+def _proponer_ctx(args, ctx, log):
+    """Una pasada de `proponer` sobre un contexto (#115): los repos con
+    slug y gate —sin gate no hay frontera, y no hay contra qué proponer
+    trabajo—. Devuelve el resumen en una línea, para que el bucle lo
+    anote en su log; lo accionable va en el log JSONL y en pantalla."""
+    if ctx.autonomy == "manual":
+        return 'contexto "{}": autonomía manual, no propone nada'.format(
+            ctx.name)
+    crudo = collect([ctx])
+    partes = []
+    for r in crudo["contexts"][0]["repos"]:
+        if not r.get("slug") or not r.get("exists", {}).get("gate"):
+            continue
+        spec = DispatchSpec(contexto=ctx.name, kind=GENERADOR["kind"],
+                            model=GENERADOR["model"])
+        prop = Proponer(spec, log, run_cmd=adapters.run)
+        peldano_juez = _peldano_juez_para(args, ctx, log, r["name"])
+        res = prop.proponer_repo(r["name"], r["slug"], r.get("path", ""),
+                                 args.max_propuestas, peldano_juez)
+        for d in res["detalle"]:
+            sys.stdout.write("  {} {}\n".format(r["name"], d))
+        partes.append("{}: {} abierta(s), {} promovida(s), {} rechazada(s), "
+                      "{} descartada(s)".format(
+                          r["name"], res["abiertas"], res["promovidas"],
+                          res["rechazadas"], res["descartadas"]))
+    return "; ".join(partes) if partes else \
+        'sin repos que proponer (hacen falta slug y gate)'
+
+
+def proponer_main(args, contexts):
+    """`harness proponer` (#115): corre generador y juez, y devuelve qué
+    abrió y qué promovió. La etiqueta `ready-for-agent` no la toca ningún
+    agente: la pone el harness, y sólo con veredicto del juez."""
+    log_path = (Path(args.log).expanduser() if args.log
+                else _estado_dir() / "harness" / "events.jsonl")
+    for ctx in contexts:
+        # Un contexto manual no delega: este comando no toma nada solo.
+        if ctx.autonomy == "manual":
+            sys.stdout.write('harness: contexto "{}": autonomía manual, '
+                             'este comando no toma nada solo\n'.format(ctx.name))
+            continue
+        if OFFLINE or os.environ.get("HERDR_ENV") != "1":
+            sys.stderr.write("harness: proponer necesita adaptadores y una "
+                             "sesión de herdr (sin HARNESS_OFFLINE, con "
+                             "HERDR_ENV=1)\n")
+            return 2
+        log = EventLog(log_path, ctx.name,
+                       listener=None if args.quiet else _imprimir_evento)
+        resumen = _proponer_ctx(args, ctx, log)
+        sys.stdout.write('harness: "{}": {}\n'.format(ctx.name, resumen))
+        sys.stdout.write("harness: log de eventos {}\n".format(log.path))
     return 0
 
 
