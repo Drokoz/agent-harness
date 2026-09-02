@@ -347,8 +347,8 @@ RUNNERS_SIN_CREDITOS = ("claude",)
 
 
 def decidir_tanda(candidatos, creditos, costo_promedio, margen,
-                  max_tickets=None, presupuesto=True):
-    """Qué tickets de la tanda entran y cuáles se quedan fuera (#68).
+                  max_tickets=None, presupuesto=True, budget_reloj=None):
+    """Qué tickets de la tanda entran y cuáles se quedan fuera (#68, #116).
 
     `candidatos` (Jobs, en el orden de la frontera), `creditos` (lo que
     queda en la key, float | None — None es "no se pudo leer"),
@@ -358,7 +358,13 @@ def decidir_tanda(candidatos, creditos, costo_promedio, margen,
     mano sin tocar etiquetas. `presupuesto` (True por defecto) corta el
     tope por plata del todo: un contexto que no mide créditos de
     OpenRouter no se dimensiona con plata, y el llamador se lo dice — el
-    tope manual `max_tickets` sigue aplicando.
+    tope manual `max_tickets` sigue aplicando. `budget_reloj` (#116) es
+    el presupuesto de minutos de agente por ticket, acumulado entre
+    intentos (lo trae cada Job en `minutos_acumulado`, del historial del
+    log): un ticket que lo agotó se queda fuera con su motivo — no falló
+    el modelo, se acabó la noche — y aplica a todos los runners: la hora
+    de agente escasea igual para el que corre contra cuota que para el
+    que corre contra la key. Sin tope (None o 0) la regla no existe.
 
     Devuelve una decisión por candidato, en orden: `{"job", "despachar",
     "motivo"}`. `motivo` es "" en los que entran, y en los que se quedan
@@ -388,6 +394,12 @@ def decidir_tanda(candidatos, creditos, costo_promedio, margen,
     for j in candidatos:
         es_claude = (j.kind or "") in RUNNERS_SIN_CREDITOS
         razones = []
+        if budget_reloj:
+            # El reloj no es plata: se mide igual para todos los runners.
+            motivo_reloj = motivo_presupuesto_reloj(j.minutos_acumulado,
+                                                    budget_reloj)
+            if motivo_reloj:
+                razones.append(motivo_reloj)
         if not es_claude and presupuesto:
             if costo_promedio is None:
                 razones.append("costo medio sin historial: sin dimensionar "
