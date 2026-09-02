@@ -526,11 +526,15 @@ class TestCuotaEnStatusYReport(unittest.TestCase):
         self.assertIn("$0.05", p.stdout)
         self.assertIn("16,780", p.stdout)
 
-    def test_status_muestra_los_dos_peldanos(self):
+    def test_status_muestra_el_desglose_por_intento(self):
+        """#112: el desglose muestra el intento como intento y el
+        peldaño de verdad (el runner, en este log sin línea `peldano`).
+        El número de intento ya no pasa por peldaño."""
         p = self._correr("status")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("peldaño 1 (pi)", p.stdout)
-        self.assertIn("peldaño 2 (claude)", p.stdout)
+        self.assertIn("int. 1 · pi", p.stdout)
+        self.assertIn("int. 2 · claude", p.stdout)
+        self.assertNotIn("peldaño 1 (pi)", p.stdout)
 
     def test_json_trae_la_cuota_del_ticket(self):
         p = self._correr("status", "--json")
@@ -548,8 +552,8 @@ class TestCuotaEnStatusYReport(unittest.TestCase):
         self.assertIn("Cuota de la semana", p.stdout)
         self.assertIn("16,780 tok", p.stdout)
         self.assertIn("2026-08-25", p.stdout)  # evolución por noche
-        self.assertIn("peldaño 1", p.stdout)
-        self.assertIn("peldaño 2", p.stdout)
+        self.assertIn("int. 1 · pi", p.stdout)
+        self.assertIn("int. 2 · claude", p.stdout)
 
     def test_offline_no_calcula_cuota(self):
         """Sin adaptadores no hay de dónde leer sesiones: la pantalla no

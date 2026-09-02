@@ -113,8 +113,13 @@ def _fila_resumen(i, marca):
     if len(peldanos) > 1:
         for p in peldanos:
             g = _gasto_texto(p) or "sin medir"
-            fila += (f'<li class="muted small peldano">peldaño {_esc(p.get("attempt"))} '
-                    f'({_esc(p.get("runner") or "?")}): {_esc(g)}</li>')
+            # #112: igual que en `harness status`: el peldaño de verdad (la
+            # etiqueta de la línea `peldano`) y el intento, como intento.
+            peldano = p.get("peldano") or p.get("runner") or "?"
+            nota = ' <span class="muted">(no gasta peldaño)</span>' \
+                if p.get("clase") == "infra" else ""
+            fila += (f'<li class="muted small peldano">int. {_esc(p.get("attempt"))} '
+                    f'· {_esc(peldano)}: {_esc(g)}{nota}</li>')
     return fila
 
 

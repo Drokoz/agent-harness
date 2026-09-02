@@ -206,12 +206,46 @@ class TestResumen(unittest.TestCase):
                               detalle="PR #19 abierto (gate verde)",
                               costo=0.05, cuota=8200.0, peldanos=peldanos)])
         salida = self.pantalla(r)
-        self.assertIn("peldaño 1", salida)
-        self.assertIn("pi", salida)
+        # #112: el número que se ve es el de intento, no el de peldaño:
+        # sin línea `peldano` en el log, el fallback es el runner.
+        self.assertIn("int. 1 · pi", salida)
         self.assertIn("$0.05", salida)
-        self.assertIn("peldaño 2", salida)
-        self.assertIn("claude", salida)
+        self.assertIn("int. 2 · claude", salida)
         self.assertIn("8,200", salida)
+
+    def test_el_peldano_de_verdad_el_intento_y_el_infra(self):
+        """#112: la línea dice el peldaño de verdad — la etiqueta que el
+        dispatcher anotó: el índice en `ESCALERA` con su runner y su
+        modelo — y el número de intento, como intento. Un intento `infra`
+        no gastó peldaño: se ve distinto de uno que sí. Dos corridas con
+        el mismo `attempt` (dos `run_id`) cada una muestra su peldaño y
+        no se dibujan como el mismo paso."""
+        from harness.summary import Ticket
+        p1 = "peldaño 1 · pi qwen/qwen3.8-27b --thinking medium"
+        p2 = "peldaño 2 · pi qwen/qwen3.8-27b --thinking high"
+        peldanos = [
+            {"attempt": 1, "runner": "pi", "motivo": "gate rojo",
+             "costo": 0.05, "cuota": 0.0, "peldano": p1, "clase": "modelo"},
+            {"attempt": 2, "runner": "pi", "motivo": "no arranco el agente",
+             "costo": 0.0, "cuota": 0.0, "peldano": p1, "clase": "infra"},
+            {"attempt": 3, "runner": "pi", "motivo": None,
+             "costo": 0.0, "cuota": 8200.0, "peldano": p2, "clase": None},
+        ]
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    cuota_semana=1.0, cuota_semana_harness=1.0, tickets=[
+                        Ticket(contexto="personal", ref="ticket/56",
+                              detalle="PR #99 abierto (gate verde)",
+                              costo=0.05, cuota=8200.0, peldanos=peldanos)])
+        salida = self.pantalla(r)
+        self.assertIn("int. 1 · " + p1, salida)
+        self.assertIn("int. 2 · " + p1, salida)
+        self.assertIn("int. 3 · " + p2, salida)
+        # El intento `infra` se marca, y sólo él: es el que no gastó
+        # peldaño, la información que ordena la escalera.
+        self.assertEqual(salida.count("no gasta peldaño"), 1)
+        # El formato viejo (el número de intento pasando por peldaño)
+        # ya no aparece.
+        self.assertNotIn("peldaño 2 (pi)", salida)
 
     def test_un_solo_peldano_no_desglosa(self):
         from harness.summary import Ticket
