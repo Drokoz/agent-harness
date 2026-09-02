@@ -2038,7 +2038,13 @@ class TestBaseConGitReal(unittest.TestCase):
     # en cualquier máquina sin identidad global -- el runner de CI, por
     # ejemplo, donde el gate venía rojo desde el 2026-08-26 sin que nadie
     # mirara.
-    IDENT = ("-c", "user.email=t@e.com", "-c", "user.name=T")
+    # Ni la identidad ni la rama por defecto se dan por sentadas: las dos
+    # salen de la config global, que en una máquina de trabajo está puesta y
+    # en un runner no. Sin `-b main`, el bare nace con HEAD en `master`, el
+    # clone commitea en `master`, y el `push origin main` no tiene qué
+    # empujar --- que es exactamente cómo fallaba el gate en CI.
+    IDENT = ("-c", "user.email=t@e.com", "-c", "user.name=T",
+             "-c", "init.defaultBranch=main")
 
     def _g(self, cwd, *args):
         subprocess.run(["git", *self.IDENT, *args], cwd=cwd, check=True,
@@ -2053,7 +2059,7 @@ class TestBaseConGitReal(unittest.TestCase):
         """(checkout con main atrasada, sha real de origin/main)."""
         origen = Path(tmp) / "origin.git"
         origen.mkdir()
-        self._g(origen, "init", "--bare")
+        self._g(origen, "init", "--bare", "-b", "main")
         local = Path(tmp) / "koku"
         local.mkdir()
         self._g(local, "init", "-b", "main")
