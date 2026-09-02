@@ -383,6 +383,16 @@ class TestConCuota(unittest.TestCase):
         self.assertEqual(por_ref["ticket/3"].peldanos, peldanos)
         self.assertEqual(por_ref["ticket/9"].peldanos, [])
 
+    def test_minutos_por_ticket(self):
+        """Los minutos de agente (#116) entran con el mismo cruce que el
+        costo: clave (repo, ref), del historial completo, y el ticket sin
+        entrada se queda en 0.0."""
+        r = con_cuota(self._resumen(),
+                      minutos_por_ticket={("agent-harness", "ticket/3"): 320.0})
+        por_ref = {t.ref: t for t in r.tickets}
+        self.assertEqual(por_ref["ticket/3"].minutos, 320.0)
+        self.assertEqual(por_ref["ticket/9"].minutos, 0.0)
+
     def test_no_toca_el_original(self):
         """`con_cuota` devuelve un `Resumen` nuevo: el que se le pasó no
         se muta (mismo criterio que el resto del módulo, ver `reconciliar`)."""

@@ -143,10 +143,11 @@ def spec(**kw):
 
 def job(issue=7, repo="koku", path="/repos/koku", slug="Drokoz/koku",
         attempt=1, kind="", model="", extra_args=(), gate_tail=None,
-        wip=None):
+        wip=None, minutos_acumulado=0.0):
     return Job(repo=repo, repo_path=path, slug=slug, issue=issue,
                attempt=attempt, kind=kind, model=model,
-               extra_args=extra_args, gate_tail=gate_tail, wip=wip)
+               extra_args=extra_args, gate_tail=gate_tail, wip=wip,
+               minutos_acumulado=minutos_acumulado)
 
 
 def job_de_peldano(escalados, **kw):
@@ -275,6 +276,71 @@ class TestTandaPorPresupuesto(unittest.TestCase):
                          [38, 39, 40, 41, 42])
 
 
+class TestTandaPorPresupuestoDeReloj(unittest.TestCase):
+    """#116: la moneda escasa de una noche son horas de agente, y se
+    presupuestan por ticket, acumulado entre intentos (los minutos los
+    trae cada Job en `minutos_acumulado`, del historial del log).
+    Un ticket que agotó el tope se queda fuera con un motivo que lo
+    dice: no falló el modelo, se acabó la noche — no es un abandono y
+    no gasta peldaño de escalera; la próxima corrida lo reintenta con
+    el presupuesto de esa noche."""
+
+    def despachados(self, d):
+        return [x["job"] for x in d if x["despachar"]]
+
+    def fuera(self, d):
+        return [x for x in d if not x["despachar"]]
+
+    def test_un_ticket_agotado_se_queda_fuera_con_su_motivo(self):
+        d = decidir_tanda([job(minutos_acumulado=180.0)], creditos=None,
+                          costo_promedio=None, margen=0.10,
+                          presupuesto=False, budget_reloj=180.0)
+        self.assertEqual(self.despachados(d), [])
+        (f,) = self.fuera(d)
+        self.assertIn("presupuesto de reloj", f["motivo"])
+        self.assertIn("se acabó la noche", f["motivo"])
+
+    def test_un_ticket_bajo_el_tope_sigue_entrando(self):
+        d = decidir_tanda([job(minutos_acumulado=179.0),
+                           job(issue=8, minutos_acumulado=0.0)],
+                          creditos=None, costo_promedio=None, margen=0.10,
+                          presupuesto=False, budget_reloj=180.0)
+        self.assertEqual([j.issue for j in self.despachados(d)], [7, 8])
+
+    def test_sin_tope_la_regla_no_existe(self):
+        for tope in (None, 0):
+            d = decidir_tanda([job(minutos_acumulado=9999.0)], creditos=None,
+                              costo_promedio=None, margen=0.10,
+                              presupuesto=False, budget_reloj=tope)
+            self.assertEqual(len(self.despachados(d)), 1, tope)
+
+    def test_el_tope_vale_para_el_runner_sin_creditos(self):
+        """La hora de agente escasea igual para el que corre contra cuota
+        que para el que corre contra la key: el tope no es plata."""
+        d = decidir_tanda([job(kind="claude", minutos_acumulado=200.0)],
+                          creditos=None, costo_promedio=None, margen=0.10,
+                          presupuesto=False, budget_reloj=180.0)
+        self.assertEqual(self.despachados(d), [])
+        (f,) = self.fuera(d)
+        self.assertIn("presupuesto de reloj", f["motivo"])
+
+    def test_el_parqueo_por_reloj_no_gasta_peldano(self):
+        """Lo que deja en el log es una línea `fuera`, no un `abandono`: la
+        escalera no lo cuenta, y con un abandono anterior se sigue en el
+        peldaño 2, no en el 3."""
+        eventos = [
+            {"timestamp": "2026-09-01T23:00:00Z", "run_id": "r1",
+             "ticket": "koku#7", "tipo": "abandono", "ref": "ticket/7",
+             "clase": "modelo", "cuerpo": "gate rojo"},
+            {"timestamp": "2026-09-02T00:00:00Z", "run_id": "r2",
+             "ticket": "koku#7", "tipo": "fuera", "ref": "ticket/7",
+             "cuerpo": "presupuesto de reloj: 180 min de agente (tope "
+                       "180 min): se acabó la noche, no falló el modelo"},
+        ]
+        self.assertEqual(state.intentos_que_escalan(eventos, "koku", 7), 1)
+        self.assertEqual(peldano_de(1)["kind"], ESCALERA[1]["kind"])
+
+
 def despachar(mundo, jobs, costo_real=None, salida_real=None, **kw):
     with tempfile.TemporaryDirectory() as tmp:
         log = log_en(tmp)
@@ -311,6 +377,9 @@ class TestPuros(unittest.TestCase):
         self.assertIn("push", p)
         # Que quede dicho que no terminar asi es un fracaso, no una opcion.
         self.assertIn("discarded", p)
+        # #116: commitear temprano, apenas hay algo que conservar, para que
+        # un watchdog que corta el intento no tire la hora entera.
+        self.assertIn("commit early", p)
 
     def test_nombre_agente_es_valido_y_distingue(self):
         for n in (nombre_agente("koku", 7), nombre_agente("ERP-IphoneUp", 7),
@@ -1542,12 +1611,14 @@ class TestRamaSinCommits(unittest.TestCase):
 
 
 class TestWatchdog(unittest.TestCase):
-    """El watchdog de progreso (#41): un agente en bucle no se espera una
-    hora. Cada `watchdog_check_min` minutos (default 5) se mide si hay
-    progreso — commit nuevo en la rama, contexto que sube o costo que
-    sube — y sin progreso durante `watchdog_kill_min` minutos (default 12)
-    se mata al agente y se abandona `modelo`. Un agente corriendo el gate
-    no se toca: esa espera es legítima y puede pasar el umbral."""
+    """El watchdog de progreso (#41, piso de progreso #116): un agente en bucle
+    no se espera una hora. Cada `watchdog_check_min` minutos (default 5) se
+    mide si hay progreso — un commit nuevo en la rama o el gate corriendo —
+    y un costo o un contexto que suben es movimiento, no progreso: no
+    renuevan el reloj. Sin progreso durante `watchdog_kill_min` minutos
+    (default 12) se mata al agente y se abandona `modelo`. Un agente
+    corriendo el gate no se toca: esa espera es legítima y puede pasar el
+    umbral."""
 
     TIMEOUT = '{"error":{"code":"timeout"},"id":"cli:agent:wait"}'
 
@@ -1555,6 +1626,13 @@ class TestWatchdog(unittest.TestCase):
     def _pantalla(ctx):
         return ("⠏ Working...\n~/repo (ticket/7)\n"
                 "↑12k ↓2k R4k CH0.1% $0.056 {}%/262k ...\n").format(ctx)
+
+    @staticmethod
+    def _pantalla_costo(costo):
+        """La línea de estado con contexto quieto (1.2%) y el costo
+        variable, para aislar el movimiento del costo del del contexto."""
+        return ("⠏ Working...\n~/repo (ticket/7)\n"
+                "↑12k ↓2k R4k CH0.1% ${} 1.2%/262k ...\n").format(costo)
 
     def _wait_con_timeouts_luego_idle(self, m, timeouts):
         """`agent wait`: `timeout` las primeras N veces, `idle` después."""
@@ -1581,17 +1659,41 @@ class TestWatchdog(unittest.TestCase):
         self.assertEqual(s.watchdog_check_min, 5)
         self.assertEqual(s.watchdog_kill_min, 12)
 
-    def test_avanza_y_no_lo_matan(self):
-        """El agente que avanza (el contexto sube en cada corte) se deja
-        estar hasta que se asienta: sin watchdog, sin abandono."""
+    def test_contexto_que_sube_solo_no_es_progreso(self):
+        """El contexto que sube es movimiento, no progreso (#116): sin
+        commits y sin gate, el reloj no se renueva, y pasado el umbral el
+        agente se corta y se abandona `modelo`. En el log queda anotado el
+        movimiento, para calibrar con datos."""
         m = Mundo()
-        self._wait_con_timeouts_luego_idle(m, timeouts=2)
+        m.wait_out = self.TIMEOUT
         self._pane_por_espera(m, [self._pantalla("1.2"), self._pantalla("3.4"),
-                                  self._pantalla("5.6")])
+                                  self._pantalla("5.6"), self._pantalla("7.8")])
         res, lineas = despachar(m, [job()])
-        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
-        self.assertNotIn("abandono", [l["tipo"] for l in lineas])
-        self.assertEqual(m.llamo("herdr", "agent", "send-keys"), [])
+        self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+        self.assertEqual(res[0].clase_abandono, "modelo")
+        self.assertIn("sin progreso", res[0].motivo)
+        (matada,) = m.llamo("herdr", "agent", "send-keys")
+        self.assertEqual(matada[0][-1], "ctrl+c")
+        cuerpos = [l["cuerpo"] for l in lineas if l["tipo"] == "watchdog"]
+        self.assertTrue(any("movimiento" in c for c in cuerpos), cuerpos)
+
+    def test_costo_que_sube_solo_no_es_progreso(self):
+        """Un costo que sube de a centavos no renueva el reloj para
+        siempre (#116): HEAD quieto, cero commits, $ que gotea en cada
+        corte — pasado el umbral, el agente se corta."""
+        m = Mundo()
+        m.wait_out = self.TIMEOUT
+        pantallas = [self._pantalla_costo(c) for c in
+                     ("0.056", "0.057", "0.058", "0.059")]
+        self._pane_por_espera(m, pantallas)
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+        self.assertEqual(res[0].clase_abandono, "modelo")
+        self.assertIn("sin progreso", res[0].motivo)
+        (matada,) = m.llamo("herdr", "agent", "send-keys")
+        self.assertEqual(matada[0][-1], "ctrl+c")
+        cuerpos = [l["cuerpo"] for l in lineas if l["tipo"] == "watchdog"]
+        self.assertTrue(any("movimiento" in c for c in cuerpos), cuerpos)
 
     def test_un_commit_nuevo_cuenta_como_progreso(self):
         m = Mundo(pr_head_oid="b" * 40)  # el PR apunta al commit nuevo

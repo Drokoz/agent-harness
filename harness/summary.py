@@ -50,8 +50,11 @@ class Ticket:
     `costo` (dólares OpenRouter) y `cuota` (tokens de Claude ponderados)
     son el gasto acumulado de TODO el historial del ticket, no sólo del
     período (#47): un ticket que escaló gastó en noches anteriores, y ese
-    gasto es parte de lo que costó cerrarlo. `peldanos` es el desglose por
-    intento cuando hubo más de uno; ninguno de los tres lo puede calcular
+    gasto es parte de lo que costó cerrarlo. `minutos` es lo mismo en la
+    moneda que de verdad limita una noche (#116): minutos de agente
+    acumulados, del historial completo (`state.de_ticket(...).duracion_min`).
+    `peldanos` es el desglose por intento cuando hubo más de uno; ninguno
+    de los cuatro lo puede calcular
     `resumir` sola —hace falta cruzar contra `harness.quota` y
     `harness.state`— así que entran por `con_cuota`.
     """
@@ -65,6 +68,7 @@ class Ticket:
     en_vivo: bool = False
     costo: float = 0.0
     cuota: float = 0.0
+    minutos: float = 0.0
     peldanos: List[dict] = field(default_factory=list)
 
 
@@ -299,26 +303,30 @@ def construir(eventos, prs, estado="ok", desde=None, hasta=None, resolver_pr=Non
 
 def con_cuota(resumen, cuota_semana=None, cuota_semana_harness=None,
               costos_por_ticket=None, cuotas_por_ticket=None,
-              peldanos_por_ticket=None):
-    """Un `Resumen` nuevo con la cuota cruzada adentro (#47).
+              peldanos_por_ticket=None, minutos_por_ticket=None):
+    """Un `Resumen` nuevo con la cuota cruzada adentro (#47) y los minutos
+    de agente (#116).
 
     Nada de esto sale del log solo: la cuota (tokens de Claude) sale de
     `harness.quota` (sesiones locales) y los peldaños de `harness.state`
     (el historial completo del ticket, no sólo el período); el CLI hace
-    ese cruce y llama acá con el resultado ya listo. Los tres dicts van por
+    ese cruce y llama acá con el resultado ya listo. Los dicts van por
     `(repo, ref)` — no `(repo, numero)`: `numero` es el PR ("PR #19
     abierto"), y `state.pasos`/`quota.puntos_de_ticket` necesitan el
     issue, que sólo `ref` ("ticket/256") trae confiable. Un ticket sin
-    entrada se queda con lo que traía (costo 0.0, cuota 0.0, sin peldaños).
+    entrada se queda con lo que traía (costo 0.0, cuota 0.0, minutos 0.0,
+    sin peldaños).
     """
     costos_por_ticket = costos_por_ticket or {}
     cuotas_por_ticket = cuotas_por_ticket or {}
     peldanos_por_ticket = peldanos_por_ticket or {}
+    minutos_por_ticket = minutos_por_ticket or {}
 
     def _enriquecido(t):
         clave = (t.repo, t.ref)
         return replace(t, costo=costos_por_ticket.get(clave, t.costo),
                        cuota=cuotas_por_ticket.get(clave, t.cuota),
+                       minutos=minutos_por_ticket.get(clave, t.minutos),
                        peldanos=peldanos_por_ticket.get(clave, t.peldanos))
 
     tickets = [_enriquecido(t) for t in resumen.tickets]

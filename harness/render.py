@@ -109,11 +109,14 @@ def _resumen(r, c, out):
 
 
 def _gasto_ticket(t, c):
-    """El costo de un ticket en las dos monedas (#47): dólares de
+    """Lo que un ticket costó en las monedas que midemos (#47, #116):
+    minutos de agente (la que de verdad limita una noche), dólares de
     OpenRouter y tokens de Claude ponderados, cuando hay algo que
-    mostrar. Vacío si el ticket no gastó nada en ninguna de las dos —
+    mostrar. Vacío si el ticket no gastó nada en ninguna de las tres —
     o si no se cruzó contra la cuota (offline: `cuota` queda en 0.0)."""
     partes = []
+    if t.minutos >= 1:
+        partes.append(f"{round(t.minutos)} min")
     if t.costo > 0:
         partes.append(f"${t.costo:.2f}")
     if t.cuota > 0:

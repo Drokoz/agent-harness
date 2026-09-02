@@ -184,6 +184,32 @@ class TestResumen(unittest.TestCase):
         self.assertIn("$0.42", salida)
         self.assertIn("12,345", salida)
 
+    def test_minutos_de_agente_junto_al_costo(self):
+        """AC #116: los minutos de agente se muestran al lado del costo:
+        es la moneda que de verdad limita una noche."""
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    cuota_semana=1.0, cuota_semana_harness=1.0, tickets=[
+                        Ticket(contexto="personal", ref="ticket/3",
+                              detalle="PR #19 abierto (gate verde)",
+                              costo=0.42, cuota=12345.0, minutos=320.4)])
+        salida = self.pantalla(r)
+        self.assertIn("320 min", salida)
+        self.assertIn("$0.42", salida)
+
+    def test_minutos_minimos_no_muestran(self):
+        """Menos de un minuto no se redondea a uno: no se finge gasto de
+        reloj que no hubo."""
+        from harness.summary import Ticket
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    cuota_semana=1.0, cuota_semana_harness=1.0, tickets=[
+                        Ticket(contexto="personal", ref="ticket/3",
+                              detalle="PR #19 abierto (gate verde)",
+                              costo=0.42, minutos=0.4)])
+        salida = self.pantalla(r)
+        self.assertNotIn(" min", salida)
+        self.assertIn("$0.42", salida)
+
     def test_sin_cuota_no_muestra_tokens_por_ticket(self):
         """Sin datos de cuota (offline), el ticket se ve como siempre: sólo
         el detalle, sin inventar una cifra de tokens."""

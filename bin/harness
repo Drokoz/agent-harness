@@ -118,7 +118,8 @@ from harness import costo_pi  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
 from harness.dispatch import (BucleSpec, DispatchSpec, Dispatcher, EventLog,  # noqa: E402
                               Job, Pasada, bucle, cosechar, decidir_tanda,
-                              peldano_de, transcripcion_path)
+                              motivo_presupuesto_reloj, peldano_de,
+                              transcripcion_path)
 from harness.maintain import (CONFLICTING, MantenJob, Mantener,  # noqa: E402
                               mergeable_de)
 from harness.render import linea_evento, render  # noqa: E402
@@ -126,7 +127,7 @@ from harness.quota import (agregar, as_dict as quota_as_dict, cuota_por_ventana,
                            fuentes_desde_spec, leer_fuentes, puntos_de_ticket,
                            render_quota, resumen_evento, semana_de)
 from harness.snapshot import as_dict, snapshot  # noqa: E402
-from harness.state import (costo_promedio, intentos, intentos_pr,  # noqa: E402
+from harness.state import (costo_promedio, de_ticket, intentos, intentos_pr,  # noqa: E402
                            intentos_pr_que_escalan, intentos_que_escalan,
                            motivos_de_abandono, motivos_de_abandono_pr,
                            pasos, ultimo_gate_rojo, ultimo_wip)
@@ -403,7 +404,7 @@ def _con_cuota(resumen, eventos_todos, contexts, quota_agg, quota_registros):
     """
     raices = [Path(c.repos.root).expanduser() for c in contexts]
     harness_sem, resto_sem = semana_de(quota_agg, datetime.now(timezone.utc))
-    costos, cuotas, peldanos = {}, {}, {}
+    costos, cuotas, peldanos, minutos = {}, {}, {}, {}
     for t in resumen.tickets:
         issue = _issue_de_ref(t.ref)
         if t.repo is None or issue is None:
@@ -419,9 +420,14 @@ def _con_cuota(resumen, eventos_todos, contexts, quota_agg, quota_registros):
                             "motivo": p.motivo, "costo": p.costo, "cuota": p.cuota,
                             "peldano": p.peldano, "clase": p.clase}
                            for p in pasos_t]
+        # Los minutos de agente (#116) salen del historial completo, no
+        # del período: la moneda que de verdad limita una noche es la
+        # acumulada, y es la misma que presupuesta el despacho.
+        minutos[clave] = de_ticket(eventos_todos, t.repo, issue).duracion_min
     return con_cuota(resumen, cuota_semana=harness_sem + resto_sem,
                      cuota_semana_harness=harness_sem, costos_por_ticket=costos,
-                     cuotas_por_ticket=cuotas, peldanos_por_ticket=peldanos)
+                     cuotas_por_ticket=cuotas, peldanos_por_ticket=peldanos,
+                     minutos_por_ticket=minutos)
 
 
 def _resolver_pr(snap):
@@ -655,11 +661,16 @@ def run_main(args, contexts, solo=None):
                 if wip is not None:
                     wip = (wip[0], wip[1],
                            str(transcripcion_path(r.path, i.number, wip[0])))
+                # Los minutos de agente acumulados (#116) salen del
+                # historial completo: con ellos el presupuesto de reloj
+                # sabe si este ticket ya se comió la noche.
+                est = de_ticket(eventos_previos, r.name, i.number)
                 candidatos.append(Job(repo=r.name, repo_path=r.path, slug=r.slug,
                                       issue=i.number, attempt=attempt,
                                       kind=peldano["kind"], model=peldano["model"],
                                       extra_args=tuple(peldano["extra_args"]),
-                                      gate_tail=gate_tail, wip=wip))
+                                      gate_tail=gate_tail, wip=wip,
+                                      minutos_acumulado=est.duracion_min))
         # El tamaño de la tanda lo decide el presupuesto (#68): los
         # créditos que quedan contra el costo medio del historial, más el
         # margen, más los topes manuales. Lo que se queda fuera se anota
@@ -700,7 +711,8 @@ def run_main(args, contexts, solo=None):
         decisiones = decidir_tanda(candidatos, creditos, promedio, args.margen,
                                    max_tickets=args.max_tickets,
                                    presupuesto=(ctx.budget.provider
-                                                == "openrouter"))
+                                                == "openrouter"),
+                                   budget_reloj=spec.budget_minutos)
         for d in decisiones:
             j = d["job"]
             if d["despachar"]:
@@ -787,11 +799,25 @@ def _una_pasada(args, ctx, log):
             if wip is not None:
                 wip = (wip[0], wip[1],
                        str(transcripcion_path(r.path, i.number, wip[0])))
+            # El presupuesto de reloj (#116): un ticket que ya agotó los
+            # minutos de agente de la corrida se queda fuera con su motivo
+            # -- no es un abandono, no gasta peldaño -- y se recalcula en
+            # la próxima corrida, con el presupuesto de esa noche.
+            est = de_ticket(eventos_previos, r.name, i.number)
+            motivo_reloj = motivo_presupuesto_reloj(est.duracion_min,
+                                                    spec.budget_minutos)
+            if motivo_reloj:
+                log.write("fuera", "ticket/{}".format(i.number), motivo_reloj,
+                          ticket="{}#{}".format(r.name, i.number))
+                sys.stdout.write("  FUERA  #{}/{} {}\n".format(
+                    i.number, r.name, motivo_reloj))
+                continue
             jobs.append(Job(repo=r.name, repo_path=r.path, slug=r.slug,
                             issue=i.number, attempt=attempt,
                             kind=peldano["kind"], model=peldano["model"],
                             extra_args=tuple(peldano["extra_args"]),
-                            gate_tail=gate_tail, wip=wip))
+                            gate_tail=gate_tail, wip=wip,
+                            minutos_acumulado=est.duracion_min))
     if not jobs:
         extra = " ({} parkeado(s))".format(parkeados) if parkeados else ""
         sys.stdout.write('harness: "{}": nada en la frontera{}\n'.format(
