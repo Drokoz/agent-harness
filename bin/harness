@@ -118,7 +118,7 @@ from harness import costo_pi  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
 from harness.dispatch import (BucleSpec, DispatchSpec, Dispatcher, EventLog,  # noqa: E402
                               Job, Pasada, bucle, cosechar, decidir_tanda,
-                              peldano_de)
+                              peldano_de, transcripcion_path)
 from harness.maintain import (CONFLICTING, MantenJob, Mantener,  # noqa: E402
                               mergeable_de)
 from harness.render import linea_evento, render  # noqa: E402
@@ -129,7 +129,7 @@ from harness.snapshot import as_dict, snapshot  # noqa: E402
 from harness.state import (costo_promedio, intentos, intentos_pr,  # noqa: E402
                            intentos_pr_que_escalan, intentos_que_escalan,
                            motivos_de_abandono, motivos_de_abandono_pr,
-                           pasos, ultimo_gate_rojo)
+                           pasos, ultimo_gate_rojo, ultimo_wip)
 from harness.summary import (PrAbierto, Resumen, con_cuota, construir,  # noqa: E402
                              filtrar, guardar_marca, as_dict as resumen_as_dict,
                              leer_eventos, leer_marca, parse_fecha)
@@ -649,11 +649,17 @@ def run_main(args, contexts, solo=None):
                     continue
                 gate_tail = (ultimo_gate_rojo(eventos_previos, r.name, i.number)
                             if peldano.get("cola_gate") else None)
+                # La rama trae un commit WIP de un abandono previo (#80): el
+                # prompt del intento siguiente lo dice y le deja la decisión.
+                wip = ultimo_wip(eventos_previos, r.name, i.number)
+                if wip is not None:
+                    wip = (wip[0], wip[1],
+                           str(transcripcion_path(r.path, i.number, wip[0])))
                 candidatos.append(Job(repo=r.name, repo_path=r.path, slug=r.slug,
                                       issue=i.number, attempt=attempt,
                                       kind=peldano["kind"], model=peldano["model"],
                                       extra_args=tuple(peldano["extra_args"]),
-                                      gate_tail=gate_tail))
+                                      gate_tail=gate_tail, wip=wip))
         # El tamaño de la tanda lo decide el presupuesto (#68): los
         # créditos que quedan contra el costo medio del historial, más el
         # margen, más los topes manuales. Lo que se queda fuera se anota
@@ -775,11 +781,17 @@ def _una_pasada(args, ctx, log):
                 continue
             gate_tail = (ultimo_gate_rojo(eventos_previos, r.name, i.number)
                         if peldano.get("cola_gate") else None)
+            # La rama trae un commit WIP de un abandono previo (#80): el
+            # prompt del intento siguiente lo dice y le deja la decisión.
+            wip = ultimo_wip(eventos_previos, r.name, i.number)
+            if wip is not None:
+                wip = (wip[0], wip[1],
+                       str(transcripcion_path(r.path, i.number, wip[0])))
             jobs.append(Job(repo=r.name, repo_path=r.path, slug=r.slug,
                             issue=i.number, attempt=attempt,
                             kind=peldano["kind"], model=peldano["model"],
                             extra_args=tuple(peldano["extra_args"]),
-                            gate_tail=gate_tail))
+                            gate_tail=gate_tail, wip=wip))
     if not jobs:
         extra = " ({} parkeado(s))".format(parkeados) if parkeados else ""
         sys.stdout.write('harness: "{}": nada en la frontera{}\n'.format(

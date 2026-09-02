@@ -228,12 +228,23 @@ def podar_transcripciones(dir, repo, issue, keep=TRANSCRIPCIONES_POR_TICKET,
     return borrados
 
 
-def prompt_de(issue, gate_tail=None):
+def prompt_de(issue, gate_tail=None, wip=None):
     """El trabajo de un agente, en una línea. En inglés: es machine-facing.
 
     `gate_tail` es la cola del gate rojo del intento anterior (peldaño 2 de
     la escalera, #38): se pega al final y `una_linea` la aplasta junto con
     el resto, así que sigue siendo una sola línea aunque traiga saltos.
+
+    `wip` (None o `(intento, motivo, transcripcion)`, #80): cuando la rama
+    trae un commit WIP de un abandono previo, el prompt lo dice — existe,
+    de qué intento viene y con qué motivo murió ese intento — y deja la
+    decisión al agente en dos opciones: retomar desde el WIP, o descartarlo
+    y empezar de cero desde la base. Descartar se dice explícito como
+    legítimo: un WIP existe porque algo falló. También apunta a la
+    transcripción del intento anterior (#66) para decidir con evidencia,
+    y exige que la decisión quede registrada en el log (el primer commit
+    del intento), para poder medir cuál de las dos funciona mejor.
+    Sin WIP, el prompt es el de siempre, sin ruido extra.
     """
     texto = (
         "Read AGENTS.md and CONTEXT.md, then implement GitHub issue {} in this "
@@ -248,6 +259,20 @@ def prompt_de(issue, gate_tail=None):
     )
     if gate_tail:
         texto += " The previous attempt's gate failed with: {}".format(gate_tail)
+    if wip:
+        intento, motivo, transcripcion = wip
+        texto += (
+            " This branch already carries a WIP commit left by the abandoned "
+            "attempt {} of this issue. That attempt was abandoned because: {}. "
+            "You have exactly two options: (1) resume from that WIP commit and "
+            "build on it, or (2) discard it and start from scratch from the "
+            "base - the WIP exists because something went wrong, so discarding "
+            "is a legitimate choice, not a failure. Read the previous attempt's "
+            "transcript at {} before deciding. Record your decision so it can "
+            "be measured: make the first commit of this attempt start with "
+            '"WIP decision: resume" or "WIP decision: discard", followed by a "'
+            "one-line reason.".format(intento, motivo, transcripcion)
+        )
     return una_linea(texto)
 
 
@@ -599,6 +624,9 @@ class Job:
     # El primer prompt no llego (#113): no es un veredicto todavía, lo
     # decide `dispatch` al ver si quedan vueltas para recolocarlo.
     prompt_perdido: bool = False
+    # (intento, motivo, transcripcion) del commit WIP que quedó en la rama
+    # por un abandono previo (#80); None = sin WIP, prompt de siempre.
+    wip: Optional[Tuple[int, str, str]] = None
 
 
 @dataclass
@@ -702,7 +730,7 @@ class Dispatcher:
         return nombre_agente(job.repo, job.issue)
 
     def _prompt(self, job):
-        return prompt_de(job.issue, job.gate_tail)
+        return prompt_de(job.issue, job.gate_tail, job.wip)
 
     def _baseline(self, job, ref):
         """Lo que el job debía preservar antes de despachar. El ticket no
