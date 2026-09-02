@@ -26,5 +26,14 @@ jobs:
         with:
           python-version: "3.9"
 
+      # El harness hace git de verdad (worktrees, rebase de la rama de un
+      # intento anterior), y un rebase sin identidad sale 128. En una máquina
+      # de trabajo la identidad global está puesta y no se nota; en el runner
+      # no, y el gate venía rojo desde el 2026-08-26 sin que nadie mirara.
+      - name: Identidad de git
+        run: |
+          git config --global user.email "gate@agent-harness.local"
+          git config --global user.name "gate"
+
       - name: Gate
         run: ./scripts/gate.sh
