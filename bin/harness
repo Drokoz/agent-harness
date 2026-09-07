@@ -1031,12 +1031,14 @@ def _run_loop(args, contexts, log_path):
         # Una corrida nueva por pasada: su propio run_id, y la línea
         # `pasada` se anota en ella, no en una corrida fantasma.
         log = EventLog(log_path, nombre)
-        trabajo, partes = False, []
+        trabajo, partes, corte = False, [], ""
         for ctx in contexts:
             p = _una_pasada(args, ctx, log)
             trabajo = trabajo or p.trabajo
             partes.append(p.detalle)
-        return Pasada(trabajo, "; ".join(partes), log=log)
+            if p.corte and not corte:
+                corte = p.corte
+        return Pasada(trabajo, "; ".join(partes), log=log, corte=corte)
 
     log_corriente = {"log": None}
 
