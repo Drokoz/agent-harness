@@ -819,6 +819,7 @@ class TestRevisorEnElDispatcher(unittest.TestCase):
     def test_sin_pr_no_hay_revision(self):
         """El revisor corre sobre el PR con gate verde; sin PR no hay diff
         que revisar y no se gasta la llamada."""
+        from harness.review import Revision
         revisor = self.FalsoRevisor(Revision("sin_hallazgos"))
         res, lineas = despachar(Mundo(prs=[{"number": 31,
                                             "headRefName": "otra-rama"}]),
@@ -836,7 +837,7 @@ class TestRevisorEnElDispatcher(unittest.TestCase):
         m.responder(lambda a: a[0] == "pi", (True, "[]"))
         res, lineas = despachar(m, [job()])
         self.assertEqual(res[0].estado, "hecho", res[0].motivo)
-        pi = m.llamo("pi")
+        pi = [c for c in m.llamadas if c[0][0] == "pi"]
         self.assertEqual(len(pi), 1)
         args = pi[0][0]
         self.assertEqual(args[args.index("--tools") + 1], "read,grep,find,ls")
