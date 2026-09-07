@@ -91,6 +91,22 @@
                                     por defecto 0.25): sin más de eso restante,
                                     el juez no corre en Claude
 
+    harness ideas                 el agente semanal (#117): cruza los repos
+                                    del contexto y busca qué está YA construido
+                                    que otro rubro chileno pagaría. Un modelo
+                                    bueno (Claude por defecto, `--opus` para
+                                    subir) mira el código, y el harness valida
+                                    (evidencia que se puede ir a leer, dedup
+                                    contra la vault, tope de notas) y escribe
+                                    una nota por idea en `vault/ideas/`. No
+                                    abre issues: no es trabajo, es material
+                                    para decidir
+    harness ideas --max-ideas N   tope duro de notas por corrida (por defecto 3)
+    harness ideas --forzar        correr aunque la última haya sido hace menos
+                                    de 7 días (el ritmo es semanal, no de cada
+                                    noche)
+    harness ideas --opus          el agente corre en Opus en vez de en Sonnet
+
 `harness run --loop` lo llama solo: cuando la frontera queda vacía, en vez de
 sólo esperar, corre una pasada de `proponer` (una vez por bucle; `--sin-proponer`
 lo desactiva).
@@ -145,6 +161,10 @@ from harness.dispatch import (BucleSpec, DispatchSpec, Dispatcher, EventLog,  # 
                               Job, Pasada, bucle, cosechar, decidir_tanda,
                               motivo_presupuesto_reloj, peldano_de,
                               skills_de, transcripcion_path)
+from harness.ideas import (IDEAS_CLAUDE, IDEAS_OPUS, Ideas,  # noqa: E402
+                           MAX_IDEAS_DEFAULT, debe_correr,
+                           guardar_ultima_corrida, leer_ideas_vault,
+                           leer_ultima_corrida)
 from harness.maintain import (CONFLICTING, MantenJob, Mantener,  # noqa: E402
                               mergeable_de)
 from harness.proposal import (GENERADOR, JUEZ_CLAUDE, JUEZ_QWEN,  # noqa: E402
@@ -189,13 +209,14 @@ def build_parser():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", nargs="?", default="status",
                    choices=["status", "decisions", "run", "maintain", "report",
-                            "quota", "costo", "proponer"],
+                            "quota", "costo", "proponer", "ideas"],
                    help="status (la pantalla), decisions (las decisiones), "
                         "run (el dispatcher de la frontera), "
                         "maintain (el mantenedor de conflictos, #56), "
                         "quota (la cuota de Claude por sesiones locales) o "
                         "costo (el costo real por peldaño, #96) o "
-                        "proponer (el generador y el juez de trabajo nuevo, #115)")
+                        "proponer (el generador y el juez de trabajo nuevo, "
+                        "#115) o ideas (el agente semanal de ideas, #117)")
     p.add_argument("--context", metavar="NOMBRE",
                    help="un contexto en vez del de por defecto")
     p.add_argument("--all", action="store_true", dest="todos",
@@ -269,6 +290,14 @@ def build_parser():
                    help="run --loop: no hacer la consulta barata "
                         "'¿cambió algo?' antes de cada barrido (#114): barra "
                         "completo cada vuelta, como antes")
+    p.add_argument("--max-ideas", type=int, default=MAX_IDEAS_DEFAULT,
+                   dest="max_ideas",
+                   help="ideas: tope duro de notas por corrida (por defecto 3)")
+    p.add_argument("--opus", action="store_true",
+                   help="ideas: el agente corre en Opus en vez de en Sonnet")
+    p.add_argument("--forzar", action="store_true",
+                   help="ideas: correr aunque la última haya sido hace menos "
+                        "de 7 días (el ritmo es semanal)")
     return p
 
 
@@ -323,6 +352,11 @@ def main(argv=None):
             sys.stderr.write("harness: --piso-cuota tiene que estar entre 0 y 1\n")
             return 2
         return proponer_main(args, contexts)
+    if args.command == "ideas":
+        if args.max_ideas < 1:
+            sys.stderr.write("harness: --max-ideas tiene que ser >= 1\n")
+            return 2
+        return ideas_main(args, contexts)
 
     raw = collect(contexts, offline=OFFLINE)
     quota_registros, quota_agg = None, None
@@ -1118,6 +1152,75 @@ def proponer_main(args, contexts):
                        listener=None if args.quiet else _imprimir_evento)
         resumen = _proponer_ctx(args, ctx, log)
         sys.stdout.write('harness: "{}": {}\n'.format(ctx.name, resumen))
+        sys.stdout.write("harness: log de eventos {}\n".format(log.path))
+    return 0
+
+
+def ideas_main(args, contexts):
+    """`harness ideas` (#117): el agente semanal. Cruza los repos del
+    contexto, el modelo bueno propone, y el harness valida y escribe las
+    notas en `vault/ideas/` — nunca a GitHub: no es trabajo, es material
+    para decidir. El ritmo es semanal: un sello junto al log corta las
+    corridas a menos de 7 días de la anterior, y `--forzar` lo salta a
+    mano."""
+    log_path = (Path(args.log).expanduser() if args.log
+                else _estado_dir() / "harness" / "events.jsonl")
+    for ctx in contexts:
+        if ctx.autonomy == "manual":
+            sys.stdout.write('harness: contexto "{}": autonomía manual, '
+                             'este comando no toma nada solo\n'.format(ctx.name))
+            continue
+        if OFFLINE or os.environ.get("HERDR_ENV") != "1":
+            sys.stderr.write("harness: ideas necesita adaptadores y una sesión "
+                             "de herdr (sin HARNESS_OFFLINE, con HERDR_ENV=1)\n")
+            return 2
+        if not ctx.vault:
+            sys.stderr.write('harness: contexto "{}": sin vault declarada, no '
+                             'hay dónde escribir las notas\n'.format(ctx.name))
+            continue
+        log = EventLog(log_path, ctx.name,
+                       listener=None if args.quiet else _imprimir_evento)
+        stamp = (_estado_dir() / "harness" / "ideas-ultima-corrida-{}".format(
+            ctx.name))
+        if args.forzar:
+            ok, motivo = True, "forzada a mano (--forzar)"
+        else:
+            ok, motivo = debe_correr(leer_ultima_corrida(stamp), _ahora_str())
+        if not ok:
+            log.write("ideas", "idea", "no corre: " + motivo)
+            sys.stdout.write('harness: "{}": {}\n'.format(ctx.name, motivo))
+            continue
+        repos = [(p.name, str(p)) for p in repo_paths(ctx.repos)]
+        if not repos:
+            sys.stdout.write('harness: "{}": sin repos en el disco, no hay '
+                             'qué mirar\n'.format(ctx.name))
+            continue
+        conocidas = leer_ideas_vault(Path(ctx.vault).expanduser() / "ideas")
+        peldano = IDEAS_OPUS if args.opus else IDEAS_CLAUDE
+        # El agente lee TODOS los repos con un modelo bueno: la fase larga y
+        # callada es legítima, así que el umbral del watchdog se ensancha
+        # (los 12 min del ticket se comen la lectura de los repos).
+        spec = DispatchSpec(contexto=ctx.name, kind=peldano["kind"],
+                            model=peldano["model"], watchdog_kill_min=45)
+        ideas = Ideas(spec, log, run_cmd=adapters.run)
+        log.write("ideas", "idea",
+                  "ritmo semanal: {} — {} idea(s) ya en la vault, repos: {}".format(
+                      motivo, len(conocidas),
+                      ", ".join(n for n, _ in repos)))
+        res = ideas.ideas_corrida(repos[0][0], repos[0][1], repos,
+                                  ctx.vault, args.max_ideas, conocidas,
+                                  extra_args=peldano.get("extra_args", ()))
+        for d in res["detalle"]:
+            sys.stdout.write("  {}\n".format(d))
+        if res["estado"] == "hecho":
+            # Un abandono no congela el ritmo semanal: se puede reintentar.
+            guardar_ultima_corrida(stamp, _ahora_str())
+        extra = (" (agente {} — sin sello: se puede reintentar)".format(
+            res["estado"]) if res["estado"] != "hecho" else "")
+        sys.stdout.write('harness: "{}": {} nota(s) escrita(s), {} '
+                         'descartada(s){}\n'.format(
+                             ctx.name, res["escribas"], res["descartadas"],
+                             extra))
         sys.stdout.write("harness: log de eventos {}\n".format(log.path))
     return 0
 
