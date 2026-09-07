@@ -344,13 +344,15 @@ class LaCorrida(EscenarioIdeas):
                   archivo="app/caja.py", linea=4,
                   rubro="Ferreterías de La Florida"),
         ])
+        prev = set(self.ideas_escritas())
         res, eventos = self.correr(mundo,
                                    conocidas=leer_ideas_vault(
                                        self.vault / "ideas"))
         self.assertEqual(res["escribas"], 1)
         self.assertEqual(res["descartadas"], 2)
-        escritas = self.ideas_escritas()
-        self.assertEqual(len(escritas), 1)
+        escritas = [f for f in self.ideas_escritas() if f not in prev]
+        self.assertEqual(len(escritas), 1, "la semilla ya estaba: cuentan "
+                         "sólo las notas de esta corrida")
         self.assertIn("caja", Path(escritas[0]).name)
         dups = [e["cuerpo"] for e in eventos
                 if e["tipo"] == "idea" and "duplicada" in e["cuerpo"]]
