@@ -407,6 +407,48 @@ class TestResumen(unittest.TestCase):
         salida = self.pantalla(r)
         self.assertNotIn("según el log", salida)
 
+    # --------------------------------------------------------- revisión (#46)
+    def _ticket_con_revision(self, revision):
+        from harness.summary import Ticket
+        return Ticket(contexto="personal", ref="ticket/3",
+                      detalle="PR #19 abierto (gate verde)",
+                      repo="agent-harness", numero=19, revision=revision)
+
+    def test_hallazgos_junto_al_pr(self):
+        from harness.review import Hallazgo, Revision
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    tickets=[self._ticket_con_revision(Revision("ok",
+                        hallazgos=[Hallazgo("alta", "a.py", "bug"),
+                                   Hallazgo("baja", "", "nit")]))])
+        salida = self.pantalla(r)
+        linea_pr = [l for l in salida.splitlines()
+                    if "· personal ticket/3:" in l][0]
+        self.assertGreater(salida.index("[alta] a.py: bug"),
+                           salida.index(linea_pr))
+        # en orden de gravedad, la más pesada primero
+        self.assertLess(salida.index("[alta] a.py: bug"),
+                        salida.index("[baja] nit"))
+
+    def test_sin_hallazgos_se_marca_como_tal(self):
+        from harness.review import Revision
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    tickets=[self._ticket_con_revision(
+                        Revision("sin_hallazgos"))])
+        self.assertIn("revisión: sin hallazgos", self.pantalla(r))
+
+    def test_revision_fallida_con_motivo(self):
+        from harness.review import Revision
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    tickets=[self._ticket_con_revision(
+                        Revision("fallida", motivo="el revisor no respondio"))])
+        self.assertIn("revisión fallida: el revisor no respondio",
+                      self.pantalla(r))
+
+    def test_ticket_sin_revision_no_dice_nada_de_revisiones(self):
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    tickets=[self._ticket_con_revision(None)])
+        self.assertNotIn("revisión", self.pantalla(r))
+
 
 class TestEstadoFrontera(unittest.TestCase):
     """El ticket #43: la línea de cada ticket de la frontera muestra su estado."""
