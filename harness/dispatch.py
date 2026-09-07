@@ -340,6 +340,25 @@ def _ahora():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _hhmm(ts):
+    """Las HH:MM de un timestamp del log (la misma hora que muestra el
+    listener, para que "desde las HH:MM" apunte a algo visible)."""
+    m = re.search(r"T(\d{2}:\d{2})", str(ts or ""))
+    return m.group(1) if m else str(ts or "")
+
+
+def _duracion(segundos):
+    """Segundos a "29h 5m" / "5m 30s" / "42s": el resumen del corte (#114)"""
+    segundos = int(round(segundos))
+    h, resto = divmod(segundos, 3600)
+    m, s = divmod(resto, 60)
+    if h:
+        return "{}h {}m".format(h, m)
+    if m:
+        return "{}m {}s".format(m, s)
+    return "{}s".format(s)
+
+
 # --------------------------------------------------------------------- tanda
 # Los runners que corren contra la cuota de Claude, no contra la key de
 # OpenRouter: para ellos el tope por presupuesto no existe (#68).
@@ -527,7 +546,17 @@ class BucleSpec:
     max_pasadas: int = 12        # tope duro de pasadas CON trabajo
     espera: float = 60.0         # segundos entre pasadas con trabajo
     espera_vacia: float = 300.0  # frontera vacía: espera más larga, no es el fin (#101)
+    espera_vacia_max: float = 1800.0  # techo del backoff de la espera vacía (#114)
     vueltas_vacias_max: int = 60  # tope contra estar mirando para siempre
+
+
+def espera_vacia_de(vuelta, spec):
+    """La espera de la vuelta vacía número `vuelta` de la racha (#114):
+    `spec.espera_vacia` doblada por vuelta, con el techo
+    `spec.espera_vacia_max`. El backoff hace que una noche sin novedades
+    cueste un barrido cada 30 minutos, no cada 5, y un barrido completo
+    cada 5 minutos cuando SÍ hay novedades nuevas."""
+    return min(spec.espera_vacia * 2 ** (vuelta - 1), spec.espera_vacia_max)
 
 
 @dataclass
@@ -548,7 +577,7 @@ class Pasada:
 
 
 def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
-          dormir=None, proposer_vacio=None):
+          dormir=None, proposer_vacio=None, vigilar=None):
     """El modo `--loop` (#88): repite la pasada hasta que la frontera se
     vacíe — y la frontera vacía no es el fin de la noche, es una espera
     (#101): un issue etiquetado a las 4am tiene que encontrar el bucle
@@ -570,11 +599,26 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
     humano, no de la máquina). Un fallo del proposer no tumba el bucle: se
     anota y se espera igual.
 
-    Cada pasada queda en el log con su número (`pasada`, ref `bucle/N`).
-    `ejecutar_pasada` -> `Pasada` es una pasada completa; `dormir` es el
-    reloj — los tests inyectan uno que no espera de verdad. `log` es el
-    EventLog de respaldo (las pasadas que no traen su propio log, y el corte
-    si no hubo pasadas). Devuelve el motivo del corte.
+    La espera vacía se alarga sola (#114): `espera_vacia` doblada por
+    vuelta hasta `espera_vacia_max` (5m, 10m, 20m, 30m…), y el trabajo la
+    corta. Las vueltas vacías seguidas no dejan una línea por vuelta:
+    dejan una línea de `espera` en el log cuando la espera sube de paso,
+    y el corte al final dice cuántas vueltas vacías hubo y cuánto se
+    esperó, en una línea.
+
+    `vigilar` (#114): "¿cambió algo en GitHub?" barato — una llamada de
+    search por repo contra el `updated_at`, no un barrido completo. False =
+    no cambió nada: no hay barrido, la vuelta cuenta igual como vacía (un
+    bucle sin límite no existe) y la espera se alarga igual. True, None o
+    un fallo de `vigilar` -> barrido completo; el fallo queda anotado
+    (`vigilar`) en el log, porque sin dato no hay forma de afirmar que no
+    cambió. Sin `vigilar`, cada vuelta barre completo (lo de antes de #114).
+
+    Cada pasada CON trabajo queda en el log con su número (`pasada`, ref
+    `bucle/N`). `ejecutar_pasada` -> `Pasada` es una pasada completa;
+    `dormir` es el reloj — los tests inyectan uno que no espera de verdad.
+    `log` es el EventLog de respaldo (las pasadas que no traen su propio
+    log, y el corte si no hubo pasadas). Devuelve el motivo del corte.
     """
     if dormir is None:
         # Sin inyectar: el real. Se resuelve en la llamada, no en el `def`,
@@ -592,8 +636,12 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
             return None
         return None if v is None else float(v)
 
-    pasadas = 0    # las que encontraron trabajo
-    vacias = 0     # las seguidas sin nada en la frontera
+    pasadas = 0       # las que encontraron trabajo
+    vacias = 0        # las seguidas sin nada en la frontera
+    vacias_total = 0  # todas las vacías del bucle, para el resumen del corte
+    esperado = 0.0    # segundos dormidos en total (#114)
+    espera_anterior = None  # el backoff: cuándo subió la espera por última vez
+    desde_espera = None     # desde cuándo dura la racha vacía, para el log
     propuesto = False  # el proposer de frontera vacía corre una vez por bucle
     n = 0
     alvo = log
@@ -613,22 +661,44 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
             motivo = "nada nuevo en {} vueltas".format(spec.vueltas_vacias_max)
             break
         n += 1
-        p = ejecutar_pasada()
-        if p.log is not None:
-            alvo = p.log
-        if p.trabajo:
+        # #114: preguntar barato antes de barrer completo. Un fallo no es
+        # "no cambió": sin dato se barra, y la falla queda en el log.
+        cambio = True
+        if vigilar is not None:
+            try:
+                cambio = bool(vigilar())
+            except Exception as e:
+                cambio = True
+                alvo.write("vigilar", "bucle",
+                           "fallo: {} (barrio completo)".format(e))
+        p = None
+        if cambio:
+            p = ejecutar_pasada()
+            if p.log is not None:
+                alvo = p.log
+        if p is not None and p.trabajo:
             pasadas += 1
             vacias = 0
+            espera_anterior = None
+            desde_espera = None
             alvo.write("pasada", "bucle/{}".format(n),
                        "pasada {}: {}".format(n, p.detalle))
             espera = spec.espera
         else:
             vacias += 1
-            alvo.write("pasada", "bucle/{}".format(n),
-                       "pasada {}: frontera vacia (vuelta {} de {}), "
-                       "espero {}s".format(n, vacias, spec.vueltas_vacias_max,
-                                           int(spec.espera_vacia)))
-            if proposer_vacio is not None and not propuesto:
+            vacias_total += 1
+            espera = espera_vacia_de(vacias, spec)
+            if vacias == 1:
+                desde_espera = _hhmm(alvo.reloj())
+            # #114: no una línea por vuelta, una por cada subida de la
+            # espera (300s -> 600s -> 1200s -> techo): la noche entera sin
+            # novedades cabe en cuatro líneas más el resumen del corte.
+            if vacias == 1 or espera != espera_anterior:
+                alvo.write("espera", "bucle",
+                           "esperando desde las {}, {} vueltas, espero "
+                           "{}s".format(desde_espera, vacias, int(espera)))
+            espera_anterior = espera
+            if p is not None and proposer_vacio is not None and not propuesto:
                 # #115: la hora más barata de la máquina no se gasta en
                 # preguntar si hay trabajo, se gasta en mirarlo. Una vez por
                 # bucle: después, la cola de needs-triage es del humano.
@@ -640,8 +710,13 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
                 alvo.write("proponer", "bucle",
                            "frontera vacia: {} (en vez de solo esperar, "
                            "#115)".format(detalle))
-            espera = spec.espera_vacia
+        esperado += espera
         dormir(espera)
+    # #114: el final del log resume la espera en una línea: cuántas vueltas
+    # vacías hubo y cuánto se esperó en total.
+    if vacias_total:
+        motivo = "{} · {} vueltas, {} esperados".format(
+            motivo, vacias_total, _duracion(esperado))
     alvo.write("bucle", "bucle", "corte: " + motivo)
     return motivo
 

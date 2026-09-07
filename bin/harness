@@ -61,7 +61,10 @@
     harness run --loop              el bucle de la noche (#88): repite la
                                     pasada hasta que corta el piso de
                                     créditos, el tope de pasadas o el freno;
-                                    la frontera se recalcula entre pasadas
+                                    la frontera se recalcula entre pasadas;
+                                    la espera vacía se alarga sola (5m, 10m,
+                                    20m, 30m) y antes de cada barrido
+                                    pregunta barato "¿cambió algo?" (#114)
     harness run --loop --freno F    archivo que, si aparece, frena el bucle
 
     harness maintain                el mantenedor de conflictos (#56): recorre
@@ -122,6 +125,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -132,7 +136,7 @@ sys.path.insert(0, str(ROOT))
 
 from harness import adapters  # noqa: E402
 from harness.adapters import (adr_files, collect, load_config, openrouter_credits,
-                              repo_paths, vault_decision_files)  # noqa: E402
+                              repo_paths, slug_of, vault_decision_files)  # noqa: E402
 from harness.config import ConfigError  # noqa: E402
 from harness import costo  # noqa: E402
 from harness import costo_pi  # noqa: E402
@@ -261,6 +265,10 @@ def build_parser():
     p.add_argument("--sin-proponer", action="store_true", dest="sin_propone",
                    help="run --loop: no correr proponer con la frontera "
                         "vacía: esperar en blanco, como antes de #115")
+    p.add_argument("--sin-vigilar", action="store_true", dest="sin_vigila",
+                   help="run --loop: no hacer la consulta barata "
+                        "'¿cambió algo?' antes de cada barrido (#114): barra "
+                        "completo cada vuelta, como antes")
     return p
 
 
@@ -538,12 +546,36 @@ def _creditos_usado():
         return None
 
 
+LINEA_VIVA = {"espera": False, "ancho": 0}
+
+
 def _imprimir_evento(linea):
     """La salida en vivo de `run` (#81): cada evento del log, en una línea
     corta a stdout mientras la corrida va. Con color sólo si stdout es un
     TTY: un log redirigido a archivo queda legible. `--quiet` no inyecta
-    este listener y el comportamiento es el de siempre."""
-    sys.stdout.write(linea_evento(linea, color=sys.stdout.isatty()) + "\n")
+    este listener y el comportamiento es el de siempre.
+
+    En un TTY, la línea de `espera` del bucle es la única viva (#114):
+    las vueltas vacías seguidas no acumulan una línea por vuelta, se
+    actualiza la misma en el sitio. En un log redirigido no hay línea que
+    actualizar — el colapso lo da el bucle, que escribe una por cada
+    subida de la espera, no por vuelta."""
+    tty = sys.stdout.isatty()
+    txt = linea_evento(linea, color=tty)
+    if tty and LINEA_VIVA["espera"] and linea.get("tipo") == "espera":
+        # Sobrescribe la línea anterior: `ljust` con el ancho que ya se
+        # usó para no dejar colas de la línea vieja.
+        ancho = max(LINEA_VIVA["ancho"], len(txt),
+                    shutil.get_terminal_size((120, 24)).columns)
+        sys.stdout.write("\r" + txt.ljust(ancho))
+        LINEA_VIVA["ancho"] = ancho
+    else:
+        if tty and LINEA_VIVA["espera"]:
+            # La anterior era la línea viva: se baja para no pisarla.
+            sys.stdout.write("\n")
+        sys.stdout.write(txt + "\n")
+        LINEA_VIVA["ancho"] = 0
+    LINEA_VIVA["espera"] = (linea.get("tipo") == "espera")
     sys.stdout.flush()
 
 
@@ -880,6 +912,48 @@ def _una_pasada(args, ctx, log):
     return Pasada(True, "{} job(s)".format(len(jobs)), log=log)
 
 
+def _vigilar_repo(slug):
+    """#114: la firma barata de un repo — ¿cambió algo en sus issues?
+    Una sola llamada de search, ordenada por `updated` (la API da el
+    `updated_at`): etiquetar, editar o cerrar un issue mueve la firma.
+    Devuelve `(total, updated_at del más reciente)`; lanza si `gh` no
+    contesta, porque sin dato no hay forma de afirmar que no cambió y el
+    bucle barra completo (y lo anota)."""
+    out = adapters.gh_json(
+        slug, ["api", "search/issues?q=repo:{}+is:issue&sort=updated"
+               "&order=desc&per_page=1".format(slug)])
+    if out is None:
+        raise RuntimeError("gh search/issues no respondió ({})".format(slug))
+    items = out.get("items") or []
+    ultimo = items[0].get("updated_at") if items else None
+    return (out.get("total_count"), ultimo)
+
+
+def _armar_vigilar(contextos):
+    """#114: el "¿cambió algo?" del bucle: una llamada de search por repo
+    y vuelta, en vez de un barrido completo (config, issues, PRs, snapshot)
+    cuando no hay nada nuevo. Devuelve el callable que `bucle` inyecta,
+    o None cuando ningún repo tiene slug resolvable: sin firma no hay
+    forma de afirmar que no cambió, y se barra siempre, como antes."""
+    firmas = {}
+    for c in contextos:
+        for p in repo_paths(c.repos):
+            slug = slug_of(p)
+            if slug and slug not in firmas:
+                firmas[slug] = None
+    if not firmas:
+        return None
+
+    def vigilar():
+        for slug, anterior in firmas.items():
+            f = _vigilar_repo(slug)
+            if anterior is None or f != anterior:
+                firmas[slug] = f
+                return True
+        return False
+    return vigilar
+
+
 def _run_loop(args, contexts, log_path):
     """`harness run --loop` (#88): el modo bucle del CLI, en vez del
     `scripts/noche.sh` que hace lo mismo sin tests.
@@ -925,6 +999,9 @@ def _run_loop(args, contexts, log_path):
         return p
 
     spec = BucleSpec(piso=args.piso, max_pasadas=args.max_pasadas)
+    # #114: preguntar barato antes de barrer completo. Sin slug resolvable
+    # (o con --sin-vigilar) no existe: cada vuelta barra completo.
+    vigilar = None if args.sin_vigila else _armar_vigilar(contexts)
     # El proposer de frontera vacía (#115): la hora más barata de la máquina
     # no se gasta en preguntar si hay trabajo, se gasta en mirarlo. Corre
     # una vez por bucle; `--sin-proponer` lo desactiva.
@@ -938,7 +1015,7 @@ def _run_loop(args, contexts, log_path):
     # que anotar aunque no haya corrido ninguna (piso bajo al arrancar).
     corte = bucle(ejecutar, spec, EventLog(log_path, nombre),
                   creditos=creditos, freno=args.freno or None,
-                  proposer_vacio=proposer)
+                  proposer_vacio=proposer, vigilar=vigilar)
     sys.stdout.write("harness: bucle: corte: {}\n".format(corte))
     return 0
 
