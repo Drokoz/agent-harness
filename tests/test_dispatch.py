@@ -20,8 +20,9 @@ from unittest import mock
 import support
 from harness import adapters, dispatch, state
 from harness.dispatch import (ESCALERA, DispatchSpec, Dispatcher, EventLog, Job,
-                              cosechar, decidir_tanda, nombre_agente, peldano_de,
-                              prompt_de, una_linea, worktree_path)
+                              SKILLS_IMPLEMENTADOR, args_sesion_minima, cosechar,
+                              decidir_tanda, nombre_agente, peldano_de, prompt_de,
+                              skills_de, una_linea, worktree_path)
 
 ROOT = support.ROOT
 HARNESS = ROOT / "bin" / "harness"
@@ -32,6 +33,18 @@ NOMBRE_VALIDO = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 PANE_CERO = "⠏ Working...\n~/repo (ticket/7)\n↑1k ↓0.2k R2k CH0.0% $0.012 0.0%/262k ...\n"
 # El prompt llegó: el contexto subió y hay costo acumulado.
 PANE_ARRANCO = "⠏ Working...\n~/repo (ticket/7)\n↑12k ↓2k R4k CH0.1% $0.056 1.2%/262k ...\n"
+
+# #42: los args de la sesión mínima, después del `--` de `herdr agent start`.
+# En el mundo de mentira `test -f` sale ok por default, así que implement y
+# tdd cuentan como presentes en el worktree.
+PI_MINIMA = ["--no-skills",
+             "--skill", ".pi/skills/implement",
+             "--skill", ".pi/skills/tdd",
+             "--model", "qwen/qwen3.8-27b"]
+CLAUDE_MINIMA = ["--strict-mcp-config",
+                 "--setting-sources", "project",
+                 "--permission-mode", "auto",
+                 "--settings", '{"autoMode":{"skipAutoPermissionPrompt":true}}']
 
 
 class Mundo:
@@ -143,11 +156,11 @@ def spec(**kw):
 
 def job(issue=7, repo="koku", path="/repos/koku", slug="Drokoz/koku",
         attempt=1, kind="", model="", extra_args=(), gate_tail=None,
-        wip=None, minutos_acumulado=0.0):
+        wip=None, minutos_acumulado=0.0, skills=SKILLS_IMPLEMENTADOR):
     return Job(repo=repo, repo_path=path, slug=slug, issue=issue,
                attempt=attempt, kind=kind, model=model,
                extra_args=extra_args, gate_tail=gate_tail, wip=wip,
-               minutos_acumulado=minutos_acumulado)
+               minutos_acumulado=minutos_acumulado, skills=skills)
 
 
 def job_de_peldano(escalados, **kw):
@@ -1931,11 +1944,140 @@ class TestClasificacionDeAbandonos(unittest.TestCase):
         self.assertEqual(j.clase_abandono, "modelo")
 
 
+class TestSesionMinima(unittest.TestCase):
+    """#42: la sesión del implementador es mínima. Los puros que arman los
+    args del agente: sin servidores MCP, sin plugins, con las únicas skills
+    que el ticket necesita, y una sesión fresca por ticket (nunca
+    `--resume`/`--continue`)."""
+
+    def test_sin_declaracion_las_skills_son_la_base(self):
+        self.assertEqual(skills_de(""), SKILLS_IMPLEMENTADOR)
+        self.assertEqual(skills_de(None), SKILLS_IMPLEMENTADOR)
+        self.assertEqual(skills_de("implement issue 7"),
+                         ("implement", "tdd"))
+
+    def test_las_skills_que_declara_el_ticket_se_suman(self):
+        self.assertEqual(skills_de("## Archivos\nSkills: research"),
+                         ("implement", "tdd", "research"))
+        self.assertEqual(
+            skills_de("skills: domain-modeling, triage"),
+            ("implement", "tdd", "domain-modeling", "triage"))
+        self.assertEqual(skills_de("Skills: RESEARCH"),
+                         ("implement", "tdd", "research"))
+
+    def test_duplicados_e_invalidos_no_rompen(self):
+        self.assertEqual(skills_de("Skills: implement, tdd, tdd"),
+                         ("implement", "tdd"))
+        self.assertEqual(skills_de("Skills: /abs, con espacio, ok"),
+                         ("implement", "tdd", "ok"))
+
+    def test_gana_la_primera_linea_de_skills(self):
+        self.assertEqual(skills_de("Skills: research\nSkills: triage"),
+                         ("implement", "tdd", "research"))
+
+    def test_pi_carga_solo_las_skills_del_ticket(self):
+        args = args_sesion_minima("pi", ("implement", "tdd", "research"),
+                                  modelo="qwen/qwen3.8-27b",
+                                  extra_args=("--thinking", "medium"))
+        self.assertEqual(args, [
+            "--no-skills",
+            "--skill", ".pi/skills/implement",
+            "--skill", ".pi/skills/tdd",
+            "--skill", ".pi/skills/research",
+            "--model", "qwen/qwen3.8-27b",
+            "--thinking", "medium"])
+
+    def test_pi_sin_skills_del_repo_no_carga_ninguna(self):
+        self.assertEqual(args_sesion_minima("pi", (), modelo="qwen/m"),
+                         ["--no-skills", "--model", "qwen/m"])
+
+    def test_claude_sin_mcp_sin_plugins_mantiene_el_auto(self):
+        args = args_sesion_minima("claude", ("implement", "tdd"),
+                                  modelo="sonnet",
+                                  extra_args=("--effort", "medium"))
+        self.assertEqual(args, [
+            "--strict-mcp-config",
+            "--setting-sources", "project",
+            "--permission-mode", "auto",
+            "--settings", '{"autoMode":{"skipAutoPermissionPrompt":true}}',
+            "--model", "sonnet",
+            "--effort", "medium"])
+        # Ni un plugin ni un servidor MCP, y la config extra es JSON válido.
+        self.assertNotIn("--plugin-dir", args)
+        self.assertNotIn("--mcp-config", args)
+        self.assertEqual(
+            json.loads(args[args.index("--settings") + 1]),
+            {"autoMode": {"skipAutoPermissionPrompt": True}})
+
+    def test_ninguna_sesion_lleva_resume_ni_continue(self):
+        for kind in ("pi", "claude", "codex"):
+            args = args_sesion_minima(kind, ("implement", "tdd"),
+                                      modelo="m",
+                                      extra_args=("--thinking", "medium"))
+            for prohibido in ("--resume", "--continue", "-r", "-c"):
+                self.assertNotIn(prohibido, args, kind)
+
+    def test_un_kind_sin_sesion_minima_no_cambia(self):
+        self.assertEqual(
+            args_sesion_minima("codex", (), modelo="m",
+                               extra_args=("--x", "y")),
+            ["--model", "m", "--x", "y"])
+
+
+class TestSkillsDelTicket(unittest.TestCase):
+    """#42: el job trae las skills del ticket; pi arranca con las que
+    existen en el worktree, y una declarada que no hay se anota y se deja
+    afuera (un `--skill` inexistente tumbaría el arranque del agente)."""
+
+    def _cola_de_start(self, m):
+        (start,) = m.llamo("herdr", "agent", "start")
+        args = list(start[0])
+        return args[args.index("--") + 1:]
+
+    def test_pi_sin_skills_en_el_worktree_lleva_no_skills(self):
+        m = Mundo().responder(lambda a: a[:2] == ["test", "-f"], (False, ""))
+        res, _ = despachar(m, [job_de_peldano(0)])
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        self.assertEqual(self._cola_de_start(m),
+                         ["--no-skills",
+                          "--model", "qwen/qwen3.8-27b",
+                          "--thinking", "medium"])
+
+    def test_pi_declara_una_skill_que_no_hay_y_se_anota(self):
+        m = Mundo().responder(
+            lambda a: a[:2] == ["test", "-f"] and "research" in a,
+            (False, ""))
+        res, lineas = despachar(
+            m, [job_de_peldano(0,
+                               skills=("implement", "tdd", "research"))])
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        cola = self._cola_de_start(m)
+        self.assertIn(".pi/skills/implement", cola)
+        self.assertNotIn(".pi/skills/research", cola)
+        notas = [l for l in lineas if l["tipo"] == "skills"]
+        self.assertEqual(len(notas), 1)
+        self.assertIn("research", notas[0]["cuerpo"])
+
+    def test_claude_no_consulta_skills_del_worktree(self):
+        """Claude no tiene flag por skill: la sesión mínima no le pregunta
+        al worktree; sólo pi lo hace."""
+        consultas = []
+
+        def test_f(args):
+            consultas.append(1)
+            return (True, "")
+
+        m = Mundo().responder(lambda a: a[:2] == ["test", "-f"], test_f)
+        res, _ = despachar(m, [job_de_peldano(2)])
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        self.assertEqual(consultas, [])
+
+
 class TestEscaleraDispatcher(unittest.TestCase):
-    """Un test por peldaño (#38), contra el mundo scripteado: kind, modelo
-    y thinking/effort que le llegan a `herdr agent start`, sobre un Job ya
-    resuelto por `peldano_de` -- lo mismo que arma `bin/harness` antes de
-    llamar a `Dispatcher.dispatch`."""
+    """Un test por peldaño (#38), contra el mundo scripteado: kind, modelo,
+    thinking/effort y los args de la sesión mínima (#42) que le llegan a
+    `herdr agent start`, sobre un Job ya resuelto por `peldano_de` -- lo
+    mismo que arma `bin/harness` antes de llamar a `Dispatcher.dispatch`."""
 
     def _args_de_start(self, m):
         (start,) = m.llamo("herdr", "agent", "start")
@@ -1947,7 +2089,7 @@ class TestEscaleraDispatcher(unittest.TestCase):
         args = self._args_de_start(m)
         self.assertEqual(args[args.index("--kind") + 1], "pi")
         cola = args[args.index("--") + 1:]
-        self.assertEqual(cola, ["--model", "qwen/qwen3.8-27b", "--thinking", "medium"])
+        self.assertEqual(cola, PI_MINIMA + ["--thinking", "medium"])
         self.assertEqual(res[0].estado, "hecho", res[0].motivo)
 
     def test_peldano_2_thinking_alto_y_cola_el_gate_en_el_prompt(self):
@@ -1956,7 +2098,7 @@ class TestEscaleraDispatcher(unittest.TestCase):
         despachar(m, [j])
         args = self._args_de_start(m)
         cola = args[args.index("--") + 1:]
-        self.assertEqual(cola, ["--model", "qwen/qwen3.8-27b", "--thinking", "high"])
+        self.assertEqual(cola, PI_MINIMA + ["--thinking", "high"])
         (prompt,) = m.llamo("herdr", "agent", "prompt")
         texto = prompt[0][4]
         self.assertIn("ROJO: fallo del intento anterior", texto)
@@ -1970,7 +2112,9 @@ class TestEscaleraDispatcher(unittest.TestCase):
         args = self._args_de_start(m)
         self.assertEqual(args[args.index("--kind") + 1], "claude")
         cola = args[args.index("--") + 1:]
-        self.assertEqual(cola, ["--model", "sonnet", "--effort", "medium"])
+        self.assertEqual(cola,
+                         CLAUDE_MINIMA + ["--model", "sonnet", "--effort",
+                                          "medium"])
         self.assertEqual(res[0].estado, "hecho", res[0].motivo)
 
     def test_peldano_4_claude_opus_effort_medio(self):
@@ -1980,7 +2124,9 @@ class TestEscaleraDispatcher(unittest.TestCase):
                 res, _ = despachar(m, [job_de_peldano(3)])
         args = self._args_de_start(m)
         cola = args[args.index("--") + 1:]
-        self.assertEqual(cola, ["--model", "opus", "--effort", "medium"])
+        self.assertEqual(cola,
+                         CLAUDE_MINIMA + ["--model", "opus", "--effort",
+                                          "medium"])
 
 
 class TestWipEnElPrompt(unittest.TestCase):
