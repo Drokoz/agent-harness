@@ -69,6 +69,16 @@ KOKU_PRS = [
 
 READY_TODO = {"gate": True, "skills": True, "context": True}
 
+# El routing de OpenRouter (#126), tal como lo trae `adapters.pi_routing`:
+# lo que el repo declara y lo que hay en models.json — en el golden, puestos.
+ROUTING_OK = {"allow_fallbacks": True, "ignore": ["reka"]}
+ROUTING_RAW = {
+    "declaracion": {"provider": "openrouter",
+                    "compat": {"openRouterRouting": dict(ROUTING_OK)}},
+    "models": {"providers": {"openrouter": {"compat":
+                                            {"openRouterRouting": dict(ROUTING_OK)}}}},
+}
+
 # Los dos contextos del PLAN, con las dos polaridades de presupuesto y los dos
 # trackers. El token está para que los tests puedan verificar que no se filtra.
 DOS_CONTEXTOS = {
@@ -160,5 +170,6 @@ def golden_raw(*nombres):
     return {
         "offline": False,
         "agents": herdr_agents(),
+        "routing": dict(ROUTING_RAW),
         "contexts": [disponibles[n]() for n in nombres],
     }

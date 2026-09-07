@@ -251,6 +251,22 @@ def _agents(a, c, out):
             f"{color}{ag.status:<8}{c.off} {c.dim}{ag.repo} {ag.pane}{c.off}")
 
 
+def _routing(r, c, out):
+    """El routing de OpenRouter de la máquina (#126), de una y al lado de la
+    readiness: si un proveedor malo apaga la noche, la línea se ve igual que
+    cuando falta el gate. La solución es una: `harness doctor --fix`."""
+    label = f" {c.bold}Routing{c.off}       "
+    if r.state == "ok":
+        extra = f"{c.dim}ignore: {', '.join(r.ignore)}{c.off}" if r.ignore else ""
+        out(f"{label}{c.grn}✓ ok{c.off}{('  ' + extra) if extra else ''}")
+    elif r.state == "ausente":
+        out(f"{label}{c.red}· ausente{c.off}  {c.dim}harness doctor --fix{c.off}")
+    elif r.state == "distinto":
+        out(f"{label}{c.yel}· distinto al esperado{c.off}  {c.dim}harness doctor --fix{c.off}")
+    else:
+        out(f"{label}{c.dim}{r.detalle or r.state}{c.off}")
+
+
 def _header(ctx, c, out):
     detalle = f"{ctx.tracker} · {ctx.autonomy} · {ctx.run}"
     if ctx.vault:
@@ -357,6 +373,7 @@ def render(snap, quiet=False, color=True, resumen=None):
     if resumen is not None:
         _resumen(resumen, c, out)
     _agents(snap.agents, c, out)
+    _routing(snap.routing, c, out)
     if not snap.contexts:
         out("")
         out(f" {c.dim}ningún contexto configurado{c.off}")

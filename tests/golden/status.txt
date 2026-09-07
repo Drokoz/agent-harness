@@ -8,6 +8,7 @@
    ● Descarga de escudos de equipos     claude  idle     F7League w1:p28
    ● Refactorizar flujo de visitas y fo claude  idle     ERP-IphoneUp w3:p1
    ● Flujo de dispiece IMEI obligatorio claude  idle     ERP-IphoneUp w3:p2
+ Routing       ✓ ok  ignore: reka
 
  ▸ personal  github · frontier · local · vault ~/notas
  OpenRouter  ███████████░░░░░░░░░░░░░  $13.37 de $25.00 disponibles  ≈55 tickets
