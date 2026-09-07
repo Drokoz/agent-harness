@@ -259,12 +259,35 @@ def _header(ctx, c, out):
     out(f" {c.bold}▸ {ctx.name}{c.off}  {c.dim}{detalle}{c.off}")
 
 
+def _avisos_trackers(snap, c, out):
+    """Arriba, donde se ve: los repos cuyo tracker no se pudo leer (#130).
+    "No se pudo leer" no se dibuja como "nada pendiente": la frontera se
+    desconoce, y la noche entera depende de que esto se note a la mañana."""
+    for ctx in snap.contexts:
+        for r in ctx.repos:
+            if not r.tracker_ilegible:
+                continue
+            out(f" {c.red}⚠ tracker ilegible: {r.name} (contexto {ctx.name}): "
+                f"no se pudo leer (gh no contestó) — la frontera se desconoce, "
+                f"no está vacía{c.off}")
+
+
 def _work(ctx, c, out):
     out("")
     out(f" {c.bold}Trabajo{c.off}")
     algo = False
     for r in ctx.repos:
-        if not r.slug or not r.has_work:
+        if not r.slug:
+            continue
+        if r.tracker_ilegible:
+            # El repo sigue apareciendo: su frontera no es vacía, es desconocida
+            # (#130). Sin esto, un token vencido se dibuja "nada pendiente".
+            algo = True
+            out("")
+            out(f"   {c.red}{r.name}{c.off} {c.dim}{r.branch}{c.off} "
+                f"{c.red}— no se pudo leer el tracker (gh no contestó){c.off}")
+            continue
+        if not r.has_work:
             continue
         algo = True
         dirty = f" · {r.dirty} sin commitear" if r.dirty else ""
@@ -330,6 +353,7 @@ def render(snap, quiet=False, color=True, resumen=None):
     lines = [""]
     out = lines.append
 
+    _avisos_trackers(snap, c, out)
     if resumen is not None:
         _resumen(resumen, c, out)
     _agents(snap.agents, c, out)

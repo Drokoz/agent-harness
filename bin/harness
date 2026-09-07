@@ -341,6 +341,13 @@ def main(argv=None):
                          "8601 (p.ej. 2026-08-21)\n")
         return 2
     resumen = resumen_de(args, snap, contexts, quota_agg, quota_registros)
+    # Un tracker que no se pudo leer (gh vencido/sin red, #130) no es una
+    # frontera vacía: la pantalla lo dice arriba y el código de salida lo
+    # dice a quien lo automatiza — salir 0 sobre "no se pudo leer" es la
+    # familia de #91 (fallar en silencio es peor que fallar).
+    ilegibles = any(r.tracker_ilegible
+                    for c in snap.contexts for r in c.repos)
+    code = 1 if ilegibles else 0
     if args.command == "report" or args.como_json:
         # El reporte consume el MISMO dict que emite --json: es el contrato que el
         # spec fijó entre el núcleo y cualquier frontend. Si mañana la web se escribe
@@ -354,10 +361,10 @@ def main(argv=None):
         else:
             json.dump(data, sys.stdout, indent=2, ensure_ascii=False, sort_keys=True)
             sys.stdout.write("\n")
-        return 0
+        return code
     sys.stdout.write(render(snap, quiet=args.quiet, color=sys.stdout.isatty(),
                             resumen=resumen))
-    return 0
+    return code
 
 
 def _cuota_dict(quota_agg):
@@ -680,6 +687,19 @@ def run_main(args, contexts, solo=None):
         # (ticket #43): un ticket despachado no se re-despacha.
         crudo["eventos"] = eventos_previos
         snap = snapshot(crudo)
+        # El tracker que no se pudo leer (#130): su frontera no está vacía,
+        # se desconoce. El motivo va al log (para la mañana) y se dice cuál
+        # repo falló, sin tapar a los demás: si el resto tampoco tiene
+        # trabajo, no se despacha una tanda vacía — se corta con el motivo
+        # y sale distinto de cero, como el freno viejo de #91 no salía 0.
+        ilegibles = [r for r in snap.contexts[0].repos if r.tracker_ilegible]
+        for r in ilegibles:
+            log.write("corrida", "corrida",
+                      "tracker ilegible: {}: no se pudo leer el tracker "
+                      "(gh no contestó): la frontera de ese repo se "
+                      "desconoce".format(r.name))
+            sys.stdout.write('harness: "{}": {}: no se pudo leer el tracker '
+                             '(gh no contestó)\n'.format(ctx.name, r.name))
         spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
                             kind=args.kind, model=args.model)
         costo_de_pi, salida_de_pi = _sesiones_de_pi()
@@ -808,6 +828,12 @@ def run_main(args, contexts, solo=None):
                     j.issue, j.repo, d["motivo"]))
         if not jobs:
             extra = " ({} parkeado(s))".format(parkeados) if parkeados else ""
+            if ilegibles:
+                sys.stderr.write('harness: "{}": no se despacha nada: no se '
+                                 'pudo leer el tracker de {}\n'.format(
+                                     ctx.name, ", ".join(r.name
+                                                         for r in ilegibles)))
+                return 1
             sys.stdout.write('harness: "{}": nada en la frontera{}\n'.format(
                 ctx.name, extra))
             continue
@@ -839,6 +865,22 @@ def _una_pasada(args, ctx, log):
     # (ticket #43): un ticket despachado no se re-despacha.
     crudo["eventos"] = eventos_previos
     snap = snapshot(crudo)
+    # El tracker que no se pudo leer (#130): la frontera se desconoce, no
+    # está vacía. El motivo va al log, se dice cuál repo falló (sin tapar a
+    # los demás: los legibles sí se despachan), y la pasada trae `corte`:
+    # el bucle no gasta vueltas vacías contra un tracker que no va a
+    # responder — corta en la primera.
+    ilegibles = [r for r in snap.contexts[0].repos if r.tracker_ilegible]
+    for r in ilegibles:
+        log.write("corrida", "corrida",
+                  "tracker ilegible: {}: no se pudo leer el tracker "
+                  "(gh no contestó): la frontera de ese repo se "
+                  "desconoce".format(r.name))
+        sys.stdout.write('harness: "{}": {}: no se pudo leer el tracker '
+                         '(gh no contestó)\n'.format(ctx.name, r.name))
+    corte = ("tracker ilegible: {}".format(
+                 ", ".join(r.name for r in ilegibles))
+             if ilegibles else "")
     spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
                         kind=args.kind, model=args.model)
     costo_de_pi, salida_de_pi = _sesiones_de_pi()
@@ -908,14 +950,15 @@ def _una_pasada(args, ctx, log):
         extra = " ({} parkeado(s))".format(parkeados) if parkeados else ""
         sys.stdout.write('harness: "{}": nada en la frontera{}\n'.format(
             ctx.name, extra))
-        return Pasada(False, "nada en la frontera{}".format(extra), log=log)
+        return Pasada(False, "nada en la frontera{}".format(extra), log=log,
+                      corte=corte)
     resultados = disp.dispatch(jobs)
     for j in resultados:
         estado = "OK       " if j.estado == "hecho" else "ABANDONADO"
         detalle = j.motivo if j.estado != "hecho" else "PR abierto (gate verde)"
         sys.stdout.write("  {} #{}/{} {}\n".format(estado, j.issue, j.repo, detalle))
     sys.stdout.write("harness: log de eventos {}\n".format(log.path))
-    return Pasada(True, "{} job(s)".format(len(jobs)), log=log)
+    return Pasada(True, "{} job(s)".format(len(jobs)), log=log, corte=corte)
 
 
 def _vigilar_repo(slug):
@@ -1023,7 +1066,10 @@ def _run_loop(args, contexts, log_path):
                   creditos=creditos, freno=args.freno or None,
                   proposer_vacio=proposer, vigilar=vigilar)
     sys.stdout.write("harness: bucle: corte: {}\n".format(corte))
-    return 0
+    # Un corte por tracker ilegible no es una noche terminada: es un mundo
+    # que no se pudo leer. Sale distinto de cero, como el freno viejo de
+    # #91 dejó de salir 0.
+    return 1 if corte.startswith("tracker ilegible") else 0
 
 
 def costo_main(args):

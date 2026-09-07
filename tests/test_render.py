@@ -650,7 +650,12 @@ class TestDegradado(unittest.TestCase):
         salida = render(snapshot(crudo), color=False)
         self.assertIn("sin datos (¿key en ~/.pi/agent/models.json?)", salida)
         self.assertIn("fuera de herdr", salida)
-        self.assertIn("nada pendiente", salida)
+        # #130: un tracker que no se pudo leer no se dibuja "nada pendiente":
+        # se dice arriba y por repo, que la frontera se desconoce.
+        self.assertNotIn("nada pendiente", salida)
+        self.assertIn("tracker ilegible: agent-harness", salida)
+        self.assertIn("tracker ilegible: koku", salida)
+        self.assertIn("no se pudo leer el tracker (gh no contestó)", salida)
         self.assertIn("Listo para el harness", salida)
         self.assertIn("agent-harness", salida)  # la tabla de readiness sigue entera
 

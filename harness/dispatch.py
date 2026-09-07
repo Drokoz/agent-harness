@@ -643,11 +643,17 @@ class Pasada:
 
     `log` es el EventLog de ESTA pasada (nuevo run_id): si hay, el bucle
     anota la pasada ahí, para que la corrida y su línea `pasada` se lean de
-    la misma corrida; sin `log` se anota en el log que recibió el bucle."""
+    la misma corrida; sin `log` se anota en el log que recibió el bucle.
+
+    `corte` no vacío: la pasada encontró un mundo que no puede leer (el
+    tracker no se pudo leer, #130): el bucle corta al terminar la pasada,
+    sin gastar vueltas vacías contra un tracker que no va a responder.
+    """
 
     trabajo: bool
     detalle: str = ""
     log: "EventLog | None" = None
+    corte: str = ""
 
 
 def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
@@ -664,7 +670,9 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
     - el crédito restante baja del piso (`creditos()` -> float | None; sin
       medir, el piso no corta, los demás cortes sí);
     - se agota el tope de pasadas CON trabajo (una vacía no gasta turno, #101);
-    - nada nuevo en `vueltas_vacias_max` vueltas con la frontera vacía.
+    - nada nuevo en `vueltas_vacias_max` vueltas con la frontera vacía;
+    - la pasada trae `corte`: un mundo que no puede leer (tracker ilegible,
+      #130) no se mira 60 veces, se corta en la primera.
 
     La frontera vacía se gasta en proponer trabajo nuevo, no en esperar en
     blanco (#115): si hay `proposer_vacio`, el bucle lo corre la PRIMERA
@@ -750,6 +758,11 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
             p = ejecutar_pasada()
             if p.log is not None:
                 alvo = p.log
+            if p.corte:
+                # El mundo no se puede leer (#130): esperar no va a arreglarlo;
+                # cortar ahora deja el motivo en el log para la mañana.
+                motivo = p.corte
+                break
         if p is not None and p.trabajo:
             pasadas += 1
             vacias = 0

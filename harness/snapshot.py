@@ -165,6 +165,14 @@ class Repo:
         """Si no hay nada de esto, el repo no aparece en la sección Trabajo."""
         return bool(self.frontier or self.blocked or self.prs or self.triage)
 
+    @property
+    def tracker_ilegible(self):
+        """El tracker de este repo no se pudo leer (gh no contestó): `issues`
+        es None. No es lo mismo que vacío —`[]` es leído y sin nada—: la
+        frontera se desconoce, y decir "nada pendiente" encima es fallar en
+        silencio (issue #130, la familia de #91)."""
+        return "issues" in self.degraded
+
 
 @dataclass
 class Context:
