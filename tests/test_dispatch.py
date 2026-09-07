@@ -2045,7 +2045,8 @@ class TestSkillsDelTicket(unittest.TestCase):
 
     def test_pi_declara_una_skill_que_no_hay_y_se_anota(self):
         m = Mundo().responder(
-            lambda a: a[:2] == ["test", "-f"] and "research" in a,
+            lambda a: a[:2] == ["test", "-f"] and
+            any("research" in x for x in a),
             (False, ""))
         res, lineas = despachar(
             m, [job_de_peldano(0,

@@ -140,7 +140,7 @@ from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa
 from harness.dispatch import (BucleSpec, DispatchSpec, Dispatcher, EventLog,  # noqa: E402
                               Job, Pasada, bucle, cosechar, decidir_tanda,
                               motivo_presupuesto_reloj, peldano_de,
-                              transcripcion_path)
+                              skills_de, transcripcion_path)
 from harness.maintain import (CONFLICTING, MantenJob, Mantener,  # noqa: E402
                               mergeable_de)
 from harness.proposal import (GENERADOR, JUEZ_CLAUDE, JUEZ_QWEN,  # noqa: E402
@@ -717,6 +717,9 @@ def run_main(args, contexts, solo=None):
                                       issue=i.number, attempt=attempt,
                                       kind=peldano["kind"], model=peldano["model"],
                                       extra_args=tuple(peldano["extra_args"]),
+                                      # #42: las skills del ticket salen de
+                                      # su body, no de la corrida.
+                                      skills=skills_de(i.body),
                                       gate_tail=gate_tail, wip=wip,
                                       minutos_acumulado=est.duracion_min))
         # El tamaño de la tanda lo decide el presupuesto (#68): los
@@ -864,6 +867,8 @@ def _una_pasada(args, ctx, log):
                             issue=i.number, attempt=attempt,
                             kind=peldano["kind"], model=peldano["model"],
                             extra_args=tuple(peldano["extra_args"]),
+                            # #42: las skills del ticket salen de su body.
+                            skills=skills_de(i.body),
                             gate_tail=gate_tail, wip=wip,
                             minutos_acumulado=est.duracion_min))
     if not jobs:

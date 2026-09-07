@@ -38,9 +38,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
-from harness.dispatch import (ESCALERA, Dispatcher, nombre_agente,
-                              podar_transcripciones, transcripcion_path,
-                              una_linea)
+from harness.dispatch import (ESCALERA, SKILLS_IMPLEMENTADOR, Dispatcher,
+                              nombre_agente, podar_transcripciones,
+                              transcripcion_path, una_linea)
 
 # Peldaños fijos (#115): el generador va en el barato (peldaño 1) y el juez
 # un peldaño arriba por costo — del pi/Qwen al Claude. Sin cuota para
@@ -328,6 +328,9 @@ class ProponeJob:
     kind: str = ""
     model: str = ""
     extra_args: Tuple[str, ...] = ()
+    # Sesión mínima (#42): proponer no es implementar, pero el default de
+    # la base del implementador es el comportamiento del dispatcher.
+    skills: Tuple[str, ...] = SKILLS_IMPLEMENTADOR
     # Lo que el agente dejó, ya leído en `_done` (mientras el worktree está
     # en pie): generador, `[{"proposal", "ok", "motivo", "duplicado_de"}]`;
     # juez, el texto crudo de `veredictos.json` (el veredicto lo decide

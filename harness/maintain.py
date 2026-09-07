@@ -37,8 +37,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple
 
-from harness.dispatch import (Dispatcher, nombre_agente, podar_transcripciones,
-                              transcripcion_path, una_linea, worktree_path)
+from harness.dispatch import (SKILLS_IMPLEMENTADOR, Dispatcher, nombre_agente,
+                              podar_transcripciones, transcripcion_path,
+                              una_linea, worktree_path)
 from harness.state import clave_mantenimiento
 
 # Los valores de `mergeable` que contesta `gh pr view --json mergeable`.
@@ -187,6 +188,9 @@ class MantenJob:
     kind: str = ""
     model: str = ""
     extra_args: Tuple[str, ...] = ()
+    # Sesión mínima (#42): el mantenedor no declara skills en un ticket;
+    # la base del implementador cubre su trabajo.
+    skills: Tuple[str, ...] = SKILLS_IMPLEMENTADOR
     baseline: Optional[Baseline] = field(default=None)
 
 
