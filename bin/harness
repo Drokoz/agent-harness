@@ -574,7 +574,8 @@ def _imprimir_evento(linea):
             # La anterior era la línea viva: se baja para no pisarla.
             sys.stdout.write("\n")
         sys.stdout.write(txt + "\n")
-        LINEA_VIVA["ancho"] = 0
+        LINEA_VIVA["ancho"] = (len(txt) if linea.get("tipo") == "espera"
+                               else 0)
     LINEA_VIVA["espera"] = (linea.get("tipo") == "espera")
     sys.stdout.flush()
 
