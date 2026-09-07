@@ -418,10 +418,11 @@ class TestRevisionEnResumen(unittest.TestCase):
     def _eventos(self, cuerpo_review, ticket_pr="agent-harness#3",
                  ticket_review="agent-harness#3"):
         return [
-            evento("2026-08-22T03:00:10Z", "pr", "ticket/3",
-                   cuerpo="PR #19 abierto (gate verde)", ticket=ticket_pr),
-            evento("2026-08-22T03:10:00Z", "review", "ticket/3",
-                   cuerpo=cuerpo_review, ticket=ticket_review),
+            json.loads(evento("2026-08-22T03:00:10Z", "pr", "ticket/3",
+                              cuerpo="PR #19 abierto (gate verde)",
+                              ticket=ticket_pr)),
+            json.loads(evento("2026-08-22T03:10:00Z", "review", "ticket/3",
+                              cuerpo=cuerpo_review, ticket=ticket_review)),
         ]
 
     def test_hallazgos_junto_al_pr(self):
@@ -448,9 +449,10 @@ class TestRevisionEnResumen(unittest.TestCase):
         """Un log con la línea `review` pero sin el `pr` del período (filtrado
         por `--since`): sin ticket al que adjuntar, la línea se ignora y no
         rompe nada. El log la conserva como registro."""
-        eventos = [evento("2026-08-22T03:10:00Z", "review", "ticket/3",
-                          cuerpo="revisión PR #19: sin hallazgos",
-                          ticket="agent-harness#3")]
+        eventos = [json.loads(evento("2026-08-22T03:10:00Z", "review",
+                                     "ticket/3",
+                                     cuerpo="revisión PR #19: sin hallazgos",
+                                     ticket="agent-harness#3"))]
         tickets, _, _ = resumir(eventos)
         self.assertEqual(tickets, [])
 

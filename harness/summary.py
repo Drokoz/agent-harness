@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from harness.review import Revision, parsear_revision
+
 # Costo de job: el cuerpo de la línea "costo" es exactamente "$0.0560".
 # El delta de créditos de la corrida ("creditos antes ... / delta $0.2") NO
 # se suma: mide el mismo gasto por otra vía y sumar ambos lo contaría dos veces.
@@ -70,6 +72,11 @@ class Ticket:
     cuota: float = 0.0
     minutos: float = 0.0
     peldanos: List[dict] = field(default_factory=list)
+    # El veredicto del revisor barato sobre el diff del PR (#46):
+    # "ok" (con hallazgos), "sin_hallazgos" (información) o "fallida"
+    # (sin veredicto). None = el PR no pasó por el revisor (logs
+    # anteriores a #46).
+    revision: Optional[Revision] = None
 
 
 @dataclass
@@ -209,7 +216,8 @@ def resumir(eventos):
     """(tickets, trabados, costo) de un período ya filtrado.
 
     `tickets` son los eventos `pr` (job terminado con gate verde y PR abierto),
-    `trabados` los `abandono`, y `costo` la suma de los costos por job.
+    `trabados` los `abandono`, y `costo` la suma de los costos por job. Las
+    líneas `review` (#46) se adjuntan al ticket del PR que revisaron.
     """
     tickets: List[Ticket] = []
     trabados: List[Trabado] = []
@@ -228,7 +236,37 @@ def resumir(eventos):
             m = COSTO_JOB_RE.match(cuerpo.strip())
             if m:
                 costo += float(m.group(1))
+    _adjuntar_revisiones(tickets, eventos)
     return tickets, trabados, costo
+
+
+def _adjuntar_revisiones(tickets, eventos):
+    """La línea `review` de #46 se adjunta al PR que revisó: los hallazgos
+    aparecen en el resumen junto al PR, no en su propia sección.
+
+    Matchea por número de PR y, cuando ambos lo traen, por repo (dos repos
+    pueden compartir número de PR). Una línea cuyo PR no está en el período
+    (o cuyo cuerpo no se reconoce) se ignora: el log la conserva como
+    registro, y ningún cuerpo extraño se convierte en veredicto.
+    """
+    for e in eventos:
+        if e.get("tipo") != "review":
+            continue
+        cuerpo = str(e.get("cuerpo", ""))
+        revision = parsear_revision(cuerpo)
+        if revision is None:
+            continue
+        m = PR_NUM_RE.search(cuerpo)
+        if not m:
+            continue
+        numero = int(m.group(1))
+        repo = _ticket_repo(e)
+        for t in tickets:
+            if t.numero == numero:
+                if repo and t.repo and t.repo != repo:
+                    continue
+                t.revision = revision
+                break
 
 
 def _motivo_guard(cuerpo):
