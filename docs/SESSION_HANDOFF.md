@@ -1,8 +1,44 @@
 # Relevo de sesión — agent-harness
 
-Estado al **2026-08-24, 21:00 (America/Santiago)**. Leer esto primero; `PLAN.md` sigue
+Estado al **2026-09-09, 23:40 (America/Santiago)**. Leer esto primero; `PLAN.md` sigue
 siendo el documento canónico del diseño, y los issues de GitHub son la verdad del trabajo
-pendiente.
+pendiente. Lo de más abajo del 24 de agosto sigue vigente salvo donde esta sección lo
+corrija.
+
+---
+
+## La noche del 9→10 de septiembre
+
+**Lo que se mergeó** (los seis PRs que la noche del 6→7 dejó abiertos, todos con gate
+verde verificado local, no sólo en CI): #131 (#114, espera vacía con backoff y consulta
+barata "¿cambió algo?"), #136 (#42, sesión mínima del implementador), #134 (#46, revisor
+barato del diff), #133 (#130, tracker ilegible ≠ frontera vacía), #135 (#117, `harness
+ideas`), #132 (#126, routing declarado + `harness doctor`).
+
+Tres de ellos conflictuaban entre sí: se rebasaron a mano. Uno tenía un conflicto
+**semántico**, no textual — `IdeaJob` (#117) no tenía el campo `skills` que `_agente`
+empezó a leer con la sesión mínima (#42), y siete tests se caían con `AttributeError`.
+El rebase limpio no alcanza: hay que correr el gate después de rebasar.
+
+**El bug que se comió la noche anterior** (#139, PR #140, mergeado): el presupuesto de
+reloj de #116 comparaba el tope de 180 min contra `de_ticket(...).duracion_min`, que suma
+el historial **completo** del ticket. `agent-harness#45` llegó a 1130 min acumulados y
+quedó excluido para siempre: como era el único ticket libre del repo, el bucle del 6→7
+gastó cinco horas en 60 vueltas con la frontera vacía. Ahora
+`state.minutos_de_ticket(..., desde=)` cuenta una ventana y el CLI le pasa el arranque
+del proceso: "se acabó la noche" significa esta noche.
+
+**Regla nueva, cara de aprender:** un tope que se mide sobre el log entero no es un
+presupuesto, es una condena. Todo acumulador que decida despachar tiene que declarar su
+ventana.
+
+**Corriendo ahora:** `caffeinate -imsu ./bin/harness run --loop --context harness+f7
+--max 2 --freno /tmp/harness-stop`, con salida en
+`~/.local/state/harness/noche-2026-09-09.log` (bufferada: la verdad es el JSONL de
+eventos). Frontera de arranque: 18 tickets libres (agent-harness #45 + 17 de F7League).
+Presupuesto: **US$10.50 de US$40** en OpenRouter (~43 tickets al costo medio).
+Para frenarlo: `touch /tmp/harness-stop` — y **borrarlo después**, que un freno viejo ya
+se comió una noche (#91).
 
 ---
 
