@@ -117,6 +117,37 @@ class EstadoTicket:
     costo: float = 0.0
 
 
+def minutos_de_ticket(eventos, repo, issue, desde=None):
+    """Los minutos de agente de un ticket: la ventana de cada intento
+    (`run_id`), sumadas.
+
+    `desde` (timestamp ISO, o None) acota la cuenta a los eventos de esa
+    fecha en adelante: los minutos de ESTA noche, que es lo que mide el
+    presupuesto de reloj de #116 —"se acabó la noche"—. Sobre el log
+    entero, un ticket que se comió tres noches queda excluido para
+    siempre: fue lo que pasó con agent-harness#45, fuera con 1130 min
+    contra un tope de 180.
+
+    Un `desde` que no se puede parsear no filtra: sin dato no se puede
+    afirmar que un evento quedó afuera, y el default seguro es contarlo
+    todo (lo de antes del filtro), no dejar la noche sin presupuesto.
+
+    Puro."""
+    corte = parse_fecha(str(desde)) if desde else None
+    por_run = {}
+    for e in eventos:
+        if not _es_de(e, repo, issue):
+            continue
+        dt = parse_fecha(str(e.get("timestamp", "")))
+        if dt is None or (corte is not None and dt < corte):
+            continue
+        run = e.get("run_id") or _SIN_RUN
+        a, b = por_run.get(run, (dt, dt))
+        por_run[run] = (min(a, dt), max(b, dt))
+    return sum((fin - ini).total_seconds() / 60.0
+               for ini, fin in por_run.values())
+
+
 def de_ticket(eventos, repo, issue):
     """El estado acumulado de un ticket en el historial: cuántos intentos,
     con qué motivo murió el último, con qué runner, cuánto duró en total y
@@ -124,7 +155,6 @@ def de_ticket(eventos, repo, issue):
     ultimo_motivo = None
     ultimo_runner = None
     costo = 0.0
-    por_run = {}
     for e in eventos:
         if not _es_de(e, repo, issue):
             continue
@@ -139,13 +169,10 @@ def de_ticket(eventos, repo, issue):
             m = COSTO_JOB_RE.match(cuerpo.strip())
             if m:
                 costo += float(m.group(1))
-        dt = parse_fecha(str(e.get("timestamp", "")))
-        if dt is not None:
-            run = e.get("run_id") or _SIN_RUN
-            a, b = por_run.get(run, (dt, dt))
-            por_run[run] = (min(a, dt), max(b, dt))
-    duracion = sum((fin - ini).total_seconds() / 60.0
-                   for ini, fin in por_run.values())
+    # El total del ticket, sin acotar: el resumen de la mañana quiere el
+    # historial entero. El presupuesto de reloj usa `minutos_de_ticket`
+    # con el arranque de la noche.
+    duracion = minutos_de_ticket(eventos, repo, issue)
     return EstadoTicket(intentos=intentos(eventos, repo, issue),
                         ultimo_motivo=ultimo_motivo,
                         ultimo_runner=ultimo_runner,
