@@ -67,6 +67,63 @@ class TestIntentos(unittest.TestCase):
         self.assertEqual(state.intentos([], "koku", 7), 0)
 
 
+class TestMinutosDeTicket(unittest.TestCase):
+    """Los minutos de agente de un ticket, y desde cuándo se cuentan (#116).
+
+    El presupuesto de reloj dice "se acabó la noche": los minutos que mira
+    tienen que ser los de ESTA noche. Contándolos sobre el log entero, un
+    ticket que se comió tres noches queda excluido para siempre — que es lo
+    que pasó con agent-harness#45, fuera con 1130 min sobre un tope de 180.
+    """
+
+    def historial(self):
+        """Dos intentos, en noches distintas: r1 el 22, r2 el 23."""
+        return [
+            ev("worktree", "ticket/7", "/x", "2026-08-22T12:00:00Z",
+               run_id="r1"),
+            ev("costo", "ticket/7", "$0.0500", "2026-08-22T12:11:00Z",
+               run_id="r1"),
+            ev("worktree", "ticket/7", "/x", "2026-08-23T13:00:00Z",
+               run_id="r2"),
+            ev("costo", "ticket/7", "$0.1000", "2026-08-23T13:21:00Z",
+               run_id="r2"),
+        ]
+
+    def test_sin_desde_es_el_historial_entero(self):
+        self.assertEqual(
+            state.minutos_de_ticket(self.historial(), "koku", 7), 32.0)
+
+    def test_desde_deja_afuera_las_noches_viejas(self):
+        """Lo que arregla #45: la noche de hoy no hereda los minutos de las
+        anteriores."""
+        self.assertEqual(
+            state.minutos_de_ticket(self.historial(), "koku", 7,
+                                    desde="2026-08-23T00:00:00Z"), 21.0)
+
+    def test_una_noche_que_todavia_no_empezo_no_tiene_minutos(self):
+        self.assertEqual(
+            state.minutos_de_ticket(self.historial(), "koku", 7,
+                                    desde="2026-09-01T00:00:00Z"), 0.0)
+
+    def test_de_ticket_no_cambia(self):
+        """`de_ticket` sigue contando el historial entero: el resumen de la
+        mañana quiere el total del ticket, no el de una noche."""
+        self.assertEqual(
+            state.de_ticket(self.historial(), "koku", 7).duracion_min, 32.0)
+
+    def test_desde_ilegible_no_filtra(self):
+        """Una fecha que no se puede parsear no puede significar "nada
+        entra": sin dato se cuenta todo, como antes del filtro."""
+        self.assertEqual(
+            state.minutos_de_ticket(self.historial(), "koku", 7,
+                                    desde="ayer por la tarde"), 32.0)
+
+    def test_otro_repo_no_se_mecha(self):
+        otros = [ev("worktree", "ticket/7", "/x", "2026-08-22T12:00:00Z",
+                    run_id="r9", ticket="otro#7")]
+        self.assertEqual(state.minutos_de_ticket(otros, "koku", 7), 0.0)
+
+
 class TestDeTicket(unittest.TestCase):
     def historial(self):
         """Dos intentos: el primero muere con gate rojo (pi), el segundo
