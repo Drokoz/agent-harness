@@ -189,8 +189,9 @@ from harness.quota import (agregar, as_dict as quota_as_dict, cuota_por_ventana,
 from harness.snapshot import as_dict, snapshot  # noqa: E402
 from harness.state import (costo_promedio, de_ticket, intentos, intentos_pr,  # noqa: E402
                            intentos_pr_que_escalan, intentos_que_escalan,
-                           motivos_de_abandono, motivos_de_abandono_pr,
-                           pasos, ultimo_gate_rojo, ultimo_wip)
+                           minutos_de_ticket, motivos_de_abandono,
+                           motivos_de_abandono_pr, pasos, ultimo_gate_rojo,
+                           ultimo_wip)
 from harness.summary import (PrAbierto, Resumen, con_cuota, construir,  # noqa: E402
                              filtrar, guardar_marca, as_dict as resumen_as_dict,
                              leer_eventos, leer_marca, parse_fecha)
@@ -465,6 +466,15 @@ def quota_main(args, contexts):
         log = EventLog(_estado_dir() / "harness" / "events.jsonl", "harness")
         log.write("quota", "quota", resumen_evento(agg))
     return 0
+
+
+# El arranque de ESTE proceso: para el presupuesto de reloj (#116), "la
+# noche" es la corrida que está viva. Un ticket que se comió las tres
+# noches anteriores empieza la de hoy con el presupuesto entero — contarlo
+# sobre el log entero lo dejaba excluido para siempre (agent-harness#45,
+# fuera con 1130 min contra un tope de 180 y una noche gastada en 60
+# vueltas vacías).
+INICIO_NOCHE = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _ahora_str():
@@ -815,10 +825,12 @@ def run_main(args, contexts, solo=None):
                 if wip is not None:
                     wip = (wip[0], wip[1],
                            str(transcripcion_path(r.path, i.number, wip[0])))
-                # Los minutos de agente acumulados (#116) salen del
-                # historial completo: con ellos el presupuesto de reloj
-                # sabe si este ticket ya se comió la noche.
-                est = de_ticket(eventos_previos, r.name, i.number)
+                # Los minutos de agente de ESTA noche (#116): con ellos el
+                # presupuesto de reloj sabe si el ticket ya se la comió. Se
+                # cuentan desde que arrancó el proceso, no sobre el log
+                # entero: si no, un ticket caro nunca vuelve a entrar.
+                minutos = minutos_de_ticket(eventos_previos, r.name, i.number,
+                                            desde=INICIO_NOCHE)
                 candidatos.append(Job(repo=r.name, repo_path=r.path, slug=r.slug,
                                       issue=i.number, attempt=attempt,
                                       kind=peldano["kind"], model=peldano["model"],
@@ -827,7 +839,7 @@ def run_main(args, contexts, solo=None):
                                       # su body, no de la corrida.
                                       skills=skills_de(i.body),
                                       gate_tail=gate_tail, wip=wip,
-                                      minutos_acumulado=est.duracion_min))
+                                      minutos_acumulado=minutos))
         # El tamaño de la tanda lo decide el presupuesto (#68): los
         # créditos que quedan contra el costo medio del historial, más el
         # margen, más los topes manuales. Lo que se queda fuera se anota
@@ -980,10 +992,13 @@ def _una_pasada(args, ctx, log):
                        str(transcripcion_path(r.path, i.number, wip[0])))
             # El presupuesto de reloj (#116): un ticket que ya agotó los
             # minutos de agente de la corrida se queda fuera con su motivo
-            # -- no es un abandono, no gasta peldaño -- y se recalcula en
-            # la próxima corrida, con el presupuesto de esa noche.
-            est = de_ticket(eventos_previos, r.name, i.number)
-            motivo_reloj = motivo_presupuesto_reloj(est.duracion_min,
+            # -- no es un abandono, no gasta peldaño -- y la próxima noche
+            # lo reintenta con el presupuesto entero. Por eso los minutos
+            # se cuentan desde que arrancó el proceso y no sobre el log
+            # entero: contándolo todo, el ticket no volvía nunca.
+            minutos = minutos_de_ticket(eventos_previos, r.name, i.number,
+                                        desde=INICIO_NOCHE)
+            motivo_reloj = motivo_presupuesto_reloj(minutos,
                                                     spec.budget_minutos)
             if motivo_reloj:
                 log.write("fuera", "ticket/{}".format(i.number), motivo_reloj,
@@ -998,7 +1013,7 @@ def _una_pasada(args, ctx, log):
                             # #42: las skills del ticket salen de su body.
                             skills=skills_de(i.body),
                             gate_tail=gate_tail, wip=wip,
-                            minutos_acumulado=est.duracion_min))
+                            minutos_acumulado=minutos))
     if not jobs:
         extra = " ({} parkeado(s))".format(parkeados) if parkeados else ""
         sys.stdout.write('harness: "{}": nada en la frontera{}\n'.format(
