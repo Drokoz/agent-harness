@@ -106,6 +106,16 @@
                                     de 7 días (el ritmo es semanal, no de cada
                                     noche)
     harness ideas --opus          el agente corre en Opus en vez de en Sonnet
+    harness doctor                la salud de la máquina (#126): si el routing
+                                    de OpenRouter que el repo declara está
+                                    puesto en ~/.pi/agent/models.json, y qué
+                                    proveedores de atrás tienen evidencia de
+                                    error en las sesiones. Todo disco local:
+                                    igual offline
+    harness doctor --fix          aplica el routing declarado a models.json
+                                    (en vez de editar el JSON a mano); el resto
+                                    del archivo (apiKey, otros providers) se
+                                    preserva
 
 `harness run --loop` lo llama solo: cuando la frontera queda vacía, en vez de
 sólo esperar, corre una pasada de `proponer` (una vez por bucle; `--sin-proponer`
@@ -156,6 +166,8 @@ from harness.adapters import (adr_files, collect, load_config, openrouter_credit
 from harness.config import ConfigError  # noqa: E402
 from harness import costo  # noqa: E402
 from harness import costo_pi  # noqa: E402
+from harness import doctor as doctor_mod  # noqa: E402
+from harness import routing as routing_mod  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
 from harness.dispatch import (BucleSpec, DispatchSpec, Dispatcher, EventLog,  # noqa: E402
                               Job, Pasada, bucle, cosechar, decidir_tanda,
@@ -209,14 +221,16 @@ def build_parser():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", nargs="?", default="status",
                    choices=["status", "decisions", "run", "maintain", "report",
-                            "quota", "costo", "proponer", "ideas"],
+                            "quota", "costo", "proponer", "ideas",
+                            "doctor"],
                    help="status (la pantalla), decisions (las decisiones), "
                         "run (el dispatcher de la frontera), "
                         "maintain (el mantenedor de conflictos, #56), "
-                        "quota (la cuota de Claude por sesiones locales) o "
-                        "costo (el costo real por peldaño, #96) o "
-                        "proponer (el generador y el juez de trabajo nuevo, "
-                        "#115) o ideas (el agente semanal de ideas, #117)")
+                        "quota (la cuota de Claude por sesiones locales), "
+                        "costo (el costo real por peldaño, #96), "
+                        "proponer (el generador y el juez de trabajo nuevo, #115), "
+                        "ideas (el agente semanal de ideas, #117) "
+                        "o doctor (la salud de la máquina: routing de OpenRouter, #126)")
     p.add_argument("--context", metavar="NOMBRE",
                    help="un contexto en vez del de por defecto")
     p.add_argument("--all", action="store_true", dest="todos",
@@ -298,6 +312,9 @@ def build_parser():
     p.add_argument("--forzar", action="store_true",
                    help="ideas: correr aunque la última haya sido hace menos "
                         "de 7 días (el ritmo es semanal)")
+    p.add_argument("--fix", action="store_true",
+                   help="doctor: aplica el routing declarado a "
+                        "~/.pi/agent/models.json (#126)")
     return p
 
 
@@ -344,6 +361,8 @@ def main(argv=None):
         return maintain_main(args, contexts)
     if args.command == "costo":
         return costo_main(args)
+    if args.command == "doctor":
+        return doctor_main(args)
     if args.command == "proponer":
         if args.max_propuestas < 1:
             sys.stderr.write("harness: --max-propuestas tiene que ser >= 1\n")
@@ -1124,6 +1143,31 @@ def costo_main(args):
         sys.stdout.write("\n")
     else:
         sys.stdout.write(costo.render(v))
+def doctor_main(args):
+    """`harness doctor` (#126): el routing de OpenRouter, con evidencia.
+
+    Todo disco local (declaración del repo + `~/.pi/agent/models.json` +
+    sesiones de pi): corre igual offline. Sale 0 con el routing en orden,
+    1 cuando no (ausente, distinto, sin-config) y 2 con la declaración
+    faltante o un `--fix` que no pudo aplicar."""
+    decl = routing_mod.cargar_declaracion()
+    if not decl:
+        sys.stderr.write("harness: sin routing declarado en el repo "
+                         "(harness/routing.json)\n")
+        return 2
+    if args.fix:
+        ok, msg = routing_mod.aplicar(decl)
+        sys.stdout.write(("harness: routing " + msg + "\n" if ok
+                          else "harness: " + msg + "\n"))
+        if not ok:
+            return 2
+    modelos = routing_mod.leer_models()
+    sesiones = costo_pi.leer_sesiones()
+    diag = doctor_mod.diagnostico(decl, modelos, sesiones)
+    sys.stdout.write(doctor_mod.render(diag, color=sys.stdout.isatty()))
+    return 0 if diag["estado"] == "ok" else 1
+
+
 def _peldano_juez_para(args, ctx, log, repo):
     """El peldaño del juez (#115) con su decisión anotada en el log: por
     defecto Claude —el primer consumidor rutinario de Claude dentro del

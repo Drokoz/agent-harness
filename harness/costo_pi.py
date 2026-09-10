@@ -63,6 +63,12 @@ HUMANO = ("402", "out of credits", "insufficient credit", "insufficient_quota",
 # más barato por US$2,58 sin escalar nunca.
 MATADO = ("terminated", "killed", "sigterm", "sigkill", "aborted")
 
+# El proveedor de atrás que falló, según OpenRouter (#126): la noche del
+# 2026-09-01 los seis abandonos salieron "Upstream error from Reka: Too many
+# requests". De ese texto —no de una corazonada— sale la lista de proveedores
+# a evitar: `costo_pi` ya guarda el `errorMessage` de cada sesión.
+UPSTREAM_RE = re.compile(r"upstream error from ([A-Za-z0-9][A-Za-z0-9_-]*)", re.I)
+
 
 def ticket_de_cwd(cwd) -> Optional[Tuple[str, int]]:
     """`(repo, issue)` si esa ruta es el worktree de un ticket; si no, None."""
@@ -225,6 +231,21 @@ def clasificar_salida(salida) -> Tuple[Optional[str], str]:
     if stop == "length":
         return ("modelo", "se quedó sin contexto (stopReason: length)")
     return (None, "")
+
+
+def proveedores_con_error(sesiones) -> Dict[str, int]:
+    """`{proveedor: n}`: qué proveedores de atrás aparecen en el errorMessage
+    de las sesiones, y cuántas veces (#126). Es la evidencia para la lista de
+    `openRouterRouting.ignore`: qué conviene evitar sin que nadie lo mire a
+    mano. Sin proveedores reconocibles, `{}`.
+    """
+    out: Dict[str, int] = {}
+    for s in sesiones:
+        error = str(((s or {}).get("salida") or {}).get("error") or "")
+        for m in UPSTREAM_RE.finditer(error):
+            prov = m.group(1).lower()
+            out[prov] = out.get(prov, 0) + 1
+    return out
 
 
 def por_ticket(sesiones) -> Dict[str, dict]:

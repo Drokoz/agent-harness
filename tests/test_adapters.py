@@ -419,7 +419,7 @@ class TestCollect(unittest.TestCase):
             crudo = adapters.collect(default_config().contexts, offline=True)
         self.assertTrue(crudo["offline"])
         self.assertIsNone(crudo["agents"])
-        self.assertEqual(sorted(crudo), ["agents", "contexts", "offline"])
+        self.assertEqual(sorted(crudo), ["agents", "contexts", "offline", "routing"])
         self.assertEqual([c["name"] for c in crudo["contexts"]], ["personal"])
         self.assertIsNone(crudo["contexts"][0]["budget"]["credits"])
 

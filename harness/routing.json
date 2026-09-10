@@ -1,0 +1,10 @@
+{
+  "provider": "openrouter",
+  "compat": {
+    "openRouterRouting": {
+      "allow_fallbacks": true,
+      "ignore": ["reka"]
+    }
+  },
+  "evidencia": "sesiones 2026-09-01: 'Upstream error from Reka: Too many requests' en 6 de 7 abandonos de la noche (#126); ver `harness doctor`"
+}

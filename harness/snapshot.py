@@ -17,6 +17,10 @@ La forma de `raw` (ver `harness.adapters.collect`):
     {
       "offline": bool,
       "agents": [ {...} ] | None,          # None = no hay sesión de herdr
+      "routing": {                          # #126: disco local, siempre presente
+        "declaracion": {"provider": str, "compat": {...}} | None,
+        "models": {...} | None,             # ~/.pi/agent/models.json crudo
+      },
       "eventos": [ {...} ] | None,          # log de eventos del dispatcher
                                                # (harness.summary.leer_eventos);
                                                # da el estado `despachado`
@@ -68,6 +72,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import PurePosixPath
 from typing import Dict, List, Optional
 
+from harness import routing as routing_mod
 from harness.state import agente_vivo, despachado, estado_frontier, rama_de
 
 SCHEMA_VERSION = 3
@@ -118,6 +123,21 @@ class Agents:
 
     state: str
     items: List[Agent] = field(default_factory=list)
+
+
+@dataclass
+class Routing:
+    """El routing de OpenRouter de la máquina (#126).
+
+    `state`: ok | ausente | distinto | sin-config | sin-declarar. De la
+    máquina, no del repo: `~/.pi/agent/models.json` es una sola para todos
+    los contextos, así que se dibuja una sola vez, como `Agents`.
+    """
+
+    state: str
+    provider: str = ""
+    detalle: str = ""
+    ignore: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -191,6 +211,7 @@ class Context:
 class Snapshot:
     offline: bool
     agents: Agents
+    routing: Routing = field(default_factory=lambda: Routing(state="sin-declarar"))
     contexts: List[Context] = field(default_factory=list)
 
 
@@ -260,6 +281,25 @@ def _agents(raw, offline):
         for a in ordenados
     ]
     return Agents(state="ok", items=items)
+
+
+def _routing(raw):
+    """El routing esperado del repo contra `~/.pi/agent/models.json` (#126).
+
+    El veredicto lo da `routing.estado` (puro); aquí sólo se traduce: sin
+    declaración en el repo no hay nada esperado que mirar.
+    """
+    raw = raw or {}
+    decl = raw.get("declaracion")
+    if not decl:
+        return Routing(state="sin-declarar",
+                       detalle="sin routing declarado en el repo (harness/routing.json)")
+    provider = decl.get("provider") or "openrouter"
+    ignore = list(((decl.get("compat") or {}).get("openRouterRouting") or {})
+                  .get("ignore") or [])
+    estado, detalle = routing_mod.estado(decl, raw.get("models"))
+    return Routing(state=estado, provider=provider, detalle=detalle,
+                   ignore=ignore)
 
 
 def _issues(raw, prs, prs_merged, eventos, agentes, repo):
@@ -375,6 +415,7 @@ def snapshot(raw):
     return Snapshot(
         offline=offline,
         agents=_agents(agentes, offline),
+        routing=_routing(raw.get("routing")),
         contexts=[_context(c, offline, eventos, agentes)
                   for c in raw.get("contexts", [])],
     )

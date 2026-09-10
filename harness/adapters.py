@@ -22,6 +22,7 @@ from pathlib import Path
 
 from harness.config import (CONFIG_ENV, CONFIG_NAME, ConfigError, default_config,
                             parse_config)
+from harness import routing as routing_mod
 from harness.snapshot import READINESS
 
 PI_MODELS = Path.home() / ".pi" / "agent" / "models.json"
@@ -103,6 +104,19 @@ def load_config(path=None):
     except ValueError as e:
         raise ConfigError("{}: JSON inválido ({})".format(path, e))
     return parse_config(data, donde=str(path))
+
+
+def pi_routing():
+    """Lo crudo del routing de OpenRouter (#126): qué declara el repo y qué
+    hay en `~/.pi/agent/models.json`.
+
+    Disco local puro: corre igual en modo sin adaptadores, y `status` lo
+    quiere siempre — una noche con el routing ausente se paga en US$4.
+    """
+    return {
+        "declaracion": routing_mod.cargar_declaracion(),
+        "models": routing_mod.leer_models(),
+    }
 
 
 # --------------------------------------------------------------------------- repos
@@ -405,4 +419,5 @@ def collect(contexts, offline=False, workers=8):
             for c, futs in pendientes
         ]
         agents = fut_agents.result()
-    return {"offline": offline, "agents": agents, "contexts": crudos}
+    return {"offline": offline, "agents": agents,
+            "routing": pi_routing(), "contexts": crudos}
