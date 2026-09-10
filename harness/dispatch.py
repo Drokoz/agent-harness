@@ -279,6 +279,79 @@ def prompt_de(issue, gate_tail=None, wip=None):
     return una_linea(texto)
 
 
+# --------------------------------------------------------------------- skills
+# #42: la sesión del implementador es mínima. Un ticket no necesita las
+# catorce skills del repo ni las globales de la máquina: necesita las dos
+# con que se implementa (implement, tdd) y las que el ticket declara.
+SKILLS_IMPLEMENTADOR = ("implement", "tdd")
+
+# Cómo declara un ticket sus skills: la primera línea `Skills: a, b` del
+# cuerpo, mayúsculas a voluntad, separadas por coma. Es una convención del
+# ticket, no del harness: un ticket sin la línea usa la base y nada más.
+_SKILLS_RE = re.compile(r"(?im)^\s*skills\s*:\s*(.+)$")
+_SKILL_NOMBRE_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def skills_de(cuerpo):
+    """Las skills de un ticket: la base del implementador (implement, tdd)
+    más las que el ticket declara en el cuerpo (`Skills: research`, #42).
+
+    Puro. Nombres inválidos se ignoran (una errata en el ticket no rompe
+    el arranque), los repetidos se dedupan y el orden de la declaración se
+    respeta detrás de la base."""
+    skills = list(SKILLS_IMPLEMENTADOR)
+    m = _SKILLS_RE.search(cuerpo or "")
+    if m:
+        for parte in m.group(1).split(","):
+            nombre = parte.strip().lower()
+            if _SKILL_NOMBRE_RE.match(nombre) and nombre not in skills:
+                skills.append(nombre)
+    return tuple(skills)
+
+
+def args_sesion_minima(kind, skills, modelo="", extra_args=()):
+    """Los args del agente (después del `--` de `herdr agent start`) para
+    una sesión mínima (#42): sin servidores MCP, sin plugins, con las
+    únicas skills que el ticket necesita, y siempre una sesión fresca —
+    un ticket es una sesión nueva, nunca `--resume` ni `--continue`.
+
+    `pi`: `--no-skills` apaga la discovery (skills del repo y globales) y
+    `--skill` carga las declaradas, relativas al cwd del agente (el
+    worktree): `.pi/skills/<nombre>`. Pi no tiene servidores MCP ni
+    plugins: su equivalente mínimo queda documentado en
+    docs/harness/sesion-minima.md.
+
+    `claude`: `--strict-mcp-config` sin `--mcp-config` = cero servidores
+    MCP; `--setting-sources project` = sin los settings de usuario
+    (plugins, hooks, contexto de autoMode); `--permission-mode auto` más
+    el opt-in de auto que los settings de usuario traían, para que la
+    sesión no quede tapada en un diálogo. Claude no tiene flag por skill:
+    las skills del proyecto (`.claude/skills`) se cargan igual, y se
+    documenta.
+
+    Kinds sin sesión mínima definida (codex, gemini, ...): modelo y
+    extra_args, como antes de #42.
+    """
+    extra = list(extra_args or ())
+    if kind == "pi":
+        args = ["--no-skills"]
+        for nombre in skills or ():
+            args += ["--skill", ".pi/skills/{}".format(nombre)]
+        if modelo:
+            args += ["--model", modelo]
+        return args + extra
+    if kind == "claude":
+        args = ["--strict-mcp-config",
+                "--setting-sources", "project",
+                "--permission-mode", "auto",
+                "--settings",
+                '{"autoMode":{"skipAutoPermissionPrompt":true}}']
+        if modelo:
+            args += ["--model", modelo]
+        return args + extra
+    return (["--model", modelo] if modelo else []) + extra
+
+
 # ----------------------------------------------------------------- escalera
 # La escalera de reintentos (#38, PLAN.md §"Barato primero, escalada
 # asimétrica"): dos peldaños baratos de pi/Qwen -- el segundo con más
@@ -751,6 +824,9 @@ class Job:
     kind: str = ""
     model: str = ""
     extra_args: Tuple[str, ...] = ()          # --thinking/--effort del peldaño
+    # Las skills de la sesión mínima (#42): la base del implementador más
+    # las que el ticket declara (`skills_de` sobre el body del issue).
+    skills: Tuple[str, ...] = SKILLS_IMPLEMENTADOR
     gate_tail: Optional[str] = None           # cola del gate rojo del intento anterior
     # El primer prompt no llego (#113): no es un veredicto todavía, lo
     # decide `dispatch` al ver si quedan vueltas para recolocarlo.
@@ -1213,11 +1289,24 @@ class Dispatcher:
         modelo = job.model or self.spec.model
         args = ["herdr", "agent", "start", job.agent, "--kind", kind,
                 "--pane", job.pane, "--timeout", "120000"]
-        # El modelo va primero y el resto del peldaño (--thinking/--effort)
-        # después: son del mismo peldaño, van juntos.
-        extra = (["--model", modelo] if modelo else []) + list(job.extra_args)
-        if extra:
-            args += ["--"] + extra
+        # Sesión mínima (#42): sin servidores MCP, sin plugins, una sesión
+        # fresca por ticket y, para pi, las únicas skills que el ticket
+        # necesita. Para pi se filtran por las que existen en el worktree:
+        # un `--skill` que no está tumbaría el arranque del agente, así
+        # que se anota y se deja afuera en vez de arrancar roto.
+        skills = job.skills
+        if kind == "pi":
+            presentes = [s for s in job.skills
+                         if self._skill_en_worktree(job, s)]
+            faltantes = [s for s in job.skills if s not in presentes]
+            if faltantes:
+                self._log(job, "skills", ref,
+                          "declaradas en el ticket pero no hay en {}: {}"
+                          .format(job.worktree, ", ".join(faltantes)))
+            skills = tuple(presentes)
+        args_min = args_sesion_minima(kind, skills, modelo, job.extra_args)
+        if args_min:
+            args += ["--"] + args_min
         # El diálogo de confianza de Claude tapia el arranque en cada worktree.
         if kind == "claude":
             confiar_en(job.worktree)
@@ -1238,6 +1327,14 @@ class Dispatcher:
             self.dormir(self.spec.start_wait_s)
         self._log(job, "agente", ref, "fallo: " + out.strip()[:200])
         return False
+
+    def _skill_en_worktree(self, job, nombre):
+        """¿La skill está en el worktree? El layout de las skills del
+        harness es `.pi/skills/<nombre>/SKILL.md` (el que trae
+        /setup-matt-pocock-skills, y el que versiona este repo)."""
+        ok, _ = self.run_cmd(["test", "-f", str(Path(job.worktree) / ".pi" /
+                                                 "skills" / nombre / "SKILL.md")])
+        return ok
 
     def _prompt_verificado(self, job, ref):
         """Manda el prompt y verifica de verdad que llego: el primero después

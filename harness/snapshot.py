@@ -124,6 +124,9 @@ class Agents:
 class Issue:
     number: int
     title: str
+    # El cuerpo del issue (#42): el dispatcher lee de acá las skills que
+    # declara el ticket (`Skills: ...`) para armar la sesión mínima.
+    body: str = ""
     # Estado de la frontera (ticket #43): libre | despachado | pr-abierto |
     # mergeado | parkeado. Sólo lo llevan los de la frontera; bloqueados y
     # triage lo dejan en None.
@@ -268,7 +271,8 @@ def _issues(raw, prs, prs_merged, eventos, agentes, repo):
     frontier, blocked, triage = [], [], []
     for i in raw:
         labels = {l["name"] for l in i.get("labels", [])}
-        issue = Issue(number=i["number"], title=i.get("title", ""))
+        issue = Issue(number=i["number"], title=i.get("title", ""),
+                      body=i.get("body") or "")
         if TRIAGE_LABEL in labels:
             triage.append(issue)
         if AGENT_LABEL not in labels:

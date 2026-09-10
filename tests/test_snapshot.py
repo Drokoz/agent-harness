@@ -138,6 +138,19 @@ class TestFrontera(unittest.TestCase):
         self.assertEqual(blockers_of("Blocked by none (can start)"), set())
         self.assertEqual(blockers_of(None), set())
 
+    def test_la_frontera_lleva_el_body_del_issue(self):
+        """#42: el dispatcher decide las skills del agente leyendo el body
+        del ticket (`Skills: ...`), así que la frontera tiene que
+        conservarlo, no sólo el número y el título."""
+        issues = [issue(1, body="## Archivos probables\nSkills: research")]
+        r = snapshot(raw(repos=[repo_raw(issues=issues)])).contexts[0].repos[0]
+        self.assertEqual([i.number for i in r.frontier], [1])
+        self.assertEqual(
+            r.frontier[0].body, "## Archivos probables\nSkills: research")
+        # Sin body, vacío: no None.
+        r = snapshot(raw(repos=[repo_raw(issues=[issue(2)])])).contexts[0].repos[0]
+        self.assertEqual(r.frontier[0].body, "")
+
 
 class TestFronteraNativa(unittest.TestCase):
     """La frontera sale de issueDependenciesSummary.blockedBy (bloqueantes
