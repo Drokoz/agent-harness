@@ -37,9 +37,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
-from harness.dispatch import (ESCALERA, Dispatcher, nombre_agente,
-                              podar_transcripciones, transcripcion_path,
-                              una_linea)
+from harness.dispatch import (ESCALERA, SKILLS_IMPLEMENTADOR, Dispatcher,
+                              nombre_agente, podar_transcripciones,
+                              transcripcion_path, una_linea)
 from harness.proposal import aplicar_tope, normalizar_titulo
 
 # El modelo bueno (#117): esto es criterio, no código, y un modelo barato
@@ -345,6 +345,9 @@ class IdeaJob:
     kind: str = ""
     model: str = ""
     extra_args: Tuple[str, ...] = ()
+    # Sesión mínima (#42): la corrida de ideas no sale de un ticket que
+    # declare skills; la base del implementador cubre su trabajo.
+    skills: Tuple[str, ...] = SKILLS_IMPLEMENTADOR
     # Lo que el agente dejó, ya validado en `_done`:
     # `[{"idea", "ok", "motivo", "duplicada_de"}]`.
     datos: object = None
