@@ -409,6 +409,81 @@ class TestConCuota(unittest.TestCase):
         self.assertEqual(out.tickets[0].costo, 0.0)
 
 
+class TestRevisionEnResumen(unittest.TestCase):
+    """La línea `review` de #46 se adjunta al PR que revisó: los
+    hallazgos aparecen en el resumen junto al PR, no en su propia sección.
+    Los tres estados: hallazgos, "sin hallazgos" (también es información)
+    y fallida (nunca bloquea, nunca finge un veredicto)."""
+
+    def _eventos(self, cuerpo_review, ticket_pr="agent-harness#3",
+                 ticket_review="agent-harness#3"):
+        return [
+            json.loads(evento("2026-08-22T03:00:10Z", "pr", "ticket/3",
+                              cuerpo="PR #19 abierto (gate verde)",
+                              ticket=ticket_pr)),
+            json.loads(evento("2026-08-22T03:10:00Z", "review", "ticket/3",
+                              cuerpo=cuerpo_review, ticket=ticket_review)),
+        ]
+
+    def test_hallazgos_junto_al_pr(self):
+        from harness.review import Hallazgo, Revision, cuerpo_revision
+        rev = Revision("ok", hallazgos=[Hallazgo("alta", "a.py", "bug")])
+        tickets, _, _ = resumir(self._eventos(cuerpo_revision(19, rev)))
+        self.assertEqual(len(tickets), 1)
+        self.assertEqual(tickets[0].revision.estado, "ok")
+        self.assertEqual(tickets[0].revision.hallazgos[0].linea,
+                         "[alta] a.py: bug")
+
+    def test_sin_hallazgos_es_veredicto(self):
+        tickets, _, _ = resumir(self._eventos("revisión PR #19: sin hallazgos"))
+        self.assertEqual(tickets[0].revision.estado, "sin_hallazgos")
+        self.assertEqual(tickets[0].revision.hallazgos, [])
+
+    def test_fallida_con_su_motivo(self):
+        tickets, _, _ = resumir(
+            self._eventos("revisión PR #19: fallida — el revisor no respondio"))
+        self.assertEqual(tickets[0].revision.estado, "fallida")
+        self.assertEqual(tickets[0].revision.motivo, "el revisor no respondio")
+
+    def test_review_de_pr_fuera_del_periodo_no_rompe(self):
+        """Un log con la línea `review` pero sin el `pr` del período (filtrado
+        por `--since`): sin ticket al que adjuntar, la línea se ignora y no
+        rompe nada. El log la conserva como registro."""
+        eventos = [json.loads(evento("2026-08-22T03:10:00Z", "review",
+                                     "ticket/3",
+                                     cuerpo="revisión PR #19: sin hallazgos",
+                                     ticket="agent-harness#3"))]
+        tickets, _, _ = resumir(eventos)
+        self.assertEqual(tickets, [])
+
+    def test_cuerpo_desconocido_no_es_veredicto(self):
+        """Una línea `review` que no se entiende no convierte un PR revisado
+        en fallido (o en limpio) por error de redacción: no se adjunta nada."""
+        tickets, _, _ = resumir(
+            self._eventos("revisión PR #19: algo que no se entiende"))
+        self.assertIsNone(tickets[0].revision)
+
+    def test_mismo_numero_otro_repo_no_matchea(self):
+        """Dos repos pueden compartir número de PR: sin el cruce de repo,
+        una review de koku se adjuntaría al PR de agent-harness."""
+        eventos = self._eventos("revisión PR #19: sin hallazgos",
+                                ticket_pr="agent-harness#3",
+                                ticket_review="koku#3")
+        tickets, _, _ = resumir(eventos)
+        self.assertIsNone(tickets[0].revision)
+
+    def test_el_json_trae_la_revision(self):
+        from harness.review import Hallazgo, Revision, cuerpo_revision
+        from harness.summary import as_dict
+        rev = Revision("ok", hallazgos=[Hallazgo("media", "b.py", "nit")])
+        r = construir(self._eventos(cuerpo_revision(19, rev)), [])
+        d = as_dict(r)
+        self.assertEqual(d["tickets"][0]["revision"]["estado"], "ok")
+        self.assertEqual(d["tickets"][0]["revision"]["hallazgos"],
+                         [{"gravedad": "media", "archivo": "b.py",
+                           "detalle": "nit"}])
+
+
 class TestMarca(unittest.TestCase):
     def test_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:

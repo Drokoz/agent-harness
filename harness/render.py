@@ -108,6 +108,26 @@ def _resumen(r, c, out):
         out(f"   costo del período: ${r.costo:.2f}")
 
 
+def _revision(t, c, out):
+    """El veredicto del revisor barato junto a su PR (#46): la línea que le
+    dice a la persona qué mirar primero. Tres estados: hallazgos (uno por
+    línea, la más grave primero — ya vienen ordenados por el revisor),
+    "sin hallazgos" (también es información: un PR sin hallazgos se marca
+    como tal) y fallida (sin veredicto, con su motivo)."""
+    r = t.revision
+    if r is None:
+        return
+    if r.estado == "fallida":
+        out(f"       {c.dim}revisión fallida: {r.motivo}{c.off}")
+        return
+    if not r.hallazgos:
+        out(f"       {c.dim}revisión: sin hallazgos{c.off}")
+        return
+    for h in r.hallazgos:
+        color = {"alta": c.red, "media": c.yel}.get(h.gravedad, c.dim)
+        out(f"       {color}{h.linea}{c.off}")
+
+
 def _gasto_ticket(t, c):
     """Lo que un ticket costó en las monedas que midemos (#47, #116):
     minutos de agente (la que de verdad limita una noche), dólares de
@@ -185,6 +205,7 @@ def _tickets(tickets, c, out):
         for t in del_estado:
             marca = "" if t.en_vivo else f" {c.dim}(según el log, sin confirmar){c.off}"
             out(f"     · {t.contexto} {t.ref}: {_detalle_ticket(t)}{marca}{_gasto_ticket(t, c)}")
+            _revision(t, c, out)
             _peldanos(t, c, out)
 
 

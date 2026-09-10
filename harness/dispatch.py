@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from harness.costo_pi import clasificar_salida
+from harness.review import Revisor, Revision, cuerpo_revision
 
 ORIGEN = "harness"
 
@@ -854,6 +855,10 @@ class DispatchSpec:
     budget_minutos: float = 180.0
     gate_timeout: int = 1800      # segundos para gate.sh dentro del worktree
     install_timeout: int = 900    # segundos para instalar dependencias
+    # El reloj del revisor de #46: segundos a esperar el veredicto sobre el
+    # diff del PR. La review nunca bloquea el job (el PR aparece en el
+    # resumen igual), pero sí gasta minutos de la corrida, así que tiene tope.
+    review_timeout: int = 600
     start_retries: int = 4        # reintentos de agent start (pane sin shell)
     start_wait_s: float = 2.0     # espera entre reintentos de arranque
     # La carrera del primer prompt (#113), medida en el log de la noche del
@@ -895,7 +900,7 @@ class Dispatcher:
     _tipo_corrida = "corrida"
 
     def __init__(self, spec, log, run_cmd, credits=None, dormir=None,
-                 costo_real=None, salida_real=None):
+                 costo_real=None, salida_real=None, revisor=None):
         self.spec = spec
         self.log = log
         self.run_cmd = run_cmd                 # (args, cwd=None, timeout=30) -> (ok, out)
@@ -906,6 +911,11 @@ class Dispatcher:
         # (repo, issue, desde) -> {"stop","error"} | None: cómo cortó pi
         # (#98). Sin inyectar, la clasificación es la del dispatcher sola.
         self.salida_real = salida_real
+        # El revisor de #46: un objeto con `revisar_pr(slug, num) -> Revision`
+        # (los tests inyectan un falso). Sin inyectar, se arma el real con el
+        # `run_cmd` de la corrida y el runner barato por default.
+        self._revisor_inyectado = revisor
+        self._revisor_cache = None
         # Desde cuándo mirar sesiones: lo fija `dispatch` al arrancar la
         # corrida, para no leer los intentos de anoche.
         self._desde = None
@@ -1682,6 +1692,33 @@ class Dispatcher:
             return
         job.estado = "hecho"
         self._log(job, "pr", ref, "PR #{} abierto (gate verde)".format(num))
+        self._revisar(job, ref, num)
+
+    def _revisor(self):
+        """El revisor de #46: el inyectado, o el real, armado una sola vez
+        con el `run_cmd` de la corrida (runner barato por default)."""
+        if self._revisor_cache is None:
+            self._revisor_cache = (self._revisor_inyectado or
+                                   Revisor(self.run_cmd,
+                                           timeout=self.spec.review_timeout))
+        return self._revisor_cache
+
+    def _revisar(self, job, ref, num):
+        """El revisor barato sobre el diff del PR (#46): gate verde y PR
+        abierto, un agente read-only mira el diff y devuelve como mucho 10
+        hallazgos, ordenados por gravedad. La línea `review` es la que el
+        resumen de la mañana adjunta al PR.
+
+        Nunca bloquea: `revisar_pr` no levanta por fallos del mundo (los
+        clasifica `fallida`) y hasta un error inesperado —un bug del
+        revisor— no tumba un job que ya terminó bien: la review queda
+        `fallida` y el PR igual aparece en el resumen."""
+        try:
+            revision = self._revisor().revisar_pr(job.slug, num)
+        except Exception as e:
+            revision = Revision("fallida",
+                                motivo="error del revisor: {}".format(e))
+        self._log(job, "review", ref, cuerpo_revision(num, revision))
 
     def _pr_mide_el_head(self, job, ref, num):
         """El gate midió el HEAD de la rama. Si el PR apunta a otro commit,

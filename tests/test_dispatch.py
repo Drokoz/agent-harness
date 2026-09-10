@@ -354,12 +354,13 @@ class TestTandaPorPresupuestoDeReloj(unittest.TestCase):
         self.assertEqual(peldano_de(1)["kind"], ESCALERA[1]["kind"])
 
 
-def despachar(mundo, jobs, costo_real=None, salida_real=None, **kw):
+def despachar(mundo, jobs, costo_real=None, salida_real=None, revisor=None,
+              **kw):
     with tempfile.TemporaryDirectory() as tmp:
         log = log_en(tmp)
         d = Dispatcher(spec(**kw), log, mundo.cmd, credits=mundo.credits,
                        dormir=mundo.dormir, costo_real=costo_real,
-                       salida_real=salida_real)
+                       salida_real=salida_real, revisor=revisor)
         res = d.dispatch(jobs)
         lineas = [json.loads(l) for l in log.path.read_text().splitlines()]
     return res, lineas
@@ -774,6 +775,88 @@ class TestCicloDeVida(unittest.TestCase):
                          "después de -b va el nombre de la rama, no el path")
         self.assertTrue(args[i + 2].endswith("ticket-7"),
                         "el path del worktree va al final")
+
+
+# El diff de un PR para el revisor (#46): `gh pr diff` contra el mundo fake.
+DIFF_FAKE = "--- a/harness/x.py\n+++ b/harness/x.py\n@@ -1 +1 @@\n-a\n+b\n"
+
+
+class TestRevisorEnElDispatcher(unittest.TestCase):
+    """El revisor de #46 en el dispatcher: cada PR con gate verde pasa por
+    un agente read-only sobre el diff, y su veredicto queda en el log como
+    línea `review`. El revisor nunca bloquea: su fallo (o hasta un bug de
+    suyo) no impide que el ticket quede "hecho"."""
+
+    class FalsoRevisor:
+        def __init__(self, revision):
+            self.revision = revision
+            self.vistos = []
+
+        def revisar_pr(self, slug, num):
+            self.vistos.append((slug, num))
+            return self.revision
+
+    def test_pr_con_gate_verde_pasa_por_el_revisor(self):
+        from harness.review import Hallazgo, Revision, cuerpo_revision
+        rev = Revision("ok", hallazgos=[Hallazgo("alta", "a.py", "bug")])
+        revisor = self.FalsoRevisor(rev)
+        res, lineas = despachar(Mundo(), [job()], revisor=revisor)
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        self.assertEqual(revisor.vistos, [("Drokoz/koku", 31)])
+        reviews = [l for l in lineas if l["tipo"] == "review"]
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0]["cuerpo"], cuerpo_revision(31, rev))
+        self.assertEqual(reviews[0]["ticket"], "koku#7")
+        self.assertEqual(reviews[0]["ref"], "ticket/7")
+
+    def test_revisor_fallido_no_bloquea(self):
+        from harness.review import Revision
+        revisor = self.FalsoRevisor(Revision("fallida", motivo="timeout"))
+        res, lineas = despachar(Mundo(), [job()], revisor=revisor)
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        cuerpos = [l["cuerpo"] for l in lineas if l["tipo"] == "review"]
+        self.assertEqual(len(cuerpos), 1)
+        self.assertIn("fallida", cuerpos[0])
+
+    def test_revisor_que_excepciona_no_bloquea(self):
+        class Rompe:
+            def revisar_pr(self, slug, num):
+                raise RuntimeError("bug del revisor")
+        res, lineas = despachar(Mundo(), [job()], revisor=Rompe())
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        cuerpos = [l["cuerpo"] for l in lineas if l["tipo"] == "review"]
+        self.assertEqual(len(cuerpos), 1)
+        self.assertIn("fallida", cuerpos[0])
+        self.assertIn("bug del revisor", cuerpos[0])
+
+    def test_sin_pr_no_hay_revision(self):
+        """El revisor corre sobre el PR con gate verde; sin PR no hay diff
+        que revisar y no se gasta la llamada."""
+        from harness.review import Revision
+        revisor = self.FalsoRevisor(Revision("sin_hallazgos"))
+        res, lineas = despachar(Mundo(prs=[{"number": 31,
+                                            "headRefName": "otra-rama"}]),
+                                [job()], revisor=revisor)
+        self.assertEqual(res[0].estado, "abandonado")
+        self.assertEqual(revisor.vistos, [])
+        self.assertNotIn("review", [l["tipo"] for l in lineas])
+
+    def test_revisor_real_corre_con_el_runner_barato(self):
+        """Sin revisor inyectado corre el real, con el runner barato por
+        default: pi con solo tools de lectura (la promesa va en la CLI, no
+        solo en el prompt) y el modelo barato. `[]` es "sin hallazgos"."""
+        m = Mundo().responder(lambda a: a[0] == "gh" and "diff" in a,
+                              (True, DIFF_FAKE))
+        m.responder(lambda a: a[0] == "pi", (True, "[]"))
+        res, lineas = despachar(m, [job()])
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        pi = [c for c in m.llamadas if c[0][0] == "pi"]
+        self.assertEqual(len(pi), 1)
+        args = pi[0][0]
+        self.assertEqual(args[args.index("--tools") + 1], "read,grep,find,ls")
+        self.assertIn("qwen/qwen3.8-27b", args)
+        cuerpos = [l["cuerpo"] for l in lineas if l["tipo"] == "review"]
+        self.assertEqual(cuerpos, ["revisión PR #31: sin hallazgos"])
 
 
 class TestPromptPerdido(unittest.TestCase):
