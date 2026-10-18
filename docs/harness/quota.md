@@ -155,6 +155,8 @@ thinking va dentro del output y no suma dos veces).
     harness quota --json           el agregado (crudo + ponderado)
     harness quota --projects RUTAS otra(s) carpeta(s) de sesiones, separadas
                                    por coma (tests, otro usuario de la máquina)
+    harness quota --remotas SSH     fuente(s) remota(s) por SSH (user@host),
+                                   separadas por coma (el 9-5, #144)
 
 Qué dice la tabla:
 
@@ -226,6 +228,49 @@ Contrato para consumidores: un total con `completa: false` es un piso, y no se
 usa para autorizar gasto (p.ej. el piso de cuota del router, #45) salvo que la
 config lo permita explícitamente.
 
+## La fuente remota: el usuario del 9-5 (#144)
+
+`harness quota` solo ve las sesiones de `drokoz`, así que su total es un
+piso: el usuario del 9-5 (`tomasherceg`) comparte la misma bolsa semanal de
+la cuenta y consume 20-34% del tope por semana (medido 2026-09-25 con
+`scripts/quota_remota.py`, 4 semanas). Se declara la fuente remota de la
+misma forma que las locales:
+
+- **config**: `quota.remotas`, una lista de `user@host`
+  (p.ej. `["tomasherceg@localhost"]`).
+- **CLI**: `--remotas SSH1,SSH2` separadas por coma; gana sobre la config.
+
+El consumo se lee corriendo `scripts/quota_remota.py --json` **en el host**
+por SSH (autocontenido, stdlib: no necesita el harness instalado allá). Trae
+los tokens **ponderados** por día, por modelo y por semana —la misma unidad
+que el total local—, no los mensajes crudos: por SSH no llegan `.jsonl`.
+Tiene un **timeout corto (30 s)** para que un host colgado no congele el
+bucle; en modo offline (`HARNESS_OFFLINE=1`) no se intenta nada por red y la
+fuente queda marcada ilegible con la razón.
+
+Si el SSH falla (timeout, salida no cero, salida no JSON), la fuente cuenta
+como **ilegible** (#75): se salta, se dice cuál y por qué, y el total se
+marca como piso (`≥`), igual que con `projects`.
+
+```
+  fuentes: 1/2 leídas — el total es un piso
+    falta ssh: tomasherceg@localhost: timeout SSH a los 30 s
+  total ponderado ≥ 20,350 tokens (por costo relativo, ver PESOS) · piso
+```
+
+La remota **legible** se suma a las vistas ponderadas —al total, por modelo
+(los modelos reales del 9-5), por día (en `resto`: sus sesiones no son del
+harness) y por semana (bajo la clave `remoto`, para que el total de la fila
+sea local + remota y la estimación de `harness run` respete la bolsa
+compartida)— y se muestra como fuente aparte (`fuentes: 2/2 leídas`). No
+entra en el crudo (`total`, `por_semana`), que sigue siendo solo local. Sus
+cifras son de los **últimos 35 días** (la ventana de `quota_remota.py`), no
+del histórico completo: la tabla lo dice al pie.
+
+En `--json`, la entrada de la remota en `fuentes` trae `remota: true`,
+`ponderado`, `por_dia`, `por_modelo` y `por_semana`; la línea de eventos lo
+anota (`remota: user@host N tokens (35 días)`).
+
 ## El porcentaje del tope: la constante de calibración
 
 Con la constante configurada, cada corte muestra además el **porcentaje
@@ -262,7 +307,9 @@ tiene efectos de lado.
 2. **Sólo ve las sesiones locales de esta máquina**: no ve otros dispositivos
    ni (claude.ai). Otros usuarios de la máquina se declaran con
    `quota.projects`/`--projects` (#75); uno ilegible se salta y el total se
-   marca como piso.
+   marca como piso. El usuario del 9-5 (otra cuenta que comparte la bolsa
+   semanal) se declara con `quota.remotas`/`--remotas` por SSH (#144); si
+   el host no se puede leer, lo mismo: se salta y el total es un piso.
 
 Están en el `--help` de la CLI, en el epígrafe de esta doc y al pie de la
 tabla.
@@ -309,7 +356,9 @@ para Tomás o para la próxima corrida de agentes.
 ## Forma del `--json`
 
 `harness quota --json` devuelve el agregado: `fuentes` (una entrada por fuente
-declarada: `ruta`, `ok`, `error` — #75), `completa` (false = falta alguna
+declarada: `ruta`, `ok`, `error` — #75; la remota por SSH — #144 — trae
+además `remota`, `ponderado`, `por_dia`, `por_modelo` y `por_semana`),
+`completa` (false = falta alguna
 fuente y el total es un piso, no una medición), `total` (con sus cuatro
 componentes intactos), `ponderado` (el mismo total pesado por `PESOS`),
 `por_modelo` (con `mensajes` y `ponderado` por modelo), `pico_5h` (total +

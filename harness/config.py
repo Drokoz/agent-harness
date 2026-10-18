@@ -314,14 +314,24 @@ def _quota(raw, donde):
         if not isinstance(raw_r, list) or not raw_r:
             raise ConfigError(
                 '{}: "remotas" tiene que ser una lista no vacía'.format(donde))
+        out = []
         for r in raw_r:
-            if not isinstance(r, str) or not r.strip() or "@" not in r:
-                raise ConfigError('{}: cada remota tiene que ser "user@host" '
-                                  '(texto no vacío)'.format(donde))
-            if r != r.strip():
-                raise ConfigError('{}: la remota "{}" trae espacios de más'
-                                  .format(donde, r))
-        remotas = list(raw_r)
+            # Dos formas: `{"ssh": "user@host"}` (la del ticket #144) o el
+            # string `user@host` directamente.
+            if isinstance(r, dict):
+                _keys(r, ("ssh",), donde + ' → "remotas"')
+                dest = _str(r.get("ssh"), '"ssh"', donde + ' → "remotas"')
+            else:
+                dest = _str(r, "cada remota", donde + ' → "remotas"')
+            if "@" not in dest:
+                raise ConfigError(
+                    '{}: la remota "{}" tiene que ser user@host'.format(
+                        donde, dest))
+            if dest != dest.strip():
+                raise ConfigError(
+                    '{}: la remota "{}" trae espacios de más'.format(donde, dest))
+            out.append(dest)
+        remotas = out
     politica = {}
     for campo, minimo, abierto in (("umbral_sesion", 0.0, True),
                                    ("reserva_diaria", 0.0, False),

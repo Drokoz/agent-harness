@@ -46,7 +46,7 @@ import os
 import re
 import subprocess
 from stat import S_ISDIR
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict
 from zoneinfo import ZoneInfo
@@ -450,7 +450,12 @@ def clave_semana(fecha):
     correspondiente a la fecha de viernes `fecha` (date o datetime): el
     viernes 21:00 UTC expresado en `SEMANA_TZ`. Alinea la semana remota
     (que llega como fecha simple, #144) con las claves locales de `agregar`."""
-    d = fecha.date() if isinstance(fecha, datetime) else fecha
+    if isinstance(fecha, str):
+        d = date.fromisoformat(fecha)
+    elif isinstance(fecha, datetime):
+        d = fecha.date()
+    else:
+        d = fecha
     return datetime(d.year, d.month, d.day, RESET_HORA_UTC, tzinfo=timezone.utc) \
         .astimezone(SEMANA_TZ).isoformat()
 
