@@ -255,12 +255,15 @@ class TestCliHasta(unittest.TestCase):
         self.assertEqual(args.hasta, "06:30")
 
     def test_la_mas_temprana_entre_cli_y_config(self):
+        """De noche (--loop) gana la más temprana."""
         inicio = datetime(2026, 10, 17, 23, 0, tzinfo=TZ)
         args = self.h.build_parser().parse_args(["run", "--hasta", "06:30"])
-        self.assertEqual(self.h._hasta_de(args, self._ctx("07:00"), inicio),
+        self.assertEqual(self.h._hasta_de(args, self._ctx("07:00"), inicio,
+                                           noche=True),
                          datetime(2026, 10, 18, 6, 30, tzinfo=TZ))
         args = self.h.build_parser().parse_args(["run", "--hasta", "08:00"])
-        self.assertEqual(self.h._hasta_de(args, self._ctx("07:00"), inicio),
+        self.assertEqual(self.h._hasta_de(args, self._ctx("07:00"), inicio,
+                                           noche=True),
                          datetime(2026, 10, 18, 7, 0, tzinfo=TZ))
 
     def test_sin_hasta_es_none(self):
@@ -434,6 +437,9 @@ class TestRunSueltoDeDiaConHastaEnConfig(unittest.TestCase):
         self.d = Path(self.tmp.name)
         conf = json.loads(test_bucle.LaFronteraSeRecalcula.CONFIG)
         conf["contexts"]["h"]["topes"] = {"hasta": "07:00"}
+        # Sin créditos que medir: la tanda no se recorta por presupuesto.
+        conf["contexts"]["h"]["budget"] = {"polarity": "remaining",
+                                           "provider": "none"}
         self.d.joinpath("config.json").write_text(json.dumps(conf))
         self.log_path = self.d / "events.jsonl"
         self.cli = load_harness_offline()

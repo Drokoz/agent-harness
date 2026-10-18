@@ -957,6 +957,15 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
                            "{}s".format(desde_espera, vacias, int(espera)))
             espera_anterior = espera
             if p is not None and proposer_vacio is not None and not propuesto:
+                # #175: el proposer lanza agentes. Con el freno o la hora
+                # límite ya puestos no corre: se corta acá, sin esperar.
+                if freno_puesto():
+                    motivo = "freno puesto ({})".format(freno)
+                    break
+                if hasta is not None and ahora() >= hasta:
+                    motivo = "hora límite {} alcanzada (--hasta)".format(
+                        hhmm_de(hasta))
+                    break
                 # #115: la hora más barata de la máquina no se gasta en
                 # preguntar si hay trabajo, se gasta en mirarlo. Una vez por
                 # bucle: después, la cola de needs-triage es del humano.
@@ -1237,6 +1246,7 @@ class Dispatcher:
         vueltas_prompt = {}
         tope = max(1, self.spec.max_parallel)
         corte = ""
+        sin_despachar = 0
         with cf.ThreadPoolExecutor(max_workers=tope) as ex:
             cola = list(jobs)
             en_vuelo = set()
@@ -1247,13 +1257,12 @@ class Dispatcher:
                 while cola and len(en_vuelo) < tope and not corte:
                     corte = self._motivo_corte()
                     if corte:
-                        self.log.write(
-                            "corte", ref,
-                            "{}: {} job(s) sin despachar; los que corrían "
-                            "terminan".format(corte, len(cola)))
                         break
                     en_vuelo.add(ex.submit(self.run_job, cola.pop(0)))
                 if corte:
+                    # También los que vuelven a la cola después del corte
+                    # (prompt perdido, #113): no arrancan y se cuentan.
+                    sin_despachar += len(cola)
                     cola = []
                 if not en_vuelo:
                     break
@@ -1267,6 +1276,10 @@ class Dispatcher:
                     resultados.append(j)
                     if self._volver_a_cola(j, vueltas_prompt):
                         cola.append(j)
+        if corte:
+            self.log.write("corte", ref,
+                           "{}: {} job(s) sin despachar; los que corrían "
+                           "terminaron".format(corte, sin_despachar))
         despues = self.credits()
         self._repartir_costo(resultados, antes, despues, desde)
         if antes is not None and despues is not None:

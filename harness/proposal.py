@@ -578,6 +578,18 @@ class Proponer(Dispatcher):
             self._log(job, "juez", ref, job.motivo)
 
     # ---------------------------------------------------------------- flujo
+    def _cortar_propuesta(self, resumen, ref):
+        """#175: antes de lanzar un agente (generador o juez), el freno y la
+        hora límite. Con corte, no se lanza y el motivo queda en el log y en
+        el resumen. Los issues ya abiertos quedan en needs-triage."""
+        corte = self._motivo_corte()
+        if not corte:
+            return False
+        self.log.write("corte", ref, "{}: no se lanza el agente".format(corte))
+        resumen["detalle"].append("corte: " + corte)
+        resumen["juez"] = resumen["juez"] or "sin juez (corte: {})".format(corte)
+        return True
+
     def proponer_repo(self, repo, slug, repo_path, maximo, peldano_juez):
         """Una noche de proponer sobre un repo: generador -> validación y
         apertura a `needs-triage` -> juez -> promoción. Devuelve un dict de
@@ -606,6 +618,8 @@ class Proponer(Dispatcher):
                          maximo=maximo, issues_conocidos=tuple(conocidos),
                          kind=GENERADOR["kind"], model=GENERADOR["model"],
                          extra_args=tuple(GENERADOR["extra_args"]))
+        if self._cortar_propuesta(resumen, ref_g):
+            return resumen
         self.run_job(gen)
         if gen.estado != "hecho":
             resumen["juez"] = "sin juez (generador {})".format(gen.estado)
@@ -668,6 +682,8 @@ class Proponer(Dispatcher):
                           kind=peldano_juez["kind"],
                           model=peldano_juez.get("model", ""),
                           extra_args=tuple(peldano_juez.get("extra_args", ())))
+        if self._cortar_propuesta(resumen, "propuesta/juez"):
+            return resumen
         self.run_job(juez)
         if juez.estado != "hecho":
             resumen["juez"] = "juez {}: {}".format(juez.estado, juez.motivo)
