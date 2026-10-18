@@ -720,10 +720,14 @@ class Cuota:
                         "5h)".format(e, est.semana_pct or 0))
             est.motivo = str(e)
             return est
-        self.anotar("/usage: sesión {}% ({}), semana {}% ({})".format(
-            u.sesion.pct, _hhmm(u.sesion.reset), u.semana.pct,
+        # La fuente real del dato: la statusline o /usage (revisión #159).
+        fuente = (u.sesion.fuente if u.sesion.fuente == u.semana.fuente
+                  else "{}+{}".format(u.sesion.fuente, u.semana.fuente))
+        etiqueta = "/usage" if fuente == "usage" else fuente
+        self.anotar("{}: sesión {}% ({}), semana {}% ({})".format(
+            etiqueta, u.sesion.pct, _hhmm(u.sesion.reset), u.semana.pct,
             _cuando(u.semana.reset)))
-        return EstadoCuota(fuente="usage", sesion_pct=u.sesion.pct,
+        return EstadoCuota(fuente=fuente, sesion_pct=u.sesion.pct,
                            sesion_reset=u.sesion.reset,
                            semana_pct=u.semana.pct,
                            semana_reset=u.semana.reset)
