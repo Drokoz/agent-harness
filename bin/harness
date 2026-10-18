@@ -109,6 +109,11 @@
                                     con su hash (la ruta de harness-noche)
     harness run --sin-aprobacion    manual (sin --loop): corre sin plan
                                     aprobado sólo si todo es Claude
+    harness maintain|proponer --plan  lo mismo para los sueltos: si usan pi o
+                                    el tope es > 0 piden plan aprobado; si
+                                    no, corren con tope 0
+    FECHA es la de la noche: de 12:00 de D a 11:59 de D+1, D+1 (lo que ve
+    `date +%F` de harness-noche a la 01:00). Se aprueba de tarde.
 
     `run` (también --loop) no arranca sin un plan aprobado hoy cuyo hash sea
     el del plan que calcula al arrancar: sale 2 sin crear nada. Con --loop,
@@ -213,7 +218,7 @@ import shutil
 import sys
 import time
 from dataclasses import replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -238,7 +243,7 @@ from harness.dispatch import (BucleSpec, Corrida, DispatchSpec,  # noqa: E402
                               motivo_presupuesto_reloj, peldano_etiqueta,
                               peldano_numero, skills_de,
                               transcripcion_path)
-from harness.dispatch import hhmm_de, resolver_hasta  # noqa: E402
+from harness.dispatch import TZ_SERVIDOR, hhmm_de, resolver_hasta  # noqa: E402
 from harness.ideas import (IDEAS_CLAUDE, IDEAS_OPUS, Ideas,  # noqa: E402
                            MAX_IDEAS_DEFAULT, debe_correr,
                            guardar_ultima_corrida, leer_ideas_vault,
@@ -376,7 +381,7 @@ def build_parser():
     p.add_argument("--log", default="",
                    help="run: dónde va el log JSONL de eventos")
     p.add_argument("--plan", action="store_true", dest="solo_plan",
-                   help="run: no corre nada (#176): lista lo que se "
+                   help="run/maintain/proponer: no corre nada (#176): lista lo que se "
                         "despacharía (repo, ticket, runner, modelo, peldaño, "
                         "por qué y costo estimado), el total contra el tope, "
                         "y deja el plan en <estado>/harness/plan-FECHA.json "
@@ -384,10 +389,10 @@ def build_parser():
                         "la corrida que se va a aprobar (p.ej. --loop)")
     p.add_argument("--sin-aprobacion", action="store_true",
                    dest="sin_aprobacion",
-                   help="run (sin --loop): corre sin plan aprobado SOLO si "
-                        "todo lo que despacharía es Claude (US$0 en plata, "
-                        "tope de gasto forzado a 0); si algo paga, se niega "
-                        "igual (#176)")
+                   help="run (sin --loop), maintain, proponer: corre sin "
+                        "plan aprobado SOLO si todo es Claude (US$0 en "
+                        "plata, tope de gasto forzado a 0); si algo paga, "
+                        "se niega igual (#176)")
     p.add_argument("--si", action="store_true",
                    help="aprobar: no pregunta (no interactivo)")
     p.add_argument("--loop", action="store_true",
@@ -522,7 +527,10 @@ def main(argv=None):
         # Lo que frena la corrida sin efectos va antes que la aprobación:
         # el freno viejo o la falta de herdr se dicen como tales. Un
         # contexto manual no toma nada: no hay qué aprobar.
-        if all(c.autonomy == "manual" for c in contexts):
+        # Con --loop no: la config se relee cada pasada (#163), y un
+        # contexto que pasa a frontier a mitad de la noche despacharía sin
+        # plan ni techo.
+        if not args.loop and all(c.autonomy == "manual" for c in contexts):
             return run_main(args, contexts, solo)
         rc = (_no_arranca_el_bucle(args, contexts) if args.loop
               else _sin_herdr())
@@ -534,7 +542,16 @@ def main(argv=None):
         return run_main(args, contexts, solo, aprobado=aprobado)
     if args.command == "aprobar":
         return aprobar_main(args)
+    if args.command in ("maintain", "proponer") and args.solo_plan:
+        return _plan_cmd_main(args, contexts, args.command)
     if args.command == "maintain":
+        # Como en `run`: un contexto manual no toma nada, y la falta de
+        # herdr se dice como tal, antes de pedir la aprobación.
+        if not all(c.autonomy == "manual" for c in contexts):
+            rc = (_sin_herdr()
+                  or _exigir_aprobacion_cmd(args, contexts, "maintain"))
+            if rc:
+                return rc
         return maintain_main(args, contexts)
     if args.command == "costo":
         return costo_main(args)
@@ -547,6 +564,9 @@ def main(argv=None):
         if not 0 <= args.piso_cuota <= 1:
             sys.stderr.write("harness: --piso-cuota tiene que estar entre 0 y 1\n")
             return 2
+        rc = _exigir_aprobacion_cmd(args, contexts, "proponer")
+        if rc:
+            return rc
         return proponer_main(args, contexts)
     if args.command == "ideas":
         if args.max_ideas < 1:
@@ -1083,10 +1103,17 @@ def _avisar_agentes_ilegibles(snap, ctx, log):
 TECHOS_USD = {}
 
 
+def _ahora_noche():
+    """Ahora, en la zona del servidor: el reloj de la fecha del plan."""
+    return datetime.now(TZ_SERVIDOR)
+
+
 def _hoy():
-    """La fecha del plan y de la aprobación: la local de la máquina, la
-    misma que `date +%F` en `harness-noche`."""
-    return date.today().isoformat()
+    """La FECHA del plan y de la aprobación: la de la noche
+    (`plan.fecha_de_noche`: 12:00 de D … 11:59 de D+1 → D+1), la misma que
+    `date +%F` de `harness-noche` cuando el timer lanza a la 01:00 de D+1.
+    Aprobar a las 22:00 de D vale para esa noche; de mañana, no."""
+    return plan_mod.fecha_de_noche(_ahora_noche())
 
 
 def _costos_por_peldano(eventos):
@@ -1298,27 +1325,114 @@ def _exigir_aprobacion(args, contexts, solo):
             sys.stderr.write(como)
             return None, 2
         return plan_mod.sin_plata(plan), 0
-    ruta = plan_mod.ruta_aprobado(_estado_dir(), plan["fecha"])
-    aprobado = plan_mod.leer_aprobacion(ruta)
-    if aprobado is None:
-        sys.stderr.write("harness: no hay plan aprobado hoy ({} no existe o "
-                         "está vacío): no se corre nada.\n".format(ruta) + como)
-        return None, 2
-    if aprobado != plan["hash"]:
-        sys.stderr.write("harness: el plan cambió desde la aprobación "
-                         "(aprobado {}, vigente {}): no se corre nada.\n"
-                         .format(aprobado[:12], plan["hash"][:12]))
-        try:
-            visto = plan_mod.leer(plan_mod.ruta_plan(_estado_dir(),
-                                                     plan["fecha"]))
-        except plan_mod.PlanInvalido:
-            visto = None
-        if visto is not None and visto.get("hash") == aprobado:
-            for linea in plan_mod.diferencias(visto, plan):
-                sys.stderr.write("  {}\n".format(linea))
-        sys.stderr.write(como)
+    if not _aprobado(plan, como):
         return None, 2
     return plan, 0
+
+
+def _aprobado(plan, como):
+    """¿El hash de `plan` está entre los aprobados de su fecha? Si no, el
+    motivo (y qué cambió, si el plan guardado era el aprobado) a stderr."""
+    ruta = plan_mod.ruta_aprobado(_estado_dir(), plan["fecha"])
+    aprobados = plan_mod.leer_aprobaciones(ruta)
+    if not aprobados:
+        sys.stderr.write("harness: no hay plan aprobado para la noche {} ({} "
+                         "no existe o está vacío): no se corre nada.\n"
+                         .format(plan["fecha"], ruta) + como)
+        return False
+    if plan["hash"] in aprobados:
+        return True
+    sys.stderr.write("harness: el plan cambió desde la aprobación "
+                     "(aprobado {}, vigente {}): no se corre nada.\n"
+                     .format(aprobados[-1][:12], plan["hash"][:12]))
+    try:
+        visto = plan_mod.leer(plan_mod.ruta_plan(_estado_dir(),
+                                                 plan["fecha"]))
+    except plan_mod.PlanInvalido:
+        visto = None
+    if visto is not None and visto.get("hash") in aprobados:
+        for linea in plan_mod.diferencias(visto, plan):
+            sys.stderr.write("  {}\n".format(linea))
+    sys.stderr.write(como)
+    return False
+
+
+def _planear_cmd(args, contexts, cmd):
+    """El plan de `maintain`/`proponer` sueltos (#176): una entrada por
+    contexto, "corrida de harness <cmd>", pagada si la corrida usa pi, con
+    el tope entero como estimado (el peor caso). Sin efectos ni red."""
+    ctxs = []
+    for ctx in contexts:
+        corrida = _corrida_de(args, ctx)
+        tope = _max_usd(args, ctx)
+        usa = corrida.usa_pi()
+        ctxs.append({
+            "nombre": ctx.name,
+            "corrida": {"kind": corrida.kind, "fuente": corrida.fuente,
+                        "permitir_pi": corrida.permitir_pi,
+                        "runner_min": dict(corrida.runner_min or {}),
+                        "usa_pi": usa},
+            "max_usd": tope, "hasta": "", "freno": "", "notas": [],
+            "entradas": [{
+                "repo": "*", "tipo": cmd, "numero": 0,
+                "titulo": "corrida de harness {} {}".format(
+                    cmd, "con pi (gasta OpenRouter)" if usa
+                    else "en Claude"),
+                "kind": "pi" if usa else "claude", "model": "",
+                "extra_args": [], "peldano": "harness {}".format(cmd),
+                "motivo": "por qué: corrida {} ({}){}".format(
+                    corrida.kind, corrida.fuente,
+                    " + --permitir-pi" if corrida.permitir_pi else ""),
+                "estimado_usd": tope if usa else 0.0,
+                "estimado_fuente": "el tope entero: peor caso"}]})
+    plan = {"version": plan_mod.VERSION, "fecha": _hoy(),
+            "creado": _iso_utc(datetime.now(timezone.utc)), "modo": cmd,
+            "contextos": ctxs,
+            "estimado_usd": round(sum(
+                e["estimado_usd"] for c in ctxs for e in c["entradas"]
+                if e["kind"] not in plan_mod.SIN_PLATA), 4)}
+    return plan_mod.sellar(plan)
+
+
+def _plan_cmd_main(args, contexts, cmd):
+    """`harness maintain --plan` / `harness proponer --plan`."""
+    plan = _planear_cmd(args, contexts, cmd)
+    ruta = plan_mod.ruta_plan(_estado_dir(), plan["fecha"])
+    plan_mod.guardar(ruta, plan)
+    sys.stdout.write(plan_mod.render(plan))
+    sys.stdout.write("\nplan guardado en {}\nsi está bien: harness aprobar "
+                     "(después, `harness {}` con los mismos flags)\n".format(
+                         ruta, cmd))
+    return 0
+
+
+def _exigir_aprobacion_cmd(args, contexts, cmd):
+    """(#176) `maintain`/`proponer` sueltos: si pueden gastar plata (la
+    corrida usa pi, o el tope efectivo es > 0) necesitan su plan aprobado
+    como `run`; si no, corren con tope 0. `--sin-aprobacion`: corre sin
+    plan si no usa pi, con tope 0. Devuelve el código (0 = correr) y deja
+    el techo de cada contexto en `TECHOS_USD`."""
+    plan = _planear_cmd(args, contexts, cmd)
+    como = ("Para correr: harness {} --plan (con los mismos flags), "
+            "revisarlo, y harness aprobar; o --sin-aprobacion si no usa pi "
+            "(tope 0).\n".format(cmd))
+    necesita = plan_mod.paga(plan) or any(
+        (c.get("max_usd") or 0) > 0 for c in plan["contextos"])
+    if not necesita or args.sin_aprobacion:
+        if plan_mod.paga(plan):
+            sys.stderr.write("harness: --sin-aprobacion no vale: la corrida "
+                             "de {} usa pi (gasta plata).\n".format(cmd)
+                             + como)
+            return 2
+        for c in plan["contextos"]:
+            TECHOS_USD[c["nombre"]] = 0.0
+        return 0
+    if not _aprobado(plan, como):
+        return 2
+    for c in plan["contextos"]:
+        techo = plan_mod.techo_usd(plan, c["nombre"])
+        TECHOS_USD[c["nombre"]] = 0.0 if techo is None else techo
+    return 0
 
 
 def _techo_aprobado(aprobado, ctx):

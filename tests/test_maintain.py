@@ -594,7 +594,7 @@ class TestCliMaintain(unittest.TestCase):
             mundo = self._mundo()
             rc, out, mundo = self._correr(
                 mod, mundo,
-                ["maintain", "--context", "harness",
+                ["maintain", "--context", "harness", "--sin-aprobacion",
                  "--log", str(Path(tmp) / "ev.jsonl")], tmp)
             self.assertEqual(rc, 0, out)
             self.assertIn("PR #31/koku", out)
@@ -610,7 +610,7 @@ class TestCliMaintain(unittest.TestCase):
             mod = self._modulo(tmp)
             rc, out, mundo = self._correr(
                 mod, mundo,
-                ["maintain", "--context", "harness",
+                ["maintain", "--context", "harness", "--sin-aprobacion",
                  "--log", str(Path(tmp) / "ev.jsonl")], tmp)
             self.assertEqual(rc, 0, out)
             self.assertIn("nada que mantener", out)

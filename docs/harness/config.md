@@ -87,9 +87,12 @@ autorizado y gastó US$17. Desde #176 una corrida real necesita un plan aprobado
    arriba: la cuota, el presupuesto de la tanda y el reloj sólo sacan.
 2. `harness aprobar [--si]` — muestra el plan **del archivo** (se aprueba lo que se
    vio, no un plan recalculado que podría ser otro), pide confirmación (`--si` no
-   pregunta; sin terminal y sin `--si`, no aprueba) y escribe
-   `<estado>/harness/aprobado-FECHA` con el hash adentro. Un plan editado a mano (hash
-   que no coincide) no se aprueba.
+   pregunta; sin terminal y sin `--si`, no aprueba) y suma el hash a
+   `<estado>/harness/aprobado-FECHA` (una línea por plan aprobado: aprobar un
+   `maintain` no borra la aprobación de la noche). Un plan editado a mano no se
+   aprueba: el archivo lleva además `hash_documento`, un hash del documento entero
+   (títulos, peldaño, estimados, `usa_pi`), para que no se lo pueda retocar para
+   verse más barato con el `hash` intacto.
 3. `harness run` (también `--loop`) recalcula el plan al arrancar, antes de cualquier
    efecto: sin `aprobado-FECHA`, o con un hash distinto (ticket nuevo, otro runner, otro
    tope, otra hora límite, otro modo), sale con código 2, dice qué cambió y cómo
@@ -107,16 +110,29 @@ número, runner, modelo, args del peldaño). No cubre timestamps, títulos, moti
 estimados: el costo medio se mueve con cada job y no puede invalidar la aprobación a
 mitad de la noche.
 
-`FECHA` es la fecha local de la máquina (`date +%F`), y `<estado>` es `XDG_STATE_HOME`
-o `~/.local/state`: la misma ruta que mira el lanzador del servidor, `harness-noche`
-(`~/.local/state/harness/aprobado-$(date +%F)`), que sale sin hacer nada si no existe.
-El lanzador corre `harness run --loop --kind claude --freno ~/.local/state/harness/freno`,
-así que el plan de la noche se saca con esos flags:
+**`FECHA` es la de la noche, no la del reloj.** De 12:00 de D a 11:59 de D+1
+(America/Santiago) `FECHA` = D+1. El dueño aprueba de tarde (22:00 de D) y el timer
+lanza a la 01:00 de D+1, donde el lanzador del servidor, `harness-noche`, mira
+`~/.local/state/harness/aprobado-$(date +%F)` = D+1: los dos coinciden. Por eso:
+
+- **Se aprueba entre las 12:00 y el lanzamiento.** Lo aprobado de mañana (antes de las
+  12:00 de D) queda con fecha D y no vale para la noche que arranca a la 01:00 de D+1;
+  lo de la noche anterior tampoco.
+- `<estado>` es `XDG_STATE_HOME` o `~/.local/state`: en el servidor, la ruta del
+  lanzador. Si no existe, el lanzador sale sin hacer nada.
+- **El plan se saca con los flags exactos del lanzador** (`harness run --loop --kind
+  claude --freno ~/.local/state/harness/freno`); si no, el hash es otro y la noche sale
+  con código 2:
 
 ```sh
 harness run --plan --loop --kind claude --freno ~/.local/state/harness/freno
 harness aprobar
 ```
+
+- **Cualquier ticket que aparezca o se cierre entre la aprobación y la 01:00 cambia el
+  hash**, y la noche sale con código 2 sin hacer nada. El rechazo lista qué cambió
+  (tickets de más o de menos, tope, hasta, corrida, modo) para volver a planear y
+  aprobar. Es el costo de que nada corra sin que el dueño lo haya visto.
 
 Un `touch` vacío del archivo (la aprobación vieja del lanzador) deja pasar al lanzador
 pero no al harness: sin hash no hay plan aprobado.
@@ -125,6 +141,20 @@ pero no al harness: sin hash no hay plan aprobado.
 noche. La salida es `--sin-aprobacion`, sólo sin `--loop`: una corrida manual corre
 sin plan aprobado si **todo** lo que despacharía es Claude (y la corrida no usa pi para
 el revisor ni proponer); el tope de gasto queda en 0. Si algo paga, se niega igual.
+
+Un `run` sin `--loop` cuyos contextos son todos `autonomy: manual` no pide aprobación
+(no despacha nada); con `--loop` sí, porque la config se relee cada pasada y un
+contexto que pasa a `frontier` a mitad de la noche no puede despachar sin plan ni techo.
+Un plan aprobado sin nada pagado ni pi deja techo 0: una config que pase a
+`escalera: pi` a mitad de la noche no prende el revisor ni el proponer en pi.
+
+**`maintain` y `proponer` sueltos** pasan por la misma puerta: si la corrida usa pi
+(`--kind pi`, `escalera: pi`, `--permitir-pi`) o el tope efectivo es > 0, necesitan
+`harness maintain --plan` / `harness proponer --plan` (una entrada "corrida de harness
+<cmd>" con el tope como peor caso) y `harness aprobar`. Si no, corren con tope 0, y
+`--sin-aprobacion` también los deja correr sin plan si no usan pi (tope 0). `ideas` es
+solo Claude: sin puerta. El `proponer` del `--loop` queda cubierto por el plan de la
+noche.
 
 ## Con qué runner corre la noche
 

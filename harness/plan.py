@@ -29,7 +29,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from datetime import timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+# La zona del servidor (`dispatch.TZ_SERVIDOR`): repetida acá para que el
+# módulo siga puro, sin importar el dispatcher.
+TZ_SERVIDOR = ZoneInfo("America/Santiago")
 
 VERSION = 1
 
@@ -41,6 +47,17 @@ SIN_PLATA = ("claude",)
 class PlanInvalido(Exception):
     """El archivo del plan no existe, no se lee, o su hash no coincide con
     su contenido (alguien lo editó a mano)."""
+
+
+# -------------------------------------------------------------------- fecha
+def fecha_de_noche(ahora):
+    """La FECHA del plan y de la aprobación: la de la noche, no la del
+    reloj. El dueño aprueba de tarde (22:00 de D) y el timer lanza a la
+    01:00 de D+1, donde `harness-noche` mira `aprobado-$(date +%F)` = D+1.
+    De 12:00 de D a 11:59 de D+1 (America/Santiago) la fecha es D+1: la
+    misma que `date +%F` a la hora del lanzamiento."""
+    return (ahora.astimezone(TZ_SERVIDOR) + timedelta(hours=12)).date() \
+        .isoformat()
 
 
 # -------------------------------------------------------------------- rutas
@@ -103,10 +120,23 @@ def hash_de(plan):
     return hashlib.sha256(texto.encode("utf-8")).hexdigest()
 
 
+def hash_documento(plan):
+    """sha256 del documento entero (también lo que sólo se muestra:
+    títulos, peldaño, estimados, motivos, `usa_pi`), sin los dos hashes.
+    `hash` es lo que se aprueba; esto es para que un plan retocado a mano
+    no se vea más barato con el `hash` intacto."""
+    resto = {k: v for k, v in plan.items()
+             if k not in ("hash", "hash_documento")}
+    texto = json.dumps(resto, sort_keys=True, ensure_ascii=False,
+                       separators=(",", ":"))
+    return hashlib.sha256(texto.encode("utf-8")).hexdigest()
+
+
 def sellar(plan):
-    """Una copia del plan con su `hash`."""
+    """Una copia del plan con su `hash` y su `hash_documento`."""
     p = dict(plan)
     p["hash"] = hash_de(p)
+    p["hash_documento"] = hash_documento(p)
     return p
 
 
@@ -141,8 +171,16 @@ def cubre(plan, contexto, repo, tipo, numero, kind, model):
 def techo_usd(plan, contexto):
     """El tope de gasto que el plan aprobó para `contexto` (None si el plan
     no lo trae): la config se relee cada pasada, y subirla a mitad de la
-    noche no sube el tope de una corrida aprobada."""
+    noche no sube el tope de una corrida aprobada.
+
+    Un contexto cuyo plan no trae nada pagado ni usa pi tiene techo 0: lo
+    aprobado no gasta plata, y una config que pase a `escalera: pi` a
+    mitad de la noche no prende el revisor ni el proponer en pi."""
     for c in _contextos(plan, contexto):
+        if (not any(e.get("kind") not in SIN_PLATA
+                    for e in c.get("entradas") or ())
+                and not (c.get("corrida") or {}).get("usa_pi")):
+            return 0.0
         try:
             return float(c.get("max_usd"))
         except (TypeError, ValueError):
@@ -236,26 +274,34 @@ def leer(ruta):
         raise PlanInvalido("no existe {}".format(ruta))
     except (OSError, ValueError) as e:
         raise PlanInvalido("no se pudo leer {}: {}".format(ruta, e))
-    if not isinstance(plan, dict) or plan.get("hash") != hash_de(plan):
+    if (not isinstance(plan, dict) or plan.get("hash") != hash_de(plan)
+            or plan.get("hash_documento") != hash_documento(plan)):
         raise PlanInvalido("{}: el hash no coincide con el contenido (¿se "
                            "editó a mano?)".format(ruta))
     return plan
 
 
 def escribir_aprobacion(ruta, h):
+    """Suma `h` a los hashes aprobados de la fecha (una línea cada uno):
+    aprobar un `maintain` no borra la aprobación de la noche. Aprobar dos
+    veces el mismo no lo duplica."""
     ruta = Path(ruta)
     ruta.parent.mkdir(parents=True, exist_ok=True)
-    ruta.write_text(h + "\n", encoding="utf-8")
+    hashes = leer_aprobaciones(ruta)
+    if h not in hashes:
+        hashes.append(h)
+    ruta.write_text("".join(x + "\n" for x in hashes), encoding="utf-8")
 
 
-def leer_aprobacion(ruta):
-    """El hash aprobado, o None si no hay aprobación (o no se lee). Un
-    `touch` vacío (la aprobación vieja del lanzador) no aprueba nada."""
+def leer_aprobaciones(ruta):
+    """Los hashes aprobados de la fecha, en orden; [] si no hay
+    aprobación (o no se lee). Un `touch` vacío (la aprobación vieja del
+    lanzador) no aprueba nada."""
     try:
-        h = Path(ruta).read_text(encoding="utf-8").strip()
+        texto = Path(ruta).read_text(encoding="utf-8")
     except OSError:
-        return None
-    return h or None
+        return []
+    return [l.strip() for l in texto.splitlines() if l.strip()]
 
 
 # ----------------------------------------------------------------- pantalla
@@ -269,7 +315,8 @@ def render(plan):
     modo = plan.get("modo")
     out.append("plan de la corrida {} · {} · hash {}".format(
         plan.get("fecha", ""),
-        "run --loop" if modo == "loop" else "run (una pasada)",
+        {"loop": "run --loop", "una": "run (una pasada)"}.get(
+            modo, "harness {}".format(modo)),
         (plan.get("hash") or hash_de(plan))[:12]))
     total = 0.0
     n_pagados = n_claude = 0
