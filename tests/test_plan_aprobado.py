@@ -24,7 +24,8 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -34,6 +35,12 @@ import support  # noqa: F401  (sys.path + CLAUDE_JSON de mentira)
 from harness import dispatch as dispatch_mod
 from harness import plan as plan_mod
 from harness.dispatch import ESCALERA, EventLog
+
+TZ = ZoneInfo("America/Santiago")
+
+
+def _hoy_noche():
+    return plan_mod.fecha_de_noche(datetime.now(TZ))
 
 from test_dispatch import Mundo
 from test_runner_corrida import _CliBase
@@ -163,9 +170,62 @@ class ElArchivoDelPlan(unittest.TestCase):
 
     def test_aprobacion(self):
         ruta = plan_mod.ruta_aprobado(self.d, "2026-10-18")
-        self.assertIsNone(plan_mod.leer_aprobacion(ruta))
+        self.assertEqual(plan_mod.leer_aprobaciones(ruta), [])
         plan_mod.escribir_aprobacion(ruta, "abc123")
-        self.assertEqual(plan_mod.leer_aprobacion(ruta), "abc123")
+        self.assertEqual(plan_mod.leer_aprobaciones(ruta), ["abc123"])
+        # Aprobar otro plan el mismo día (p.ej. maintain) no borra el de
+        # la noche, y aprobar dos veces el mismo no lo duplica.
+        plan_mod.escribir_aprobacion(ruta, "def456")
+        plan_mod.escribir_aprobacion(ruta, "abc123")
+        self.assertEqual(plan_mod.leer_aprobaciones(ruta),
+                         ["abc123", "def456"])
+
+    def test_un_plan_que_se_ve_mas_barato_no_se_lee(self):
+        """Los campos de pantalla (estimado, título, peldaño, usa_pi) no
+        entran en el hash del contenido, pero sí en el del documento: un
+        plan retocado para verse más barato no se aprueba."""
+        for campo, valor in (("estimado_usd", 0.0), ("titulo", "inofensivo"),
+                             ("peldano", "claude"), ("motivo", "x")):
+            p = plan_mod.sellar(_plan([_entrada(7, kind="pi",
+                                                peldano="peldaño 1")]))
+            ruta = plan_mod.ruta_plan(self.d, "2026-10-18")
+            plan_mod.guardar(ruta, p)
+            data = json.loads(ruta.read_text())
+            data["contextos"][0]["entradas"][0][campo] = valor
+            ruta.write_text(json.dumps(data))
+            with self.assertRaises(plan_mod.PlanInvalido, msg=campo):
+                plan_mod.leer(ruta)
+        p = plan_mod.sellar(_plan([_entrada(7)], permitir_pi=True))
+        plan_mod.guardar(ruta, p)
+        data = json.loads(ruta.read_text())
+        data["contextos"][0]["corrida"]["usa_pi"] = False
+        ruta.write_text(json.dumps(data))
+        with self.assertRaises(plan_mod.PlanInvalido):
+            plan_mod.leer(ruta)
+
+
+class LaFechaEsLaDeLaNoche(unittest.TestCase):
+    """La aprobación se pide de tarde y la noche arranca pasada la
+    medianoche: FECHA es la de la noche (12:00 D … 11:59 D+1 → D+1), la
+    misma que `date +%F` del lanzador a la 01:00 de D+1."""
+
+    def _f(self, d, h, m=0):
+        return plan_mod.fecha_de_noche(datetime(2026, 10, d, h, m,
+                                                tzinfo=TZ))
+
+    def test_ventana(self):
+        self.assertEqual(self._f(18, 22), "2026-10-19")
+        self.assertEqual(self._f(19, 1), "2026-10-19")
+        self.assertEqual(self._f(19, 11, 59), "2026-10-19")
+        self.assertEqual(self._f(18, 12), "2026-10-19")
+        self.assertEqual(self._f(18, 11, 59), "2026-10-18")
+        self.assertEqual(self._f(18, 10), "2026-10-18")
+
+    def test_otra_zona_se_lleva_a_santiago(self):
+        from datetime import timezone
+        # 04:00 UTC del 19 = 01:00 en Santiago (verano, -03).
+        utc = datetime(2026, 10, 19, 4, 0, tzinfo=timezone.utc)
+        self.assertEqual(plan_mod.fecha_de_noche(utc), "2026-10-19")
 
 
 class _Cli(_CliBase):
@@ -175,12 +235,12 @@ class _Cli(_CliBase):
     def setUp(self):
         super().setUp()
         self.estado = self.d / "state"
-        self.hoy = date.today().isoformat()
+        self.hoy = _hoy_noche()
         self.issues = [self._issue(7)]
         self.despachados = []
         self.mundo = Mundo(prs=[])
 
-    def _main(self, argv, issues=None):
+    def _main(self, argv, issues=None, ahora=None):
         """`main(argv)` → (código, stdout, stderr). `Dispatcher.dispatch`
         es el real contra el Mundo: si algo se despachara, el Mundo vería
         el worktree y el pane."""
@@ -192,7 +252,11 @@ class _Cli(_CliBase):
             return real_dispatch(disp, jobs)
 
         out, err = io.StringIO(), io.StringIO()
+        reloj = ((lambda: ahora) if ahora is not None
+                 else (lambda: datetime.now(TZ)))
         with mock.patch.object(self.cli, "OFFLINE", False), \
+             mock.patch.object(self.cli, "_ahora_noche", side_effect=reloj,
+                               create=True), \
              mock.patch.object(self.cli, "collect",
                                side_effect=lambda *a, **k: self._raw(issues)), \
              mock.patch.object(self.cli.adapters, "run", self.mundo.cmd), \
@@ -456,6 +520,17 @@ class ElLoopReplanifica(_Cli):
         self.assertEqual(sorted(j.issue for j in self.despachados), [7, 8])
         self.assertEqual({j.kind for j in self.despachados}, {"claude"})
 
+    def test_plan_sin_nada_pagado_deja_techo_cero(self):
+        """Un plan aprobado sin jobs pagados ni pi: techo 0, aunque la
+        config pase a `escalera: pi` a mitad de la noche (revisor y
+        proponer no pueden prender pi)."""
+        self._cfg(topes={"max_usd": 5})
+        plan = self._planear_y_aprobar(["--loop"])
+        self._cfg(escalera="pi", topes={"max_usd": 5})
+        self._pasada(["--loop"], [self._issue(7)], plan)
+        self.assertEqual(self.cli.TECHOS_USD["h"], 0)
+        self.assertEqual(self.cli.TOPES_GASTO["h"].max_usd, 0)
+
     def test_el_tope_no_sube_sobre_el_aprobado(self):
         """La config se relee en cada pasada (#163): subir topes.max_usd a
         mitad de la noche no sube el tope de una corrida aprobada."""
@@ -464,6 +539,148 @@ class ElLoopReplanifica(_Cli):
         self._cfg(escalera="pi", topes={"max_usd": 500})
         self._pasada(["--loop"], [self._issue(7)], plan)
         self.assertEqual(self.cli.TOPES_GASTO["h"].max_usd, 5)
+
+
+class LaNocheCruzaLaMedianoche(_Cli):
+    """Aprobar a las 22:00 de D vale para la corrida de la 01:00 de D+1
+    (el timer); la de la noche anterior o la de la mañana de D, no."""
+
+    D_22 = datetime(2026, 10, 18, 22, 0, tzinfo=TZ)
+    D1_01 = datetime(2026, 10, 19, 1, 0, tzinfo=TZ)
+
+    def _aprobar_a(self, ahora):
+        code, _, err = self._main(["run", "--plan"], ahora=ahora)
+        self.assertEqual(code, 0, err)
+        code, _, err = self._main(["aprobar", "--si"], ahora=ahora)
+        self.assertEqual(code, 0, err)
+
+    def test_aprobado_22_de_d_corre_01_de_d_mas_1(self):
+        self._cfg()
+        self._aprobar_a(self.D_22)
+        self.assertTrue((self.estado / "harness" /
+                         "aprobado-2026-10-19").exists())
+        code, _, err = self._main(["run"], ahora=self.D1_01)
+        self.assertEqual(code, 0, err)
+        self.assertEqual([j.issue for j in self._tickets(self.despachados)],
+                         [7])
+
+    def test_aprobacion_de_la_noche_anterior_no_vale(self):
+        self._cfg()
+        self._aprobar_a(datetime(2026, 10, 17, 22, 0, tzinfo=TZ))
+        code, _, _ = self._main(["run"], ahora=self.D1_01)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.despachados, [])
+
+    def test_aprobado_10_de_d_no_vale_para_la_01_de_d_mas_1(self):
+        self._cfg()
+        self._aprobar_a(datetime(2026, 10, 18, 10, 0, tzinfo=TZ))
+        code, _, _ = self._main(["run"], ahora=self.D1_01)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.despachados, [])
+
+
+class ContextoManualEnElLoop(_Cli):
+
+    def test_loop_con_todo_manual_tambien_pide_aprobacion(self):
+        """El --loop relee la config cada pasada (#163): un contexto que
+        pasa de manual a frontier a mitad de la noche no puede despachar
+        sin plan aprobado ni techo."""
+        self._cfg()
+        cfg = json.loads(self.d.joinpath("config.json").read_text())
+        cfg["contexts"]["h"]["autonomy"] = "manual"
+        self.d.joinpath("config.json").write_text(json.dumps(cfg))
+        code, _, err = self._main(["run", "--loop", "--sin-proponer"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("harness aprobar", err)
+        self.assertEqual(self.despachados, [])
+
+    def test_sin_loop_todo_manual_no_pide_nada(self):
+        self._cfg()
+        cfg = json.loads(self.d.joinpath("config.json").read_text())
+        cfg["contexts"]["h"]["autonomy"] = "manual"
+        self.d.joinpath("config.json").write_text(json.dumps(cfg))
+        code, out, err = self._main(["run"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("autonomía manual", out)
+
+
+class MaintainYProponer(_Cli):
+    """`maintain` y `proponer` sueltos: si pueden gastar plata (la corrida
+    usa pi, o el tope efectivo es > 0) piden aprobación como `run`; si no,
+    corren con tope 0. `ideas` es solo Claude: sin puerta."""
+
+    def _cmd(self, cmd, flags=(), ahora=None):
+        llamados = []
+        with mock.patch.object(self.cli, cmd + "_main",
+                               side_effect=lambda a, c: llamados.append(a)
+                               or 0):
+            code, out, err = self._main([cmd] + list(flags), ahora=ahora)
+        return code, llamados, out, err
+
+    def test_maintain_con_pi_sin_aprobacion_no_corre(self):
+        self._cfg(escalera="pi")
+        code, llamados, _, err = self._cmd("maintain")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(llamados, [])
+        self.assertIn("harness maintain --plan", err)
+
+    def test_proponer_con_pi_sin_aprobacion_no_corre(self):
+        self._cfg(escalera="pi")
+        code, llamados, _, err = self._cmd("proponer")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(llamados, [])
+
+    def test_maintain_con_tope_sin_aprobacion_no_corre(self):
+        self._cfg(topes={"max_usd": 5})
+        code, llamados, _, _ = self._cmd("maintain")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(llamados, [])
+
+    def test_maintain_aprobado_corre_con_el_techo(self):
+        self._cfg(escalera="pi", topes={"max_usd": 5})
+        code, _, out, err = self._cmd("maintain", ["--plan"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("maintain", out)
+        code, _, err = self._main(["aprobar", "--si"])
+        self.assertEqual(code, 0, err)
+        code, llamados, _, err = self._cmd("maintain")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(llamados), 1)
+        self.assertEqual(self.cli.TECHOS_USD["h"], 5)
+
+    def test_proponer_aprobado_corre(self):
+        self._cfg(escalera="pi", topes={"max_usd": 2})
+        self._cmd("proponer", ["--plan"])
+        self._main(["aprobar", "--si"])
+        code, llamados, _, err = self._cmd("proponer")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(llamados), 1)
+
+    def test_sin_pi_ni_tope_corre_con_tope_cero(self):
+        self._cfg()
+        code, llamados, _, err = self._cmd("maintain")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(llamados), 1)
+        self.assertEqual(self.cli.TECHOS_USD["h"], 0)
+
+    def test_sin_aprobacion_con_tope_pero_sin_pi_corre_con_tope_cero(self):
+        self._cfg(topes={"max_usd": 5})
+        code, llamados, _, err = self._cmd("maintain", ["--sin-aprobacion"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(llamados), 1)
+        self.assertEqual(self.cli.TECHOS_USD["h"], 0)
+
+    def test_sin_aprobacion_con_pi_se_niega(self):
+        self._cfg(escalera="pi")
+        code, llamados, _, _ = self._cmd("proponer", ["--sin-aprobacion"])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(llamados, [])
+
+    def test_ideas_sin_puerta(self):
+        self._cfg(escalera="pi", topes={"max_usd": 5})
+        code, llamados, _, err = self._cmd("ideas")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(llamados), 1)
 
 
 class SinAprobacionManual(_Cli):
