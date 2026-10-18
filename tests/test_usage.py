@@ -1112,5 +1112,28 @@ class TestFuenteEnElEstado(unittest.TestCase):
         self.assertTrue(notas[0].startswith("statusline:"), notas)
 
 
+# ----------------------------- #159 revisión 4: capturado en el futuro
+class TestCapturadoEnElFuturo(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ruta = Path(self.tmp.name) / "harness" / "rate_limits.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_del_futuro_no_cuenta_como_fresco(self):
+        usage.escribir_rate_limits(dict(STDIN_STATUSLINE), self.ruta,
+                                   AHORA + timedelta(minutes=5))
+        u, motivo = usage.leer_rate_limits(self.ruta, AHORA, timedelta(minutes=10))
+        self.assertIsNone(u)
+        self.assertIn("futuro", motivo)
+
+    def test_un_desajuste_chico_de_reloj_se_tolera(self):
+        usage.escribir_rate_limits(dict(STDIN_STATUSLINE), self.ruta,
+                                   AHORA + timedelta(seconds=30))
+        u, _ = usage.leer_rate_limits(self.ruta, AHORA, timedelta(minutes=10))
+        self.assertIsNotNone(u)
+
+
 if __name__ == "__main__":
     unittest.main()
