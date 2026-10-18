@@ -54,8 +54,13 @@ seguía el viejo `repos.conf`.
 | `quota.projects` | opcional: la lista de directorios de sesiones que lee `harness quota` (#75). Sin declarar, mira un solo usuario del sistema (`~/.claude/projects`); con la lista suma los declarados (p.ej. otro usuario de la máquina que comparte la cuenta). `--projects` por coma gana sobre la config. Una fuente ilegible se salta, se dice cuál y por qué, y el total se marca como piso (`≥` / `"completa": false`) |
 | `quota.remotas` | opcional: lista de fuentes remotas por SSH (`"user@host"`) que suma `harness quota` (#144): el usuario del 9-5 comparte la misma bolsa semanal de la cuenta. El consumo se lee corriendo `scripts/quota_remota.py --json` en el host (timeout corto, 30 s). `--remotas` por coma gana sobre la config. Si el SSH falla, la fuente cuenta como ilegible y el total se marca como piso, igual que con `projects` |
 | `quota.umbral_sesion`, `quota.reserva_diaria`, `quota.costo_ticket`, `quota.hora_limite`, `quota.statusline_max_edad_min` | opcionales: la política de `harness run` sobre la cuota real (`harness usage`). Defaults 0.90, 0.08, 0.02, `"07:00"` y 10 min; qué hace cada uno en `docs/harness/quota.md` |
+| `topes.budget_minutos` | opcional: el presupuesto de reloj por ticket de `harness run` — minutos de agente acumulados en el historial de la noche. Default 180 (documentado en `RunTopes` en `harness/config.py`). Un ticket que llegó hasta acá se parkea con su motivo (#116) |
+| `topes.piso`, `topes.max_pasadas` | opcionales: los topes del bucle de `harness run --loop` — piso de crédito restante en US$ (default 3.00) y tope duro de pasadas con trabajo (default 12). La CLI (`--piso`, `--max-pasadas`) puede acotarla más, pero no amplificarla por encima de la config (#166) |
 
-`vault` y `quota` son opcionales; todo lo demás es obligatorio. Un campo de más o un valor que no
+`vault`, `quota` y `topes` son opcionales; todo lo demás es obligatorio. Los topes se
+releen de la config en cada corrida/pasada: una corrida que dura la noche no corre con
+la foto que tomó al arranque, y si la config deja de poder leerse la corrida se detiene
+con el motivo (#163/#164/#166). Un campo de más o un valor que no
 existe son error: el harness sale con código 2 y una línea que dice qué contexto y
 qué campo hay que arreglar.
 

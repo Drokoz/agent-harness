@@ -9,8 +9,8 @@ import unittest
 
 import support
 
-from harness.config import (DEFAULT_CONFIG, Config, ConfigError, default_config,
-                            parse_config)
+from harness.config import (DEFAULT_CONFIG, Config, ConfigError, RunTopes,
+                            default_config, parse_config)
 
 
 def ctx(**over):
@@ -289,6 +289,56 @@ class TestErroresClaros(unittest.TestCase):
     def test_el_error_dice_de_que_contexto_habla(self):
         self.esperar({"contexts": {"personal": ctx(), "trabajo": ctx(autonomy="auto")}},
                      'contexto "trabajo"')
+
+
+class TestTopes(unittest.TestCase):
+    """#166: los topes de la corrida se declaran en la config, no duermen
+    en el código."""
+
+    def test_sin_seccion_los_defaults_documentados(self):
+        t = parse_config(conf(personal=ctx())).contexts[0].topes
+        self.assertEqual((t.budget_minutos, t.piso, t.max_pasadas),
+                         (180.0, 3.0, 12))
+        self.assertEqual((RunTopes().budget_minutos, RunTopes().piso,
+                          RunTopes().max_pasadas), (180.0, 3.0, 12))
+
+    def test_topes_se_declaran_en_config(self):
+        t = parse_config(conf(personal=ctx(
+            topes={"budget_minutos": 60, "piso": 1.5, "max_pasadas": 4})),
+        ).contexts[0].topes
+        self.assertEqual((t.budget_minutos, t.piso, t.max_pasadas),
+                         (60.0, 1.5, 4))
+
+    def test_topes_parciales_mezclan_con_los_defaults(self):
+        t = parse_config(conf(personal=ctx(topes={"piso": 2.0}))).contexts[0].topes
+        self.assertEqual((t.budget_minutos, t.piso, t.max_pasadas),
+                         (180.0, 2.0, 12))
+
+    def test_tope_desconocido_es_error(self):
+        with self.assertRaises(ConfigError) as e:
+            parse_config(conf(personal=ctx(topes={"tope": 1})))
+        self.assertIn('"tope"', str(e.exception))
+
+    def test_topes_no_objeto_es_error(self):
+        with self.assertRaises(ConfigError):
+            parse_config(conf(personal=ctx(topes=[1, 2])))
+
+    def test_piso_negativo_es_error(self):
+        with self.assertRaises(ConfigError) as e:
+            parse_config(conf(personal=ctx(topes={"piso": -1})))
+        self.assertIn('"piso"', str(e.exception))
+
+    def test_max_pasadas_cero_o_no_entero_es_error(self):
+        for v in (0, "12", 1.5, True):
+            with self.subTest(v=v):
+                with self.assertRaises(ConfigError) as e:
+                    parse_config(conf(personal=ctx(topes={"max_pasadas": v})))
+                self.assertIn('"max_pasadas"', str(e.exception))
+
+    def test_el_error_dice_de_que_contexto_habla(self):
+        with self.assertRaises(ConfigError) as e:
+            parse_config(conf(personal=ctx(topes={"piso": -1})))
+        self.assertIn('contexto "personal"', str(e.exception))
 
 
 class TestSecretos(unittest.TestCase):
