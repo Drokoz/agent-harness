@@ -27,7 +27,8 @@ from harness.quota import (PESOS, agregar, as_dict, atribuir, codificar_path,
                            cuota_por_ventana, decodificar_uso, fuentes_desde_spec,
                            leer_fuentes, leer_sesiones, parsear_linea, pico_5h,
                            ponderar, puntos_de_ticket, render_quota,
-                           resumen_evento, semana_de, semana_inicio)
+                           resumen_evento, semana_de, semana_inicio,
+                           semana_reset)
 
 HARNESS = support.ROOT / "bin" / "harness"
 SESIONES = support.FIXTURES / "claude_sessions"
@@ -249,6 +250,23 @@ class TestResetEnUtc(unittest.TestCase):
         self.assertNotIn("reset vie 17:00", texto)
         self.assertIn("vie 21:00 UTC", texto)
         self.assertIn("2026-10-16 18:00", texto)
+
+
+class TestSemanaReset(unittest.TestCase):
+    """Revisión de #159: el reset siguiente se suma en UTC; sumar 7 días de
+    reloj local daba 1 h de error en las semanas de cambio de horario."""
+
+    def test_semana_del_cambio_de_abril(self):
+        self.assertEqual(semana_reset(dt("2027-04-05T12:00:00")),
+                         dt("2027-04-09T21:00:00"))
+
+    def test_semana_del_cambio_de_septiembre(self):
+        self.assertEqual(semana_reset(dt("2027-09-06T12:00:00")),
+                         dt("2027-09-10T21:00:00"))
+
+    def test_en_el_reset_es_el_siguiente(self):
+        self.assertEqual(semana_reset(dt("2026-10-23T21:00:00")),
+                         dt("2026-10-30T21:00:00"))
 
 
 class TestPico5h(unittest.TestCase):
