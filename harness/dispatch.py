@@ -230,7 +230,44 @@ def podar_transcripciones(dir, repo, issue, keep=TRANSCRIPCIONES_POR_TICKET,
     return borrados
 
 
-def prompt_de(issue, gate_tail=None, wip=None, parent_intencion=None):
+def log_intentos_path(repo_path, issue):
+    """La bitácora de intentos del ticket (#156): un archivo por ticket,
+    junto a las transcripciones (#66), fuera del checkout y fuera del
+    commit. El worktree se borra entre intentos, así que la durabilidad
+    vive acá y, al arrancar el siguiente intento, se copia al worktree
+    como `attempt-log.md` (fuera del commit) para que el agente la lea.
+    El nombre lleva el repo porque dos repos pueden tener el mismo
+    número."""
+    return Path(repo_path).parent / ".worktrees" / \
+        "{}-attempt-log-{}.md".format(Path(repo_path).name, issue)
+
+
+def entrada_log_intentos(job, motivo, detalle="", intentos_previos=()):
+    """Una entrada de bitácora de intentos (#156), en markdown:
+    qué se intentó (el peldaño: runner, modelo, args), la clase del error
+    del gate y las últimas líneas relevantes, y la sección "No repetir" con
+    los motivos de los intentos anteriores. Devuelve la entrada ya lista
+    para agregarla a la bitácora; el harness la escribe después de cada
+    intento fallido."""
+    partes = ["## Intento {} · {}".format(job.attempt, _ahora()),
+              "- runner/modelo: {} {}".format(job.kind or "?",
+                                               job.model or ""),
+              "- motivo: {}".format(motivo)]
+    if job.extra_args:
+        partes.append("- args: {}".format(" ".join(job.extra_args)))
+    if detalle:
+        nl = chr(10)
+        fence = nl.join(["```", str(detalle).strip()[-300:], "```"])
+        partes.append(fence)
+    previos = [m for m in intentos_previos if m]
+    if previos:
+        partes.append("### No repetir")
+        partes.extend("- {}".format(m) for m in previos)
+    return "\n".join(partes) + "\n"
+
+
+def prompt_de(issue, gate_tail=None, wip=None, parent_intencion=None,
+              log_intentos=None):
     """El trabajo de un agente, en una línea. En inglés: es machine-facing.
 
     `gate_tail` es la cola del gate rojo del intento anterior (peldaño 2 de
@@ -247,6 +284,13 @@ def prompt_de(issue, gate_tail=None, wip=None, parent_intencion=None):
     y exige que la decisión quede registrada en el log (el primer commit
     del intento), para poder medir cuál de las dos funciona mejor.
     Sin WIP, el prompt es el de siempre, sin ruido extra.
+
+    `log_intentos` (#156) es el contenido de la bitácora de intentos del
+    ticket (`attempt-log.md` en el worktree, fuera del commit): qué se
+    intentó en los reintentos previos, la clase del error del gate y qué
+    no repetir. Con ella, el prompt le dice al agente que lea la bitácora
+    ANTES de empezar, para que el reintento no arranque a ciegas. Sin
+    bitácora (primer intento, o sin archivo), el prompt es el de siempre.
 
     `parent_intencion` (#142, el "Refocus" de OpenRig): la cadena de
     intención del ticket (título + primera frase del spec padre, ya
@@ -296,6 +340,13 @@ def prompt_de(issue, gate_tail=None, wip=None, parent_intencion=None):
             "either, leave the extra work OUT and list it as a follow-up in "
             "the PR description instead of implementing it.".format(
                 una_linea(parent_intencion))
+        )
+    if log_intentos:
+        texto += (
+            " An attempt log for this ticket exists in this worktree at "
+            "attempt-log.md (outside the commits): read it FIRST, before "
+            "starting, and do not repeat the failed attempts it records. "
+            "Contents: {}".format(una_linea(log_intentos))
         )
     return una_linea(texto)
 
@@ -963,6 +1014,15 @@ class Job:
     # (mantenedor, tests que no lo necesitan): sin intención, prompt
     # de siempre.
     body: str = ""
+    # El contenido de la bitácora de intentos del ticket (#156): lo que
+    # el reintento ya sabe de los intentos fallidos previos, para que el
+    # prompt no arranque a ciegas. Lo resuelve `bin/harness` leyendo
+    # `attempt-log.md` del worktree reutilizado; "" = primer intento o sin
+    # bitácora: prompt de siempre.
+    log_intentos: str = ""
+    # La cola del gate rojo de este intento (#156): la última evidencia
+    # relevante para la bitácora. "" = sin gate rojo (o gate no corrió).
+    gate_cola: str = ""
 
 
 @dataclass
@@ -1081,7 +1141,8 @@ class Dispatcher:
 
     def _prompt(self, job):
         return prompt_de(job.issue, job.gate_tail, job.wip,
-                         parent_intencion=self._intencion_de(job))
+                         parent_intencion=self._intencion_de(job),
+                         log_intentos=job.log_intentos or None)
 
     def _intencion_de(self, job):
         """(#142) La cadena de intención del ticket: la del spec padre
@@ -1121,6 +1182,11 @@ class Dispatcher:
 
     def _transcripcion_destino(self, job):
         return transcripcion_path(job.repo_path, job.issue, job.attempt)
+
+    def _clave_log_intentos(self, job):
+        """(#156) Con qué se clave la bitácora del ticket: el issue para
+        un ticket; el mantenedor la rellena al número de PR (#56)."""
+        return job.issue
 
     def _podar_transcripciones(self, dir, job):
         return podar_transcripciones(dir, Path(job.repo_path).name, job.issue)
@@ -1415,8 +1481,28 @@ class Dispatcher:
         ok = self._reintentar_infra(job, ref, "no se pudo crear el worktree",
                                     lambda: self._worktree(job, ref))
         if ok:
+            self._copiar_log_intentos(job, ref)
             self._log(job, "worktree", ref, job.worktree)
         return ok
+
+    def _copiar_log_intentos(self, job, ref):
+        """(#156) La bitácora durable del ticket va al worktree como
+        `attempt-log.md` (fuera del commit) para que el agente la lea
+        donde su prompt la señala. Sin bitácora (primer intento) no hay
+        nada que copiar; un fallo de disco no tumba la corrida."""
+        destino_persistent = None
+        try:
+            destino_persistent = log_intentos_path(job.repo_path,
+                                                   self._clave_log_intentos(job))
+        except (AttributeError, TypeError):
+            return
+        if not (destino_persistent and destino_persistent.is_file()):
+            return
+        try:
+            (Path(job.worktree) / "attempt-log.md").write_bytes(
+                destino_persistent.read_bytes())
+        except OSError:
+            pass
 
     def _pane(self, job, ref):
         """Un pane de herdr con el cwd en el worktree; sin robar el foco."""
@@ -1806,7 +1892,9 @@ class Dispatcher:
         if ok:
             self._log(job, "gate", ref, "verde")
             return True
-        self._log(job, "gate", ref, "rojo: " + out.strip()[-200:])
+        cola = out.strip()[-200:]
+        job.gate_cola = cola
+        self._log(job, "gate", ref, "rojo: " + cola)
         self._abandonar(job, ref, "gate rojo en el worktree: sin PR",
                         clase="modelo", firme=True)
         return False
@@ -2173,6 +2261,9 @@ class Dispatcher:
         job.motivo = motivo
         job.clase_abandono = clase
         self._log(job, "abandono", ref, motivo, clase=clase)
+        # (#156) El reintento no arranca a ciegas: la bitácora queda en el
+        # worktree (fuera del commit) antes de que `_limpiar` lo borre.
+        self._escribir_log_intentos(job, ref)
         if sacar:
             self._marcar_para_humano(job, ref)
 
@@ -2186,6 +2277,48 @@ class Dispatcher:
                                                       self._desde))
         except Exception:
             return (None, "")
+
+    def _escribir_log_intentos(self, job, ref):
+        """(#156) Después de un intento fallido, la bitácora del ticket:
+        `attempt-log.md` en el worktree, fuera del commit. Qué se intentó
+        (el peldaño), el motivo del gate, las últimas líneas relevantes y
+        "no repetir" los motivos de los intentos anteriores. El prompt del
+        siguiente intento la incluye (`bin/harness` la resuelve leyendo
+        este archivo en `job.log_intentos`).
+
+        Un intento que ni arrancó agente no deja nada que repetir
+        (no hay veredicto sobre el trabajo): no se escribe. Best-effort:
+        un fallo de disco no tumba la corrida."""
+        if not job.agent:
+            return
+        try:
+            destino = log_intentos_path(job.repo_path,
+                                        self._clave_log_intentos(job))
+        except (AttributeError, TypeError):
+            return
+        previos = []
+        contenido_previo = ""
+        try:
+            if destino.is_file():
+                contenido_previo = destino.read_text(encoding="utf-8")
+                for linea in contenido_previo.splitlines():
+                    if linea.startswith("- motivo: "):
+                        previos.append(linea[len("- motivo: "):].strip())
+        except OSError:
+            contenido_previo, previos = "", []
+        previos = [m for m in previos if m and m != job.motivo]
+        cabecera = ("" if contenido_previo else
+                    "# Bitácora de intentos · ticket {}\n\n".format(job.issue))
+        entrada = entrada_log_intentos(job, job.motivo,
+                                       detalle=getattr(job, "gate_cola", ""),
+                                       intentos_previos=previos)
+        try:
+            destino.parent.mkdir(parents=True, exist_ok=True)
+            destino.write_text(cabecera + contenido_previo + entrada,
+                               encoding="utf-8")
+        except OSError:
+            return
+        self._log(job, "log-intentos", ref, str(destino))
 
     def _reintentar_infra(self, job, ref, motivo, intentar):
         """Reintenta `intentar()` (sin argumentos, devuelve bool) en el

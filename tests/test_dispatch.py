@@ -22,7 +22,8 @@ import support
 from harness import adapters, dispatch, state
 from harness.dispatch import (ESCALERA, DispatchSpec, Dispatcher, EventLog, Job,
                               SKILLS_IMPLEMENTADOR, args_sesion_minima, cosechar,
-                              decidir_tanda, intencion_padre, nombre_agente,
+                              decidir_tanda, entrada_log_intentos,
+                              intencion_padre, log_intentos_path, nombre_agente,
                               padre_de, peldano_de, prompt_de, skills_de,
                               una_linea, worktree_path)
 
@@ -166,12 +167,12 @@ def spec(**kw):
 def job(issue=7, repo="koku", path="/repos/koku", slug="Drokoz/koku",
         attempt=1, kind="", model="", extra_args=(), gate_tail=None,
         wip=None, minutos_acumulado=0.0, skills=SKILLS_IMPLEMENTADOR,
-        body=None):
+        body=None, log_intentos=""):
     return Job(repo=repo, repo_path=path, slug=slug, issue=issue,
                attempt=attempt, kind=kind, model=model,
                extra_args=extra_args, gate_tail=gate_tail, wip=wip,
                minutos_acumulado=minutos_acumulado, skills=skills,
-               body=body)
+               body=body, log_intentos=log_intentos)
 
 
 def job_de_peldano(escalados, **kw):
@@ -2422,6 +2423,124 @@ class TestWipEnElPrompt(unittest.TestCase):
         self.assertIn("boom", texto)
         self.assertIn("WIP", texto)
         self.assertNotIn("\n", texto)
+
+
+class TestLogIntentosEnElPrompt(unittest.TestCase):
+    """(#156) La bitácora de intentos del ticket: después de un intento
+    fallido, el harness la escribe fuera del commit, y el prompt del
+    siguiente intento la lleva. Cruza con #142: el prompt puede llevar la
+    intención del spec padre Y la bitácora, sin duplicar."""
+
+    def _prompt_enviado(self, m):
+        (prompt,) = m.llamo("herdr", "agent", "prompt")
+        return prompt[0][4]
+
+    def test_entrada_lleva_peldano_motivo_y_no_repetir(self):
+        j = job(kind="pi", model="qwen/qwen3.8-27b",
+                extra_args=("--thinking", "high"))
+        e = entrada_log_intentos(j, "gate rojo en el worktree: sin PR",
+                                 detalle="ROJO: unittest\nboom",
+                                 intentos_previos=("arbol sucio",))
+        self.assertIn("runner/modelo: pi qwen/qwen3.8-27b", e)
+        self.assertIn("--thinking high", e)
+        self.assertIn("- motivo: gate rojo en el worktree: sin PR", e)
+        self.assertIn("boom", e)
+        self.assertIn("No repetir", e)
+        self.assertIn("- arbol sucio", e)
+        self.assertIn("## Intento 1", e)
+
+    def test_sin_bitacora_el_prompt_es_el_de_siempre(self):
+        self.assertEqual(prompt_de(7), prompt_de(7, log_intentos=None))
+        self.assertEqual(prompt_de(7), prompt_de(7, log_intentos=""))
+        self.assertNotIn("attempt log", prompt_de(7))
+
+    def test_el_prompt_con_bitacora_va_en_una_sola_linea(self):
+        p = prompt_de(7, log_intentos="## Intento 1\n- motivo: gate rojo\n")
+        self.assertNotIn("\n", p)
+        self.assertIn("attempt log", p)
+        self.assertIn("attempt-log.md", p)
+        self.assertIn("do not repeat", p)
+        self.assertIn("- motivo: gate rojo", p)
+
+    def test_bitacora_e_intencion_viajan_juntos_sin_duplicar(self):
+        """#142 + #156: las dos adiciones conviven en una sola línea."""
+        p = prompt_de(7, parent_intencion="Spec: Flota \u2014 una flota que corre de noche",
+                      log_intentos="## Intento 1\n- motivo: gate rojo\n")
+        self.assertNotIn("\n", p)
+        self.assertIn("This issue serves", p)
+        self.assertIn("attempt log", p)
+        self.assertEqual(p.count("Spec: Flota"), 1,
+                         "la intención no se duplica en la bitácora")
+
+    def test_bitacora_no_entra_a_los_commits_del_pr(self):
+        """La bitácora vive fuera del commit: con `attempt-log.md`
+        ignorado, ni aparece como cambio sin commitear ni entra al
+        `git add -A` del dispatcher -- así que no entra a la rama ni al
+        PR."""
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "koku-ticket-7"
+            wt.mkdir()
+            (wt / ".gitignore").write_text("attempt-log.md\n")
+            (wt / "attempt-log.md").write_text(
+                "## Intento 1\n- motivo: gate rojo\n")
+            subprocess.run(["git", "init", "-b", "main"], cwd=wt, check=True,
+                           capture_output=True, text=True)
+            out = subprocess.run(["git", "-C", str(wt), "status",
+                                  "--porcelain"], check=True,
+                                 capture_output=True, text=True).stdout
+            self.assertEqual(out.strip(), "?? .gitignore",
+                             "attempt-log.md ignorado: no entra al PR")
+            # El WIP del dispatcher hace `git add -A`: la bitácora queda
+            # afuera del índice igual.
+            subprocess.run(["git", "-C", str(wt), "add", "-A"], check=True,
+                           capture_output=True, text=True)
+            lst = subprocess.run(["git", "-C", str(wt), "ls-files"],
+                                 check=True, capture_output=True,
+                                 text=True).stdout
+            self.assertNotIn("attempt-log.md", lst)
+            self.assertIn(".gitignore", lst)
+
+    def test_un_intento_fallido_escribe_la_bitacora(self):
+        """Gate rojo: el dispatcher deja la bitácora (con la cola del
+        gate y el motivo) en el path durable, antes de limpiar."""
+        m = Mundo(gate=(False, "ROJO: unittest\nAssertionError: 1 == 2"))
+        with tempfile.TemporaryDirectory() as tmp:
+            res, lineas = self._despachar_en(m, tmp)
+            self.assertEqual(res[0].estado, "abandonado", res[0].motivo)
+            destino = log_intentos_path(str(Path(tmp) / "koku"), 7)
+            self.assertTrue(destino.is_file(), "la bitácora queda en el disco")
+            contenido = destino.read_text(encoding="utf-8")
+            self.assertIn("gate rojo en el worktree: sin PR", contenido)
+            self.assertIn("AssertionError: 1 == 2", contenido,
+                          "la cola del gate queda como evidencia")
+            self.assertIn("log-intentos", [l["tipo"] for l in lineas])
+
+    def test_el_segundo_intento_recibe_la_bitacora_en_el_prompt(self):
+        """Después de un intento fallido simulado (bitácora ya en el
+        disco), el prompt del siguiente contiene la bitácora con el
+        error del anterior."""
+        m = Mundo()
+        j = job(log_intentos="## Intento 1\n- motivo: gate rojo en el "
+                              "worktree: sin PR\n- runner/modelo: pi qwen\n")
+        despachar(m, [j])
+        texto = self._prompt_enviado(m)
+        self.assertIn("attempt log", texto)
+        self.assertIn("gate rojo en el worktree: sin PR", texto)
+        self.assertNotIn("\n", texto)
+
+    def test_un_job_sin_bitacora_envia_el_prompt_de_siempre(self):
+        m = Mundo()
+        despachar(m, [job()])
+        self.assertNotIn("attempt log", self._prompt_enviado(m))
+
+    def _despachar_en(self, m, tmp):
+        with tempfile.TemporaryDirectory() as tmp2:
+            log = log_en(tmp2)
+            j = job(issue=7, path=str(Path(tmp) / "koku"))
+            d = Dispatcher(spec(), log, m.cmd, dormir=m.dormir)
+            res = d.dispatch([j])
+            lineas = [json.loads(l) for l in log.path.read_text().splitlines()]
+        return res, lineas
 
 
 class TestRouterSeam(unittest.TestCase):

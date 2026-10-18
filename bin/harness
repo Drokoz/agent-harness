@@ -195,9 +195,9 @@ from harness import doctor as doctor_mod  # noqa: E402
 from harness import routing as routing_mod  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
 from harness.dispatch import (BucleSpec, DispatchSpec, Dispatcher, EventLog,  # noqa: E402
+                              log_intentos_path, motivo_presupuesto_reloj,
                               Job, Pasada, bucle, cosechar, decidir_tanda,
-                              motivo_presupuesto_reloj, peldano_de,
-                              skills_de, transcripcion_path)
+                              peldano_de, skills_de, transcripcion_path)
 from harness.ideas import (IDEAS_CLAUDE, IDEAS_OPUS, Ideas,  # noqa: E402
                            MAX_IDEAS_DEFAULT, debe_correr,
                            guardar_ultima_corrida, leer_ideas_vault,
@@ -626,6 +626,18 @@ def _ahora_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _log_intentos_de(repo_path, issue):
+    """(#156) El contenido de la bitácora de intentos del ticket, para el
+    prompt del reintento: qué se intentó, la clase del error del gate y
+    qué no repetir. Sin bitácora (primer intento) o con un fallo de
+    disco, "": el prompt queda el de siempre."""
+    try:
+        p = log_intentos_path(repo_path, issue)
+        return p.read_text(encoding="utf-8") if p.is_file() else ""
+    except (OSError, TypeError):
+        return ""
+
+
 def resumen_de(args, snap, contexts, quota_agg, quota_registros):
     """El resumen de la mañana: el log de eventos desde la última vez que se
     miró (o desde `--since`), más los PRs abiertos que trae el snapshot.
@@ -975,6 +987,9 @@ def run_main(args, contexts, solo=None):
                 if wip is not None:
                     wip = (wip[0], wip[1],
                            str(transcripcion_path(r.path, i.number, wip[0])))
+                # (#156) la bitácora de los intentos fallidos previos: el
+                # prompt del reintento la lleva, para no arrancar a ciegas.
+                log_intentos = _log_intentos_de(r.path, i.number)
                 # Los minutos de agente de ESTA noche (#116): con ellos el
                 # presupuesto de reloj sabe si el ticket ya se la comió. Se
                 # cuentan desde que arrancó el proceso, no sobre el log
@@ -991,6 +1006,7 @@ def run_main(args, contexts, solo=None):
                                       # intención del spec para el prompt.
                                       skills=skills_de(i.body), body=i.body,
                                       gate_tail=gate_tail, wip=wip,
+                                      log_intentos=log_intentos,
                                       minutos_acumulado=minutos))
         # El tamaño de la tanda lo decide el presupuesto (#68): los
         # créditos que quedan contra el costo medio del historial, más el
@@ -1145,6 +1161,9 @@ def _una_pasada(args, ctx, log):
             if wip is not None:
                 wip = (wip[0], wip[1],
                        str(transcripcion_path(r.path, i.number, wip[0])))
+            # (#156) la bitácora de los intentos fallidos previos: el
+            # prompt del reintento la lleva, para no arrancar a ciegas.
+            log_intentos = _log_intentos_de(r.path, i.number)
             # El presupuesto de reloj (#116): un ticket que ya agotó los
             # minutos de agente de la corrida se queda fuera con su motivo
             # -- no es un abandono, no gasta peldaño -- y la próxima noche
@@ -1169,6 +1188,7 @@ def _una_pasada(args, ctx, log):
                             # #142: el body también lleva `## Parent`.
                             skills=skills_de(i.body), body=i.body,
                             gate_tail=gate_tail, wip=wip,
+                            log_intentos=log_intentos,
                             minutos_acumulado=minutos))
     jobs = _filtrar_por_cuota(args, cuota, jobs, log)
     if not jobs:
