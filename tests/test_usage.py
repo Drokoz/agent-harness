@@ -18,6 +18,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -249,6 +250,13 @@ class TestCaptura(unittest.TestCase):
         self.assertNotIn("Refreshing", texto)
         self.assertIn("Current week (Fable)", texto)
         self.assertTrue(dormidas)
+
+    def test_si_el_primer_read_no_trae_los_buckets_lee_de_nuevo(self):
+        # Visto en legion: wait-output ya vio "Current week" pero el read
+        # inmediato devolvió la pantalla de antes.
+        h = Herdr(lecturas=["❯ shift+tab", "❯ /usage", fixture("usage_completo.txt")])
+        texto, _ = capturar(h, pane_base="w1:p1", cwd="/r", dormir=lambda s: None)
+        self.assertIn("Current session", texto)
 
     def test_si_nunca_termina_de_refrescar_lo_avisa(self):
         h = Herdr(lecturas=["❯ shift+tab", fixture("usage_refrescando.txt")])
@@ -558,6 +566,163 @@ class TestCuota(unittest.TestCase):
         self.assertIn("96%", motivo)
 
 
+# ------------------------------------------------- statusline (rate_limits)
+# Lo que Claude Code le pasa por stdin al comando de statusline (2.1.296,
+# capturado en legion): `rate_limits` aparece después de la primera
+# respuesta del modelo y no trae el bucket por modelo.
+STDIN_STATUSLINE = {
+    "session_id": "abc-123", "cwd": "/home/drokoz/Documents/Github",
+    "model": {"id": "claude-opus-5-5", "display_name": "Opus 5.5"},
+    "version": "2.1.296",
+    "rate_limits": {"five_hour": {"used_percentage": 22,
+                                  "resets_at": 1792296600},
+                    "seven_day": {"used_percentage": 6,
+                                  "resets_at": 1792789200}},
+}
+
+
+class TestStatusline(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ruta = Path(self.tmp.name) / "harness" / "rate_limits.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_escribe_rate_limits_con_captura_y_sesion(self):
+        self.assertTrue(usage.escribir_rate_limits(
+            dict(STDIN_STATUSLINE), self.ruta, AHORA))
+        data = json.loads(self.ruta.read_text())
+        self.assertEqual(data["rate_limits"], STDIN_STATUSLINE["rate_limits"])
+        self.assertEqual(data["capturado"], AHORA.isoformat())
+        self.assertEqual(data["session_id"], "abc-123")
+        # Escritura atómica: no queda el temporal al lado.
+        self.assertEqual([p.name for p in self.ruta.parent.iterdir()],
+                         ["rate_limits.json"])
+
+    def test_sin_rate_limits_no_pisa_el_archivo_bueno(self):
+        usage.escribir_rate_limits(dict(STDIN_STATUSLINE), self.ruta, AHORA)
+        antes = self.ruta.read_text()
+        sin = {k: v for k, v in STDIN_STATUSLINE.items() if k != "rate_limits"}
+        self.assertFalse(usage.escribir_rate_limits(sin, self.ruta, AHORA))
+        self.assertEqual(self.ruta.read_text(), antes)
+
+    def test_lee_el_archivo_fresco(self):
+        usage.escribir_rate_limits(dict(STDIN_STATUSLINE), self.ruta, AHORA)
+        u, motivo = usage.leer_rate_limits(self.ruta, AHORA + timedelta(minutes=3),
+                                           timedelta(minutes=10))
+        self.assertEqual(motivo, "")
+        self.assertEqual((u.sesion.pct, u.semana.pct), (22, 6))
+        self.assertEqual(u.sesion.reset,
+                         datetime.fromtimestamp(1792296600, SCL))
+        self.assertEqual(u.semana.reset,
+                         datetime.fromtimestamp(1792789200, SCL))
+        self.assertEqual(str(u.sesion.reset.tzinfo), "America/Santiago")
+        self.assertEqual(u.sesion.fuente, "statusline")
+        self.assertEqual(u.sesion.leido, AHORA)
+        self.assertEqual(u.por_modelo, [])
+
+    def test_viejo_no_se_usa(self):
+        usage.escribir_rate_limits(dict(STDIN_STATUSLINE), self.ruta, AHORA)
+        u, motivo = usage.leer_rate_limits(self.ruta, AHORA + timedelta(minutes=11),
+                                           timedelta(minutes=10))
+        self.assertIsNone(u)
+        self.assertIn("11 min", motivo)
+
+    def test_sin_archivo_o_roto(self):
+        u, motivo = usage.leer_rate_limits(self.ruta, AHORA, timedelta(minutes=10))
+        self.assertIsNone(u)
+        self.assertIn("no existe", motivo)
+        self.ruta.parent.mkdir(parents=True)
+        for roto in ("{", '{"capturado": "x"}', json.dumps({
+                "capturado": AHORA.isoformat(),
+                "rate_limits": {"five_hour": {"used_percentage": "mucho"}}})):
+            self.ruta.write_text(roto)
+            with self.subTest(roto=roto):
+                u, motivo = usage.leer_rate_limits(self.ruta, AHORA,
+                                                   timedelta(minutes=10))
+                self.assertIsNone(u)
+                self.assertTrue(motivo)
+
+
+class TestEleccionDeFuente(unittest.TestCase):
+    def setUp(self):
+        self.fresca = Usage(Bucket("Current session", 22, AHORA, "statusline", AHORA),
+                            Bucket("Current week (all models)", 6, AHORA,
+                                   "statusline", AHORA))
+        self.capturada = parsear_usage(fixture("usage_homeserver.txt"), AHORA)
+        self.capturas = 0
+
+    def capturar(self):
+        self.capturas += 1
+        return self.capturada
+
+    def test_statusline_fresca_gana_y_no_abre_pane(self):
+        u = usage.leer_cuota(lambda: (self.fresca, ""), self.capturar)
+        self.assertIs(u, self.fresca)
+        self.assertEqual(self.capturas, 0)
+
+    def test_sin_statusline_captura_usage(self):
+        u = usage.leer_cuota(lambda: (None, "viejo: 30 min"), self.capturar)
+        self.assertIs(u, self.capturada)
+        self.assertEqual(self.capturas, 1)
+
+    def test_forzar_usage(self):
+        u = usage.leer_cuota(lambda: (self.fresca, ""), self.capturar,
+                             fuente="usage")
+        self.assertIs(u, self.capturada)
+
+    def test_solo_statusline_sin_archivo_es_ilegible(self):
+        with self.assertRaises(UsageIlegible) as cm:
+            usage.leer_cuota(lambda: (None, "no existe"), self.capturar,
+                             fuente="statusline")
+        self.assertIn("no existe", str(cm.exception))
+        self.assertEqual(self.capturas, 0)
+
+    def test_las_dos_fallan_dice_las_dos(self):
+        def falla():
+            raise UsageIlegible("claude no arrancó")
+        with self.assertRaises(UsageIlegible) as cm:
+            usage.leer_cuota(lambda: (None, "viejo: 30 min"), falla)
+        self.assertIn("viejo: 30 min", str(cm.exception))
+        self.assertIn("claude no arrancó", str(cm.exception))
+
+    def test_as_dict_dice_fuente_y_antiguedad_por_dato(self):
+        d = usage.as_dict(self.fresca, AHORA + timedelta(seconds=90))
+        self.assertEqual(d["fuente"], "statusline")
+        self.assertEqual(d["sesion"]["fuente"], "statusline")
+        self.assertEqual(d["sesion"]["edad_s"], 90)
+        self.assertEqual(d["sesion"]["leido"], AHORA.isoformat())
+
+
+class TestScriptStatusline(unittest.TestCase):
+    """`scripts/statusline-harness`: el comando de statusline de las
+    sesiones de Claude del harness. Lee el JSON de stdin, anota la cuota y
+    imprime una línea corta; nunca falla (una statusline rota no puede
+    tumbar la sesión)."""
+
+    SCRIPT = support.ROOT / "scripts" / "statusline-harness"
+
+    def correr(self, entrada, state):
+        env = dict(os.environ, XDG_STATE_HOME=state)
+        return subprocess.run([str(self.SCRIPT)], input=entrada, env=env,
+                              capture_output=True, text=True, timeout=30)
+
+    def test_anota_y_muestra(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self.correr(json.dumps(STDIN_STATUSLINE), d)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("22%", p.stdout)
+            data = json.loads((Path(d) / "harness" / "rate_limits.json").read_text())
+            self.assertEqual(data["rate_limits"]["seven_day"]["used_percentage"], 6)
+
+    def test_entrada_basura_no_falla(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self.correr("no es json", d)
+            self.assertEqual(p.returncode, 0)
+            self.assertFalse((Path(d) / "harness" / "rate_limits.json").exists())
+
+
 # -------------------------------------------------------------- juez (#115)
 class TestJuezConUsage(unittest.TestCase):
     def test_semana_con_cuota_corre_en_claude(self):
@@ -601,6 +766,13 @@ class TestConfig(unittest.TestCase):
                        ).contexts[0].quota
         self.assertEqual(q.politica(), PoliticaCuota(0.8, 0.05, 0.03, "06:30"))
 
+    def test_edad_maxima_de_la_statusline(self):
+        self.assertEqual(config_con({}).contexts[0].quota.statusline_max_edad_min, 10)
+        q = config_con({"statusline_max_edad_min": 3}).contexts[0].quota
+        self.assertEqual(q.statusline_max_edad_min, 3)
+        with self.assertRaises(ConfigError):
+            config_con({"statusline_max_edad_min": 0})
+
     def test_valores_invalidos(self):
         for malo in ({"umbral_sesion": 0}, {"umbral_sesion": 1.5},
                      {"reserva_diaria": -0.1}, {"costo_ticket": 0},
@@ -627,7 +799,7 @@ class TestCli(unittest.TestCase):
     def correr(self, argv, leer):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(self.cli, "OFFLINE", False), \
-             mock.patch.object(self.cli, "_leer_usage", leer), \
+             mock.patch.object(self.cli, "_capturar_usage", leer), \
              mock.patch.dict(os.environ, self.env), \
              mock.patch("sys.stdout", new=out), mock.patch("sys.stderr", new=err):
             code = self.cli.main(argv)
@@ -639,8 +811,12 @@ class TestCli(unittest.TestCase):
         self.assertEqual(code, 0)
         data = json.loads(out)
         self.assertEqual(data["fuente"], "usage")
-        self.assertEqual(data["sesion"], {"pct": 17,
-                                          "reset": "2026-10-18T01:10:00-03:00"})
+        self.assertEqual(data["sesion"]["pct"], 17)
+        self.assertEqual(data["sesion"]["reset"], "2026-10-18T01:10:00-03:00")
+        # De qué fuente vino cada dato y cuándo se leyó.
+        self.assertEqual(data["sesion"]["fuente"], "usage")
+        self.assertEqual(data["sesion"]["leido"], AHORA.isoformat())
+        self.assertIn("edad_s", data["sesion"])
         self.assertEqual(data["semana"]["pct"], 6)
         self.assertEqual(data["por_modelo"]["Fable"]["reset"],
                          "2026-10-23T18:00:00-03:00")
@@ -659,6 +835,32 @@ class TestCli(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertIn("no encuentro 'Current session'", err)
+
+    def test_con_statusline_fresca_no_abre_pane(self):
+        ruta = self.d / "state" / "harness" / "rate_limits.json"
+        ahora = datetime.now(SCL)
+        self.assertTrue(usage.escribir_rate_limits(
+            dict(STDIN_STATUSLINE), ruta, ahora - timedelta(minutes=2)))
+
+        def no_capturar(*a, **k):
+            raise AssertionError("con la statusline fresca no se abre pane")
+        code, out, _ = self.correr(["usage", "--json"], no_capturar)
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual(data["fuente"], "statusline")
+        self.assertEqual(data["sesion"]["pct"], 22)
+        self.assertEqual(data["sesion"]["fuente"], "statusline")
+        self.assertGreaterEqual(data["sesion"]["edad_s"], 100)
+        self.assertEqual(data["por_modelo"], {})
+
+    def test_fuente_usage_fuerza_el_pane(self):
+        ruta = self.d / "state" / "harness" / "rate_limits.json"
+        usage.escribir_rate_limits(dict(STDIN_STATUSLINE), ruta, datetime.now(SCL))
+        u = parsear_usage(fixture("usage_homeserver.txt"), AHORA)
+        code, out, _ = self.correr(["usage", "--json", "--fuente", "usage"],
+                                   lambda *a, **k: u)
+        self.assertEqual(json.loads(out)["fuente"], "usage")
+        self.assertIn("Fable", json.loads(out)["por_modelo"])
 
     def test_usage_offline_no_corre(self):
         with mock.patch.dict(os.environ, self.env), \
@@ -726,7 +928,7 @@ class TestRunConCuota(unittest.TestCase):
         with mock.patch.object(self.cli, "OFFLINE", False), \
              mock.patch.object(self.cli, "collect", return_value=self._raw()), \
              mock.patch.object(self.cli.adapters, "run", mundo.cmd), \
-             mock.patch.object(self.cli, "_leer_usage", usage_de), \
+             mock.patch.object(self.cli, "_capturar_usage", usage_de), \
              mock.patch.object(self.cli, "_sesiones_de_pi",
                                return_value=(lambda *a: None, lambda *a: None)), \
              mock.patch.dict(os.environ, {"HERDR_ENV": "1", "HOME": str(self.d),
