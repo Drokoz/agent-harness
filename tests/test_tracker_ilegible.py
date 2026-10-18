@@ -49,7 +49,8 @@ CONFIG_PLANTILLA = """{{
     "repos": {{"root": "{root}", "paths": [{paths}]}},
     "autonomy": "frontier",
     "budget": {{"polarity": "remaining", "provider": "openrouter"}},
-    "run": {{"kind": "local"}}}}}}
+    "run": {{"kind": "local"}},
+    "topes": {{"max_usd": 50}}}}}}
 }}"""
 
 

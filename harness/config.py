@@ -143,9 +143,16 @@ class RunTopes:
     son los topes del bucle de `run --loop` (crédito restante y pasadas
     con trabajo).
 
+    `max_usd` (#165) es el tope de gasto de la corrida en US$: un techo,
+    no un piso. Se mide lo gastado desde que arrancó el proceso y se
+    consulta antes de despachar cada job que cuesta plata (pi/OpenRouter);
+    los de Claude corren contra la suscripción y no lo tocan. El piso
+    sigue cortando el bucle, pero nunca deja gastar más que esto.
+
     Sin declarar, los defaults documentados: 180 min por ticket, piso
-    US$3.00, 12 pasadas con trabajo. `harness run`/`run --loop` los lee de
-    acá en cada corrida; un flag de CLI puede acotarla más, pero no
+    US$3.00, 12 pasadas con trabajo, y US$0 de gasto: sin un monto
+    explícito, la corrida no gasta plata. `harness run`/`run --loop` los
+    lee de acá en cada corrida; un flag de CLI puede acotarla más, pero no
     amplificarla por encima de la config.
 
     `hasta` (#175): hora límite dura, "HH:MM" en America/Santiago; pasada,
@@ -158,6 +165,7 @@ class RunTopes:
     piso: float = 3.0
     max_pasadas: int = 12
     hasta: Optional[str] = None
+    max_usd: float = 0.0
 
 
 @dataclass
@@ -317,9 +325,10 @@ def _topes(raw, donde):
         return RunTopes()
     raw = _obj(raw, donde + ' → "topes"')
     donde = donde + ' → "topes"'
-    _keys(raw, ("budget_minutos", "piso", "max_pasadas", "hasta"), donde)
+    _keys(raw, ("budget_minutos", "piso", "max_pasadas", "hasta",
+                "max_usd"), donde)
     kw = {}
-    for campo in ("budget_minutos", "piso"):
+    for campo in ("budget_minutos", "piso", "max_usd"):
         if campo in raw:
             v = _num(raw[campo], '"{}"'.format(campo), donde)
             if v < 0:

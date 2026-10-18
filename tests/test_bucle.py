@@ -475,7 +475,8 @@ class LaFronteraSeRecalcula(unittest.TestCase):
                   "repos": {"root": "~/repos", "paths": ["agent-harness"]},
                   "autonomy": "frontier",
                   "budget": {"polarity": "remaining", "provider": "openrouter"},
-                  "run": {"kind": "local"}},
+                  "run": {"kind": "local"},
+                  "topes": {"max_usd": 50}},  # #165: autoriza gasto
         },
     })
 
@@ -636,7 +637,8 @@ class LaVigilacionBarata(unittest.TestCase):
                   "repos": {"root": "~/repos", "paths": ["agent-harness"]},
                   "autonomy": "frontier",
                   "budget": {"polarity": "remaining", "provider": "openrouter"},
-                  "run": {"kind": "local"}},
+                  "run": {"kind": "local"},
+                  "topes": {"max_usd": 50}},  # #165: autoriza gasto
         },
     })
 
@@ -1057,12 +1059,17 @@ class LosTopesVienenDeLaConfig(unittest.TestCase):
     releen en cada corrida: la CLI puede acotarlos más, no amplificarlos.
     Se corre la `run_main` real con el mundo de mentira."""
 
-    def _cfg(self, topes=None, provider="none"):
+    def _cfg(self, topes=None, provider="none", gasto=50.0):
         context = {"tracker": {"kind": "github"},
                    "repos": {"root": "~/repos", "paths": ["agent-harness"]},
                    "autonomy": "frontier",
                    "budget": {"polarity": "remaining", "provider": provider},
                    "run": {"kind": "local"}}
+        # #165: sin `max_usd` la corrida no despacha pi; estos tests miden
+        # otros topes, así que autorizan gasto salvo que pidan lo contrario.
+        if gasto is not None:
+            topes = dict(topes or {})
+            topes.setdefault("max_usd", gasto)
         if topes is not None:
             context["topes"] = topes
         return json.dumps({"default_context": "h", "contexts": {"h": context}})
@@ -1287,7 +1294,7 @@ class LosTopesVienenDeLaConfig(unittest.TestCase):
     def test_run_sin_max_usd_no_despacha_pi(self):
         """Sin `topes.max_usd` (default 0) la corrida no gasta plata: el
         ticket en el peldaño de pi queda fuera y no prende nada."""
-        self.d.joinpath("config.json").write_text(self._cfg())
+        self.d.joinpath("config.json").write_text(self._cfg(gasto=None))
         args = self.cli.build_parser().parse_args([
             "run", "--context", "h", "--log", str(self.log_path)])
         mundo = Mundo(prs=[])
@@ -1318,7 +1325,9 @@ class LosTopesVienenDeLaConfig(unittest.TestCase):
                              for e in eventos), "pi no se despacha con tope 0")
         self.assertTrue(any(e["tipo"] == "corrida"
                             and "tope de gasto" in e["cuerpo"]
-                            for e in eventos))
+                            and "1 job(s) pagado(s) sin despachar"
+                            in e["cuerpo"]
+                            for e in eventos), eventos)
         self.assertIn("tope de gasto", salida.getvalue())
 
     def test_el_flag_puede_acotar_mas_no_amplificar(self):
