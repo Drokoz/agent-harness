@@ -1150,5 +1150,34 @@ class TestNoPisarConDatosViejos(unittest.TestCase):
             self.assertEqual(ruta.read_text(), antes)
 
 
+# --------------------- #159 revisión 7: la hora límite es la de la corrida
+class TestHoraLimiteDeLaCorrida(unittest.TestCase):
+    def test_limite_de_la_corrida(self):
+        self.assertEqual(usage.limite_de_corrida(scl(2026, 10, 17, 23, 0), "07:00"),
+                         scl(2026, 10, 18, 7, 0))
+        # Arrancó de día, pasada la hora límite: la de mañana.
+        self.assertEqual(usage.limite_de_corrida(scl(2026, 10, 18, 8, 0), "07:00"),
+                         scl(2026, 10, 19, 7, 0))
+
+    def test_pasada_la_hora_limite_no_se_espera(self):
+        # La corrida arrancó a las 23:00; son las 09:00 y la sesión está llena.
+        limite = usage.limite_de_corrida(scl(2026, 10, 17, 23, 0), "07:00")
+        ahora = scl(2026, 10, 18, 9, 0)
+        e = estado(sesion=95, sesion_reset=ahora + timedelta(hours=1))
+        d = decidir(e, ahora, POL, limite=limite)
+        self.assertFalse(d.claude)
+        self.assertIsNone(d.esperar_hasta)
+        self.assertIn("hora límite", d.motivo)
+
+    def test_la_cuota_usa_el_inicio_de_la_corrida(self):
+        ahora = [scl(2026, 10, 18, 9, 0)]
+        llena = Usage(Bucket("Current session", 95, ahora[0] + timedelta(hours=1)),
+                      USAGE.semana)
+        c = Cuota(leer_usage=lambda: llena, estimar=lambda: None, politica=POL,
+                  ahora=lambda: ahora[0], anotar=lambda s: None,
+                  inicio=scl(2026, 10, 17, 23, 0))
+        self.assertIsNone(c.decidir().esperar_hasta)
+
+
 if __name__ == "__main__":
     unittest.main()
