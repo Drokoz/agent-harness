@@ -14,7 +14,8 @@ De ahí salen:
   con su propio 5h y sepa si come su bucket y también el general
 - el pico por modelo dentro de cualquier ventana de 5h (la ventana rodante
   de la cuota)
-- el total por semana, con el reset de viernes 17:00 America/Santiago
+- el total por semana, con el reset de viernes 21:00 UTC (#148: 17:00 en
+  Santiago con UTC-4, 18:00 en horario de verano)
 - la atribución por proyecto y por ticket: el path de la sesión codifica el
   worktree (`...--worktrees-<repo>-ticket-<n>`), que es lo que permite separar
   el consumo del harness del resto
@@ -44,9 +45,11 @@ from zoneinfo import ZoneInfo
 
 from harness.summary import parse_fecha
 
-# El reset de la semana de la cuota: viernes 17:00 America/Santiago.
+# El reset de la semana de la cuota (#148): fijo en UTC, viernes 21:00 UTC.
+# En Santiago es 17:00 con UTC-4 y 18:00 en horario de verano (UTC-3): lo que
+# dice `/usage` ("Resets Oct 23, 6pm"). La zona local es sólo para mostrar.
 SEMANA_TZ = ZoneInfo("America/Santiago")
-RESET_HORA = 17
+RESET_HORA_UTC = 21
 RESET_WEEKDAY = 4  # viernes
 VENTANA_5H = timedelta(hours=5)
 
@@ -298,13 +301,13 @@ def atribuir(dir_name, raices):
 # ------------------------------------------------------------------------ tiempo
 def semana_inicio(dt, tz=SEMANA_TZ):
     """El inicio de la semana de la cuota que contiene `dt`: el último viernes
-    17:00 America/Santiago (inclusive)."""
-    s = dt.astimezone(tz)
-    ref = s.replace(hour=RESET_HORA, minute=0, second=0, microsecond=0)
+    21:00 UTC (inclusive, #148), expresado en `tz` para mostrar."""
+    s = dt.astimezone(timezone.utc)
+    ref = s.replace(hour=RESET_HORA_UTC, minute=0, second=0, microsecond=0)
     if s < ref:
         ref -= timedelta(days=1)
     ref -= timedelta(days=(ref.weekday() - RESET_WEEKDAY) % 7)
-    return ref
+    return ref.astimezone(tz)
 
 
 def pico_5h(puntos, ventana=VENTANA_5H):
@@ -522,12 +525,13 @@ def render_quota(agg, tope_semanal=None):
         v, desde, hasta = agg["pico_5h"][m]
         a(f"    {m:<28} {_fmt(v):>12}  ({_utc(desde)} → {_utc(hasta)})")
     a("")
-    a("  por semana (ponderado, reset vie 17:00, America/Santiago):")
+    a("  por semana (ponderado, reset vie 21:00 UTC; inicio en hora de "
+      "America/Santiago):")
     if not agg["por_semana_ponderado"]:
         a("    (sin sesiones)")
     for iso in sorted(agg["por_semana_ponderado"], reverse=True):
         n = sum(agg["por_semana_ponderado"][iso].values())
-        a(f"    {iso[:10]}   {_fmt(round(n)):>12}{del_tope(n)}")
+        a(f"    {iso[:10]} {iso[11:16]}   {_fmt(round(n)):>12}{del_tope(n)}")
     a("")
     a("  por día (ponderado, últimos 10, America/Santiago):")
     dias = sorted(agg["por_dia"], reverse=True)[:10]
