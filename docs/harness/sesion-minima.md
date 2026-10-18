@@ -32,8 +32,9 @@ El harness ahora arma la sesión mínima por kind en `args_sesion_minima`
 **`claude`** (peldaños 3-4):
 
 ```
---strict-mcp-config --setting-sources project --permission-mode auto \
---settings {"autoMode":{"skipAutoPermissionPrompt":true}} --model <m> --effort <n>
+--strict-mcp-config --setting-sources project --disable-slash-commands \
+--permission-mode auto --settings {"autoMode":{...},"statusLine":{...},
+"permissions":{"deny":[...]}} --model <m> --effort <n>
 ```
 
 - `--strict-mcp-config` sin `--mcp-config` = cero servidores MCP: no los del
@@ -47,10 +48,25 @@ El harness ahora arma la sesión mínima por kind en `args_sesion_minima`
   usuario traían `defaultMode: auto` y el opt-in aceptado; al saltarlos hay
   que reponerlos explícitos, o la sesión queda en manual y el agente se
   bloquea en la primera aprobación.
-- **Límite documentado:** Claude no tiene flag por skill, así que las skills
-  del proyecto (`.claude/skills/`) se cargan igual. Lo que se saca son los
-  plugins (y con ellos sus skills/commands/agents) y los skills globales de
-  user-scope.
+- `--disable-slash-commands` (#167): apaga el Skill tool y las
+  slash-commands enteras — las skills del proyecto (`.claude/skills/`) y las
+  bundled no llegan a la sesión: el equivalente forzado de `--no-skills` de
+  pi. Claude no tiene flag por skill individual; el flag es la discovery
+  entera, que es lo que la sesión mínima pide. (Verificado en vivo contra
+  2.1.296: sin el flag, `slash_commands` del init trae `implement` y `tdd`;
+  con él, la lista queda sin skills del proyecto y el Skill tool deja de
+  responder.)
+- `permissions.deny` en el `--settings` inline (#167, regla 6 de la
+  auditoría #152): el tope de escritura se fuerza en la herramienta, no en
+  el prompt. El guard de pi es una extensión de pi y no opera en Claude, así
+  que su equivalente son las mismas líneas duras de `reglas.ts` que no tienen
+  excepciones — `gh pr merge`, `gh repo delete`, `git merge`, force-push
+  (`--force`, `--force-with-lease`, `-f`) — pasadas a deny rules. Se aplican
+  aunque el repo no traiga un `.claude/settings.json` propio; el del repo
+  lleva el mismo `deny` como red a nivel de proyecto (cubre también las
+  sesiones de Claude del humano). Verificado en vivo: con los args de la
+  sesión mínima, `git push --force` sale denegado y la sesión lo reporta
+  en vez de correrlo.
 
 ## Las skills del ticket
 
