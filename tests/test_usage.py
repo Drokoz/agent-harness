@@ -20,6 +20,8 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta
 from importlib.machinery import SourceFileLoader
@@ -1044,6 +1046,58 @@ class TestResetPasado(unittest.TestCase):
         self.assertEqual(self.capturas, 1)
         # Y el chequeo por ticket ve lo mismo.
         self.assertTrue(cuota.permitir_claude()[0])
+
+
+# ------------------------------- #159 revisión 2: una sola captura a la vez
+class TestCacheDeCuota(unittest.TestCase):
+    """Revisión de #159 (MEDIA): cada ticket de Claude en paralelo volvía a
+    capturar /usage (N panes y N `claude` a la vez)."""
+
+    def setUp(self):
+        self.reloj = [AHORA]
+        self.lecturas = 0
+        self.lock = threading.Lock()
+
+    def leer(self):
+        with self.lock:
+            self.lecturas += 1
+        time.sleep(0.05)  # una captura tarda: los hilos se pisan
+        return USAGE
+
+    def cuota(self):
+        return Cuota(leer_usage=self.leer, estimar=lambda: None, politica=POL,
+                     ahora=lambda: self.reloj[0], anotar=lambda s: None)
+
+    def test_varios_hilos_una_sola_captura(self):
+        c = self.cuota()
+        hilos = [threading.Thread(target=c.permitir_claude) for _ in range(8)]
+        for h in hilos:
+            h.start()
+        for h in hilos:
+            h.join()
+        self.assertEqual(self.lecturas, 1)
+
+    def test_el_cache_dura_poco(self):
+        c = self.cuota()
+        c.estado()
+        self.reloj[0] += timedelta(minutes=1)
+        c.estado()
+        self.assertEqual(self.lecturas, 1)
+        self.reloj[0] += timedelta(minutes=2)
+        c.estado()
+        self.assertEqual(self.lecturas, 2)
+
+    def test_pasar_un_reset_invalida_el_cache(self):
+        u = Usage(Bucket("Current session", 95, AHORA + timedelta(seconds=30)),
+                  USAGE.semana)
+        c = Cuota(leer_usage=lambda: (setattr(self, "lecturas",
+                                              self.lecturas + 1), u)[1],
+                  estimar=lambda: None, politica=POL,
+                  ahora=lambda: self.reloj[0], anotar=lambda s: None)
+        c.estado()
+        self.reloj[0] += timedelta(seconds=45)
+        c.estado()
+        self.assertEqual(self.lecturas, 2)
 
 
 if __name__ == "__main__":
