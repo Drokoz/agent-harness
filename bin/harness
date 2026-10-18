@@ -204,6 +204,7 @@ from harness.dispatch import (BucleSpec, DispatchSpec, Dispatcher, EventLog,  # 
                               Job, Pasada, bucle, cosechar, decidir_tanda,
                               motivo_presupuesto_reloj, peldano_de,
                               skills_de, transcripcion_path)
+from harness.dispatch import resolver_hasta  # noqa: E402
 from harness.ideas import (IDEAS_CLAUDE, IDEAS_OPUS, Ideas,  # noqa: E402
                            MAX_IDEAS_DEFAULT, debe_correr,
                            guardar_ultima_corrida, leer_ideas_vault,
@@ -239,6 +240,28 @@ REF_ISSUE_RE = re.compile(r"^ticket/(\d+)$")
 
 # Modo sin adaptadores: sin red ni dependencias externas (OpenRouter, gh, herdr).
 OFFLINE = os.environ.get("HARNESS_OFFLINE") == "1"
+
+
+def _hhmm_arg(valor):
+    """`--hasta HH:MM`: se valida al parsear, para que un typo no deje la
+    noche sin hora límite."""
+    if valor:
+        try:
+            resolver_hasta(datetime.now(usage_mod.TZ), valor)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e))
+    return valor
+
+
+def _hasta_de(args, ctx, inicio):
+    """La hora límite de la corrida (#175), como instante: la más temprana
+    entre `topes.hasta` de la config y `--hasta`, resueltas contra el
+    arranque `inicio` (`resolver_hasta`: cruza la medianoche). None = sin
+    hora límite."""
+    horas = [h for h in (getattr(args, "hasta", ""), ctx.topes.hasta) if h]
+    if not horas:
+        return None
+    return min(resolver_hasta(inicio, h) for h in horas)
 
 
 def build_parser():
@@ -308,8 +331,15 @@ def build_parser():
                         "créditos, tope de pasadas con trabajo, o el archivo "
                         "de freno); la frontera se recalcula entre pasadas (#88)")
     p.add_argument("--freno", default="",
-                   help="run --loop: archivo que, si aparece, frena el bucle; "
-                        "se atiende entre pasadas, nunca en medio de una")
+                   help="run --loop: archivo que, si aparece, frena el bucle: "
+                        "no se despacha ningún job nuevo (se mira antes de "
+                        "cada uno, #175); los que corren terminan")
+    p.add_argument("--hasta", default="", type=_hhmm_arg, metavar="HH:MM",
+                   help="run: hora límite dura (America/Santiago, #175): "
+                        "pasada, no se despacha nada nuevo, y 30 min después "
+                        "los agentes vivos se cortan con commit WIP. Por "
+                        "defecto topes.hasta en config; puede adelantarla, "
+                        "no atrasarla")
     p.add_argument("--piso", type=float, default=None,
                    help="run --loop: no arranca otra pasada con menos de este "
                         "crédito restante (US$, por defecto el de "
@@ -975,7 +1005,8 @@ def run_main(args, contexts, solo=None):
         spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
                             kind=args.kind, model=args.model,
                             permitir_claude=cuota.permitir_claude,
-                            budget_minutos=ctx.topes.budget_minutos)
+                            budget_minutos=ctx.topes.budget_minutos,
+                            hasta=_hasta_de(args, ctx, INICIO_CORRIDA))
         costo_de_pi, salida_de_pi = _sesiones_de_pi()
         disp = Dispatcher(spec, log, run_cmd=adapters.run,
                           credits=_creditos_usado
@@ -1162,10 +1193,14 @@ def _una_pasada(args, ctx, log):
                  ", ".join(r.name for r in ilegibles))
              if ilegibles else "")
     cuota = _cuota_de(args, ctx, log)
+    # #175: el freno y la hora límite se miran antes de cada job de la
+    # pasada, no sólo entre pasadas.
     spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
                         kind=args.kind, model=args.model,
                         permitir_claude=cuota.permitir_claude,
-                        budget_minutos=ctx.topes.budget_minutos)
+                        budget_minutos=ctx.topes.budget_minutos,
+                        freno=getattr(args, "freno", "") or None,
+                        hasta=_hasta_de(args, ctx, INICIO_CORRIDA))
     costo_de_pi, salida_de_pi = _sesiones_de_pi()
     disp = Dispatcher(spec, log, run_cmd=adapters.run,
                       credits=_creditos_usado
@@ -1308,8 +1343,9 @@ def _run_loop(args, contexts, log_path):
     """`harness run --loop` (#88): el modo bucle del CLI, en vez del
     `scripts/noche.sh` que hace lo mismo sin tests.
 
-    El corte siempre queda en el log de eventos con su motivo, y el freno
-    se atiende entre pasadas (nunca en medio de una). Un freno viejo que ya
+    El corte siempre queda en el log de eventos con su motivo. El freno y
+    la hora límite (`--hasta`) se miran entre pasadas y, adentro de la
+    pasada, antes de despachar cada job (#175). Un freno viejo que ya
     estaba al arrancar no puede salir 0 (#91): se leería como éxito y se
     comería la noche.
     """
@@ -1401,7 +1437,9 @@ def _run_loop(args, contexts, log_path):
     # que anotar aunque no haya corrido ninguna (piso bajo al arrancar).
     corte = bucle(ejecutar, spec, EventLog(log_path, nombre),
                   creditos=creditos, freno=args.freno or None,
-                  proposer_vacio=proposer, vigilar=vigilar)
+                  proposer_vacio=proposer, vigilar=vigilar,
+                  hasta=_hasta_de(args, contexts[0], INICIO_CORRIDA)
+                  if contexts else None)
     sys.stdout.write("harness: bucle: corte: {}\n".format(corte))
     # Un corte por una fuente que no se puede leer (el tracker, #130; la
     # config, #163) no es una noche terminada: es un mundo que se conoce a

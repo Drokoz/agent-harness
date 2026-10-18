@@ -550,12 +550,20 @@ class LaFronteraSeRecalcula(unittest.TestCase):
             # La vuelta 2 es el proposer de frontera vacía (#115), que hace
             # su propia llamada de collect: el mundo no cambia por ella.
             if estado["n"] >= 3:
-                # Un issue que se destraba en la madrugada, y el freno que
-                # corta el bucle entre la pasada 2 y la (inexistente) 3.
-                self.freno.write_text("")
+                # Un issue que se destraba en la madrugada.
                 return self._raw([self._issue(7, "ready-for-human"),
                                   self._issue(9, "ready-for-agent")])
             return self._raw([self._issue(7, "ready-for-agent")])
+
+        # El freno aparece con #9 ya despachado y corta el bucle entre la
+        # pasada 2 y la (inexistente) 3. Si apareciera antes, #9 ni
+        # arrancaría: el freno se mira antes de cada job (#175).
+        def worktree_add(a):
+            self.freno.write_text("")
+            return (True, "")
+
+        mundo.responder(lambda a: a[0] == "git" and "worktree" in a
+                        and "add" in a, worktree_add)
 
         args = self.cli.build_parser().parse_args([
             "run", "--context", "h", "--loop", "--log", str(self.log_path),

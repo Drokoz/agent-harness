@@ -25,9 +25,10 @@ import shlex
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from harness import state
 from harness.costo_pi import clasificar_salida
@@ -526,6 +527,44 @@ def _ahora():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ---------------------------------------------------------------- hora límite
+# La zona del servidor: la misma que la cuota (`usage.TZ`, `quota.SEMANA_TZ`).
+TZ_SERVIDOR = ZoneInfo("America/Santiago")
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def resolver_hasta(inicio, hhmm):
+    """`--hasta HH:MM` (America/Santiago) como instante, contra el arranque
+    de la corrida (#175): la ocurrencia de HH:MM más cercana a `inicio`.
+
+    Una corrida que arranca a la 01:00 con hasta 07:00 corta a las 07:00 de
+    esa misma mañana; una que arranca a las 23:00, a las 07:00 de la mañana
+    siguiente. Una que arranca a las 08:00 con hasta 07:00 ya está pasada
+    (una hora atrás, no 23 horas adelante): no despacha nada. Nadie pide
+    `--hasta` para una corrida de casi un día.
+
+    Distinto de `usage.limite_de_corrida` (la próxima, siempre adelante): esa
+    es hasta cuándo esperar un reset; esta es cuándo dejar de gastar."""
+    m = _HHMM_RE.match(str(hhmm or ""))
+    if not m:
+        raise ValueError('hora límite "{}": tiene que ser HH:MM (24 h, '
+                         'America/Santiago), p.ej. "07:00"'.format(hhmm))
+    h, mi = int(m.group(1)), int(m.group(2))
+    a = inicio.astimezone(TZ_SERVIDOR)
+    candidatos = []
+    # Mañana primero: en el empate (justo 12 h), gana la de adelante.
+    for dias in (1, 0, -1):
+        d = a + timedelta(days=dias)
+        candidatos.append(datetime(d.year, d.month, d.day, h, mi,
+                                   tzinfo=TZ_SERVIDOR))
+    return min(candidatos, key=lambda c: abs((c - a).total_seconds()))
+
+
+def hhmm_de(dt):
+    """Las HH:MM de un instante en la zona del servidor, para el log."""
+    return dt.astimezone(TZ_SERVIDOR).strftime("%H:%M")
+
+
 def _hhmm(ts):
     """Las HH:MM de un timestamp del log (la misma hora que muestra el
     listener, para que "desde las HH:MM" apunte a algo visible)."""
@@ -771,7 +810,8 @@ class Pasada:
 
 
 def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
-          dormir=None, proposer_vacio=None, vigilar=None):
+          dormir=None, proposer_vacio=None, vigilar=None, hasta=None,
+          ahora=None):
     """El modo `--loop` (#88): repite la pasada hasta que la frontera se
     vacíe — y la frontera vacía no es el fin de la noche, es una espera
     (#101): un issue etiquetado a las 4am tiene que encontrar el bucle
@@ -779,8 +819,10 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
 
     Ningún bucle sin límite. El corte es siempre por una de estas, y queda
     anotado en el log de eventos con su motivo:
-    - el archivo de freno aparece — se atiende entre pasadas, nunca en
-      medio de una (#88);
+    - el archivo de freno aparece — entre pasadas acá; adentro de la
+      pasada lo mira el dispatcher antes de cada job (#175);
+    - la hora límite `hasta` (datetime con zona, `resolver_hasta`) pasó
+      (#175); `ahora` es el reloj, inyectable;
     - el crédito restante baja del piso (`creditos()` -> float | None; sin
       medir, el piso no corta, los demás cortes sí);
     - se agota el tope de pasadas CON trabajo (una vacía no gasta turno, #101);
@@ -828,6 +870,9 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
     def freno_puesto():
         return bool(freno) and Path(freno).exists()
 
+    if ahora is None:
+        ahora = lambda: datetime.now(timezone.utc)  # noqa: E731
+
     def creditos_restantes():
         if creditos is None:
             return None
@@ -853,6 +898,9 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
     while True:
         if freno_puesto():
             motivo = "freno puesto ({})".format(freno)
+            break
+        if hasta is not None and ahora() >= hasta:
+            motivo = "hora límite {} alcanzada (--hasta)".format(hhmm_de(hasta))
             break
         c = creditos_restantes()
         if c is not None and c < spec.piso:
@@ -1036,6 +1084,15 @@ class DispatchSpec:
     # motivo). La política no vive acá: dispatch.py sólo llama lo que se
     # inyecte; sin nada inyectado, siempre permitido.
     permitir_claude: Optional[Callable[[], Tuple[bool, str]]] = None
+    # El freno y la hora límite (#175): se miran antes de despachar CADA
+    # job, no sólo entre pasadas. `freno` es el archivo que, si existe, no
+    # deja arrancar nada nuevo; `hasta` (datetime con zona, de
+    # `resolver_hasta`) es la hora límite dura: pasada, no se arranca nada
+    # nuevo, y a `hasta + hasta_gracia_min` los agentes vivos se cortan con
+    # commit WIP. Los que ya corren terminan (o los corta el watchdog).
+    freno: Optional[str] = None
+    hasta: Optional[datetime] = None
+    hasta_gracia_min: float = 30.0
 
 
 class Dispatcher:
@@ -1053,8 +1110,11 @@ class Dispatcher:
     _tipo_corrida = "corrida"
 
     def __init__(self, spec, log, run_cmd, credits=None, dormir=None,
-                 costo_real=None, salida_real=None, revisor=None):
+                 costo_real=None, salida_real=None, revisor=None, ahora=None):
         self.spec = spec
+        # El reloj de la hora límite (#175): un datetime con zona. Sin
+        # inyectar, el real.
+        self.ahora = ahora or (lambda: datetime.now(timezone.utc))
         self.log = log
         self.run_cmd = run_cmd                 # (args, cwd=None, timeout=30) -> (ok, out)
         # (repo, issue, desde) -> float | None: el costo medido de verdad,
@@ -1175,13 +1235,28 @@ class Dispatcher:
         self._fetch_base(jobs)
         resultados = []
         vueltas_prompt = {}
-        with cf.ThreadPoolExecutor(max_workers=max(1, self.spec.max_parallel)) as ex:
+        tope = max(1, self.spec.max_parallel)
+        corte = ""
+        with cf.ThreadPoolExecutor(max_workers=tope) as ex:
             cola = list(jobs)
             en_vuelo = set()
             while cola or en_vuelo:
-                for j in cola:
-                    en_vuelo.add(ex.submit(self.run_job, j))
-                cola = []
+                # Se despacha de a uno, hasta el tope, y antes de CADA job se
+                # mira el freno y la hora límite (#175): un job que espera
+                # en la cola no arranca después del corte pedido.
+                while cola and len(en_vuelo) < tope and not corte:
+                    corte = self._motivo_corte()
+                    if corte:
+                        self.log.write(
+                            "corte", ref,
+                            "{}: {} job(s) sin despachar; los que corrían "
+                            "terminan".format(corte, len(cola)))
+                        break
+                    en_vuelo.add(ex.submit(self.run_job, cola.pop(0)))
+                if corte:
+                    cola = []
+                if not en_vuelo:
+                    break
                 # Sin barrera: al primer job que termina se lo procesa de
                 # inmediato, y si perdió el prompt se recoloca para ocupar
                 # el slot liberado mientras los otros siguen corriendo.
@@ -1214,6 +1289,23 @@ class Dispatcher:
                        "fin: {} hecho(s), {} abandonado(s){}, costo de jobs {}".format(
                            len(hechas), len(abandonadas), extra, costo_txt))
         return resultados
+
+    def _motivo_corte(self):
+        """Por qué no se arranca un job más (#175), o "" si se puede."""
+        freno = self.spec.freno
+        if freno and Path(freno).expanduser().exists():
+            return "freno puesto ({})".format(freno)
+        if self.spec.hasta is not None and self.ahora() >= self.spec.hasta:
+            return "hora límite {} alcanzada (--hasta)".format(
+                hhmm_de(self.spec.hasta))
+        return ""
+
+    def _hora_de_matar(self):
+        """¿Pasó `hasta + gracia`? Los agentes vivos se cortan (#175)."""
+        if self.spec.hasta is None:
+            return False
+        limite = self.spec.hasta + timedelta(minutes=self.spec.hasta_gracia_min)
+        return self.ahora() >= limite
 
     # ------------------------------------------------------------- un job
     def run_job(self, job):
@@ -1607,6 +1699,9 @@ class Dispatcher:
                                 "fallo al esperar al agente: " + out.strip()[:200],
                                 clase="infra")
                 return True
+            if self._hora_de_matar():
+                self._matar_por_hora(job, ref)
+                return True
             senal, sin_progreso, matado = self._watchdog(job, ref, senal,
                                                          sin_progreso)
             if matado:
@@ -1724,6 +1819,20 @@ class Dispatcher:
                         "cuentan como progreso)"
                         .format(sin_progreso),
                         clase="modelo")
+
+    def _matar_por_hora(self, job, ref):
+        """Pasó `hasta + gracia` y el agente sigue vivo (#175): el mismo
+        camino que el watchdog (ctrl+c y abandono; `_limpiar` rescata la
+        transcripción y deja el commit WIP en la rama). Se abandona
+        `infra`: se acabó la noche, no falló el modelo, y no gasta peldaño
+        de la escalera."""
+        self.run_cmd(["herdr", "agent", "send-keys", job.agent, "ctrl+c"],
+                     timeout=60)
+        motivo = ("hora límite {} + {} min pasada: agente matado "
+                  "(--hasta)".format(hhmm_de(self.spec.hasta),
+                                     int(self.spec.hasta_gracia_min)))
+        self._log(job, "corte", ref, motivo)
+        self._abandonar(job, ref, motivo, clase="infra")
 
     def _preparar(self, job, ref):
         """Deja el worktree en condiciones de correr el gate.

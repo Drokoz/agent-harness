@@ -49,7 +49,8 @@ class TestFrenoAntesDeCadaJob(unittest.TestCase):
         segundo: los dos que ya corrían terminan, los otros 3 no arrancan."""
         with tempfile.TemporaryDirectory() as d:
             freno = Path(d) / "freno"
-            m = Mundo()
+            m = Mundo(prs=[{"number": 30 + i, "headRefName": "ticket/{}".format(i)}
+                           for i in range(1, 6)])
             arranques = []
 
             def worktree_add(args):
@@ -112,7 +113,7 @@ class TestHasta(unittest.TestCase):
     def test_antes_de_hasta_se_despacha(self):
         m = Mundo()
         ahora = lambda: self.HASTA - timedelta(hours=1)  # noqa: E731
-        res, lineas = despachar(m, [job(1)], hasta=self.HASTA, ahora=ahora)
+        res, lineas = despachar(m, [job()], hasta=self.HASTA, ahora=ahora)
         self.assertEqual([j.estado for j in res], ["hecho"])
         self.assertEqual(cortes(lineas), [])
 
