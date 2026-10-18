@@ -522,6 +522,84 @@ def agente_vivo(agentes, repo, issue):
     return False
 
 
+@dataclass
+class Ceremonia:
+    """Lo que la corrida gastó en ceremonia contra lo que produjo (#141).
+
+    `intentos`, `minutos` y `usd` se miden DESDE EL ÚLTIMO progreso
+    (una línea `pr` es gate verde con PR abierto): es la razón que se
+    degrada cuando reintentan sin mergear, escalan y abandonan, o un
+    ticket se come la noche en vueltas sin avanzar (la noche del 6→7
+    de septiembre, #139). Sin progreso en la ventana, cuentan todos
+    los intentos de la ventana. `ratio` es intentos por progreso; sin
+    progreso, los intentos tal cual (6 intentos y cero PRs → 6.0).
+    """
+
+    intentos: int = 0
+    minutos: float = 0.0
+    usd: float = 0.0
+    progresos: int = 0
+
+    @property
+    def ratio(self):
+        if self.progresos > 0:
+            return self.intentos / self.progresos
+        return float(self.intentos)
+
+
+def ceremonia(eventos, desde=None):
+    """La ceremonia de una corrida contra su progreso (#141): cuántos
+    intentos de agente hubo, cuántos minutos y cuántos dólares, y cuántos
+    progresos (líneas `pr`: gate verde con PR abierto) —todo dentro de la
+    ventana.
+
+    La ventana es `desde` (timestamp ISO, o None = el log entero) en
+    adelante: la regla de #139, se mide sobre ESTA corrida (desde el
+    arranque del proceso), nunca sobre el log entero. Un `desde` que no
+    se puede parsear no filtra: sin dato no se puede afirmar que un
+    evento quedó afuera.
+
+    Los intentos son corridas (`run_id`) con línea `agente` DESPUÉS del
+    último progreso: es la racha sin avance que el bucle corta. Un
+    intento fallido (el agente no arrancó) cuenta igual: ceremonia fue,
+    y plata gastó. Los minutos son la ventana de cada intento sumada
+    (los mismos que presupuesta el reloj, #116); los dólares, las
+    líneas `costo` del período. Puro.
+    """
+    corte = parse_fecha(str(desde)) if desde else None
+    ventana = []
+    for e in eventos:
+        dt = parse_fecha(str(e.get("timestamp", "")))
+        if dt is None or (corte is not None and dt < corte):
+            continue
+        ventana.append((dt, e))
+    ventana.sort(key=lambda t: t[0])
+    ultimo, progresos = -1, 0
+    for i, (_, e) in enumerate(ventana):
+        if e.get("tipo") == "pr":
+            progresos += 1
+            ultimo = i
+    runs, por_run, usd = set(), {}, 0.0
+    for dt, e in ventana[ultimo + 1:]:
+        tipo = e.get("tipo")
+        if e.get("run_id") is not None:
+            # La ventana de cada corrida, con todos sus eventos (igual que
+            # el reloj de #116), no sólo la línea `agente`.
+            run = e["run_id"] or _SIN_RUN
+            a, b = por_run.get(run, (dt, dt))
+            por_run[run] = (min(a, dt), max(b, dt))
+        if tipo == "agente":
+            runs.add(e.get("run_id") or _SIN_RUN)
+        elif tipo == "costo":
+            m = COSTO_JOB_RE.match(str(e.get("cuerpo", "")).strip())
+            if m:
+                usd += float(m.group(1))
+    minutos = sum((fin - ini).total_seconds() / 60.0
+                  for ini, fin in por_run.values())
+    return Ceremonia(intentos=len(runs), minutos=minutos, usd=usd,
+                     progresos=progresos)
+
+
 def estado_frontier(labels, despachado_en_log, vivo, pr_abierto, pr_merged):
     """El estado de un ticket de la frontera.
 

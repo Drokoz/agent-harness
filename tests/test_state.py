@@ -772,7 +772,8 @@ class TestCeremonia(unittest.TestCase):
         ]
 
     def noche_6_7(self):
-        evs = [ev("corrida", "corrida", "inicio: 1 ticket(s)", self._ts(0, 0))]
+        evs = [ev("corrida", "corrida", "inicio: 1 ticket(s)", self._ts(0, 0),
+                 run_id="c0")]
         for i in range(6):
             evs += self.bloque(1 + i, "r{}".format(i + 1))
         return evs
@@ -782,8 +783,8 @@ class TestCeremonia(unittest.TestCase):
         self.assertEqual(c.intentos, 6)
         self.assertEqual(c.progresos, 0)
         self.assertAlmostEqual(c.usd, 3.0)
-        self.assertGreaterEqual(c.minutos, 300.0)
-        self.assertLessEqual(c.minutos, 360.0)
+        # 6 corridas de 15 min cada una (mismos minutos que el reloj de #116).
+        self.assertAlmostEqual(c.minutos, 90.0)
 
     def test_sin_desde_mide_el_log_entero(self):
         c = state.ceremonia(self.noche_6_7())
@@ -792,8 +793,8 @@ class TestCeremonia(unittest.TestCase):
     def test_desde_acota_a_la_corrida(self):
         """Regla de #139: la ventana es de ESTA corrida, no del log entero."""
         c = state.ceremonia(self.noche_6_7(), desde=self._ts(3, 0))
-        self.assertEqual(c.intentos, 3)
-        self.assertAlmostEqual(c.usd, 1.5)
+        self.assertEqual(c.intentos, 4, "los bloques de las 3, 4, 5 y 6")
+        self.assertAlmostEqual(c.usd, 2.0)
         self.assertEqual(c.progresos, 0)
 
     def test_un_pr_verde_es_progreso_y_corta_el_contador(self):
