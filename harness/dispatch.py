@@ -29,8 +29,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
+from harness import state
 from harness.costo_pi import clasificar_salida
 from harness.review import Revisor, Revision, cuerpo_revision
+from harness.summary import leer_eventos
 
 ORIGEN = "harness"
 
@@ -724,10 +726,12 @@ class EventLog:
 class BucleSpec:
     """Cómo corre el modo `--loop` (#88). Ningún bucle sin límite: corta
     por el piso de presupuesto, el tope de pasadas con trabajo, el tope de
-    vueltas con la frontera vacía, o el archivo de freno."""
+    vueltas con la frontera vacía, K intentos sin progreso (sensor de
+    ceremonia, #141), o el archivo de freno."""
 
     piso: float = 3.0            # no arranca otra pasada con menos crédito que esto
     max_pasadas: int = 12        # tope duro de pasadas CON trabajo
+    ceremonia_max: Optional[int] = None  # K intentos sin progreso y corta (#141); None = sin sensor
     espera: float = 60.0         # segundos entre pasadas con trabajo
     espera_vacia: float = 300.0  # frontera vacía: espera más larga, no es el fin (#101)
     espera_vacia_max: float = 1800.0  # techo del backoff de la espera vacía (#114)
@@ -782,7 +786,12 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
     - se agota el tope de pasadas CON trabajo (una vacía no gasta turno, #101);
     - nada nuevo en `vueltas_vacias_max` vueltas con la frontera vacía;
     - la pasada trae `corte`: un mundo que no puede leer (tracker ilegible,
-      #130) no se mira 60 veces, se corta en la primera.
+      #130) no se mira 60 veces, se corta en la primera;
+    - ceremonia (#141): `spec.ceremonia_max` intentos de agente sin ningún
+      progreso (gate verde con PR) dentro de ESTA corrida, medidos desde su
+      arranque en el log (regla de #139: nunca sobre el log entero). Los
+      números que dispararon el corte van en la línea del motivo. Sin
+      `ceremonia_max` (None), el sensor no existe.
 
     La frontera vacía se gasta en proponer trabajo nuevo, no en esperar en
     blanco (#115): si hay `proposer_vacio`, el bucle lo corre la PRIMERA
@@ -837,6 +846,10 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
     propuesto = False  # el proposer de frontera vacía corre una vez por bucle
     n = 0
     alvo = log
+    # #141: el sensor de ceremonia mide desde el arranque de ESTA corrida
+    # (#139), no del log entero: el arranque es ahora, en el reloj del log
+    # que abrió el bucle.
+    desde_corrida = alvo.reloj() if spec.ceremonia_max is not None else None
     while True:
         if freno_puesto():
             motivo = "freno puesto ({})".format(freno)
@@ -907,6 +920,18 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
                 alvo.write("proponer", "bucle",
                            "frontera vacia: {} (en vez de solo esperar, "
                            "#115)".format(detalle))
+        if p is not None and desde_corrida is not None:
+            # #141: actividad sin avance. K intentos desde el último
+            # progreso y nada verde: esperar más no va a mergear nada.
+            cer = state.ceremonia(leer_eventos(alvo.path),
+                                  desde=desde_corrida)
+            if cer.intentos >= spec.ceremonia_max:
+                motivo = ("ceremonia: {} intentos sin progreso "
+                          "({} min de agente, US${:.2f} desde el último "
+                          "progreso; tope {})".format(
+                              cer.intentos, int(round(cer.minutos)),
+                              cer.usd, spec.ceremonia_max))
+                break
         esperado += espera
         dormir(espera)
     # #114: el final del log resume la espera en una línea: cuántas vueltas

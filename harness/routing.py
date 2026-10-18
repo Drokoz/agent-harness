@@ -43,20 +43,20 @@ def cargar_declaracion(path=DECLARACION) -> Optional[dict]:
 BUCLE_DEFAULT = {"intentos_sin_progreso": 6}
 
 
-def bucle_de(declaracion) -> dict:
-    """Los parámetros del bucle que el repo declara (`bucle` en
-    `routing.json`), con el default cuando no declara nada o declara algo
-    que no vale (no un entero ≥ 1): el default es el que corta la noche
-    que se comió a sí misma (#139), un `0` o una cadena no lo van a
-    cortar."""
-    bucle = dict(BUCLE_DEFAULT)
+def bucle_de(declaracion) -> int:
+    """Con cuántos intentos sin progreso corta el bucle (#141): el K que el
+    repo declara en `bucle.intentos_sin_progreso` de `routing.json`, con el
+    default razonable cuando no declara nada o declara algo que no vale
+    (no un entero ≥ 1): el default es el que corta la noche que se comió a
+    sí misma (#139), un `0` o una cadena no lo van a cortar."""
+    k = BUCLE_DEFAULT["intentos_sin_progreso"]
     if isinstance(declaracion, dict):
         b = declaracion.get("bucle")
         if isinstance(b, dict):
-            k = b.get("intentos_sin_progreso")
-            if isinstance(k, int) and not isinstance(k, bool) and k >= 1:
-                bucle["intentos_sin_progreso"] = k
-    return bucle
+            v = b.get("intentos_sin_progreso")
+            if isinstance(v, int) and not isinstance(v, bool) and v >= 1:
+                k = v
+    return k
 
 
 def leer_models(path=MODELS) -> Optional[dict]:

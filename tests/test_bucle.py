@@ -36,8 +36,17 @@ def leer_log(path):
     return [json.loads(l) for l in Path(path).read_text().splitlines() if l]
 
 
+def evento(tipo, ref, cuerpo, run_id="r", ticket="agent-harness#7",
+           attempt=None, ts=None, clase=None):
+    """Una línea del log, para sembrar el mundo que la pasada escribe."""
+    return {"timestamp": ts or "2026-09-06T02:00:00Z", "contexto": "h",
+            "origen": "harness", "run_id": run_id, "ticket": ticket,
+            "attempt": attempt, "tipo": tipo, "ref": ref, "cuerpo": cuerpo,
+            "clase": clase}
+
+
 def correr(resultados, creditos=None, al_largo=None, freno=None,
-           vigilar=None, reloj=None, **spec):
+           vigilar=None, reloj=None, eventos=None, sembrar=None, **spec):
     """Corre el bucle con un mundo de mentira. Devuelve
     `(corte, eventos, dormidos, nº de pasadas)`.
 
@@ -47,10 +56,16 @@ def correr(resultados, creditos=None, al_largo=None, freno=None,
     sin medir); `al_largo(i)` es un efecto de lado en la pasada i;
     `dormir` es un registro, no una espera; `vigilar` es el "¿cambió
     algo?" barato de #114 (False = no barrer); `reloj` fija el reloj del
-    log para los "desde las HH:MM".
+    log para los "desde las HH:MM"; `eventos` son las líneas que la
+    pasada escribe en el log (con el reloj del log) y `sembrar` las que
+    ya estaban en el log ANTES de la corrida (con su propio timestamp).
     """
     with tempfile.TemporaryDirectory() as d:
         log_path = Path(d) / "events.jsonl"
+        if sembrar:
+            with log_path.open("w", encoding="utf-8") as f:
+                for e in sembrar:
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
         log = EventLog(log_path, "harness", reloj=reloj)
         dormidos = []
         estado = {"n": 0}
@@ -63,6 +78,10 @@ def correr(resultados, creditos=None, al_largo=None, freno=None,
             r = resultados[i] if i < len(resultados) else \
                 (resultados[-1] if resultados else "vacia")
             if r == "trabajo":
+                for e in (eventos or []):
+                    log.write(e["tipo"], e["ref"], e["cuerpo"],
+                              ticket=e["ticket"], attempt=e["attempt"],
+                              clase=e["clase"])
                 return Pasada(True, "1 job(s)")
             return Pasada(False, "nada en la frontera")
 
@@ -280,6 +299,117 @@ class ElBucle(unittest.TestCase):
                 self.assertEqual(fin["ref"], "bucle")
                 self.assertIn("corte: ", fin["cuerpo"])
                 self.assertIn(motivo_esperada, fin["cuerpo"])
+
+
+class ElSensorCeremonia(unittest.TestCase):
+    """El sensor de ceremonia (#141): el bucle corta con actividad sin
+    avance — reintentos que no mergean, escaladas abandonadas, un ticket
+    que se come la noche en vueltas sin avanzar (la noche del 6→7,
+    #139). Se mide sobre ESTA corrida, nunca sobre el log entero."""
+
+    def intento(self, h, run):
+        """Un intento: `agente` + `abandono` bajo su propio `run_id` (cada
+        pasada real abre su propio log, su propio run_id). Devuelve el par
+        de líneas, con timestamps de esa hora."""
+        return [evento("agente", "ticket/7", "ah-7 (kind pi, pane w9:p1)",
+                       run_id=run, ts="2026-09-06T{:02d}:00:00Z".format(h)),
+                evento("abandono", "ticket/7",
+                       "gate rojo en el worktree: sin PR", run_id=run,
+                       clase="modelo",
+                       ts="2026-09-06T{:02d}:15:00Z".format(h))]
+
+    def test_la_noche_6_a_7_sintetica_dispara_el_corte(self):
+        """Un log sintético que reproduce la noche: seis horas de
+        reintentos (una corrida por hora, seis run_ids distintos), cero
+        PRs, y el bucle corta por ceremonia en vez de quedarse 60 vueltas
+        mirando la frontera."""
+        sembrar = []
+        for i in range(6):
+            sembrar += self.intento(1 + i, "r{}".format(i + 1))
+        # La corrida actual arranca a las 00:30, antes de todos los intentos.
+        corte, eventos_log, _, n = correr(
+            ["vacia"], sembrar=sembrar,
+            reloj=lambda: "2026-09-06T00:30:00Z",
+            ceremonia_max=6, max_pasadas=12, vueltas_vacias_max=12)
+        self.assertIn("ceremonia", corte)
+        self.assertIn("6 intentos sin progreso", corte)
+        self.assertEqual(n, 1, "corta apenas la corrida tiene K intentos")
+        fin = [e for e in eventos_log if e["tipo"] == "bucle"][-1]
+        self.assertIn("corte: ceremonia", fin["cuerpo"])
+
+    def test_el_corte_lleva_los_numeros_que_lo_dispararon(self):
+        """El corte queda en el log con los números: intentos, minutos de
+        agente y US$ desde el último progreso."""
+        sembrar = self.intento(1, "r1") + self.intento(2, "r2")
+        sembrar += [evento("costo", "ticket/7", "$0.75", run_id="r1",
+                           ts="2026-09-06T01:10:00Z"),
+                    evento("costo", "ticket/7", "$0.25", run_id="r2",
+                           ts="2026-09-06T02:10:00Z")]
+        corte, eventos_log, _, _ = correr(
+            ["vacia"], sembrar=sembrar,
+            reloj=lambda: "2026-09-06T00:30:00Z",
+            ceremonia_max=2, max_pasadas=12, vueltas_vacias_max=12)
+        self.assertIn("ceremonia", corte)
+        self.assertIn("2 intentos", corte)
+        self.assertIn("US$1.00", corte)
+        self.assertIn("tope 2", corte)
+        fin = [e for e in eventos_log if e["tipo"] == "bucle"][-1]
+        self.assertIn("min de agente", fin["cuerpo"])
+
+    def test_una_corrida_que_avanza_no_corta_aunque_gaste(self):
+        """Test explícito: cada pasada produce un PR verde, la racha sin
+        progreso nunca llega a K, y el bucle no corta por ceremonia ni
+        gasta una vuelta de más: se corta por el tope de pasadas."""
+        n_prs = {"n": 0}
+
+        def pasada_avanza():
+            n_prs["n"] += 1
+            run = "r{}".format(n_prs["n"])
+            for t, r, c in (("agente", "ticket/7",
+                             "ah-7 (kind pi, pane w9:p1)"),
+                            ("gate", "ticket/7", "verde"),
+                            ("pr", "ticket/7",
+                             "PR #{} abierto (gate verde)".format(
+                                 7 + n_prs["n"]))):
+                log.write(t, r, c, ticket="agent-harness#7")
+            return Pasada(True, "1 job(s)")
+
+        with tempfile.TemporaryDirectory() as d:
+            log_path = Path(d) / "events.jsonl"
+            log = EventLog(log_path, "harness",
+                           reloj=lambda: "2026-09-06T00:30:00Z")
+            corte = bucle(pasada_avanza,
+                          BucleSpec(ceremonia_max=3, max_pasadas=12),
+                          log, dormir=lambda s: None)
+        self.assertNotIn("ceremonia", corte,
+                         "12 PRs verdes contra un tope de 3: no hay racha que cortar")
+        self.assertIn("tope de 12 pasadas", corte)
+        self.assertEqual(n_prs["n"], 12, "gastó 12 pasadas de trabajo: avanza")
+
+    def test_la_ventana_es_de_esta_corrida_no_del_log_entero(self):
+        """Regla de #139: los intentos de ANOCHE no disparan el sensor de
+        HOY: se mide desde el arranque del proceso, y la corrida nueva
+        apenas despachó un intento."""
+        viejos = []
+        for h in range(16, 24):  # anoche: 8 intentos, sin progreso
+            viejos += self.intento(h, "r{}".format(h))
+        evs = self.intento(1, "r9")  # hoy: un intento
+        corte, _, _, n = correr(["trabajo"], eventos=evs, sembrar=viejos,
+                                reloj=lambda: "2026-09-07T01:00:00Z",
+                                ceremonia_max=8, max_pasadas=12)
+        self.assertNotIn("ceremonia", corte,
+                         "un intento hoy no hereda los 8 de anoche")
+
+    def test_sin_ceremonia_max_no_existe_el_sensor(self):
+        """Sin `ceremonia_max` el sensor no existe: la misma noche corta
+        por otro motivo, no por ceremonia."""
+        sembrar = []
+        for i in range(8):
+            sembrar += self.intento(1 + i, "r{}".format(i + 1))
+        corte, _, _, _ = correr(
+            ["vacia"], sembrar=sembrar,
+            reloj=lambda: "2026-09-06T00:30:00Z", vueltas_vacias_max=1)
+        self.assertNotIn("ceremonia", corte)
 
 
 class ElCliFreno(unittest.TestCase):
