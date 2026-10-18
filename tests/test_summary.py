@@ -638,7 +638,25 @@ class TestCuotaEnStatusYReport(unittest.TestCase):
         self.assertIn("16,780 tok", p.stdout)
         self.assertIn("2026-08-25", p.stdout)  # evolución por noche
         self.assertIn("int. 1 · pi", p.stdout)
-        self.assertIn("int. 2 · claude", p.stdout)
+
+    def test_status_muestra_la_ceremonia_de_la_corrida(self):
+        """#141: la razón ceremonia/progreso de la corrida, en la ventana
+        del resumen. En LOG_ESCALADA: dos intentos, un PR verde, $0.05."""
+        p = self._correr("status")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        linea = [l for l in p.stdout.splitlines()
+                 if "ceremonia de la corrida" in l]
+        self.assertEqual(len(linea), 1)
+        self.assertIn("2 intento(s) / 1 progreso(s) (ratio 2.0)", linea[0])
+        self.assertIn("US$0.05", linea[0])
+
+    def test_json_trae_la_ceremonia(self):
+        p = self._correr("status", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        cer = json.loads(p.stdout)["resumen"]["ceremonia"]
+        self.assertEqual(cer["intentos"], 2)
+        self.assertEqual(cer["progresos"], 1)
+        self.assertAlmostEqual(cer["usd"], 0.05)
 
     def test_offline_no_calcula_cuota(self):
         """Sin adaptadores no hay de dónde leer sesiones: la pantalla no

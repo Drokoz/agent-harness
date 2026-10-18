@@ -37,6 +37,28 @@ def cargar_declaracion(path=DECLARACION) -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
+# El bucle corta con K intentos seguidos sin ningún progreso (#141):
+# seis intentos (≈ 30 min de agente a los ~5 min por intento que mide el
+# reloj de #116) sin un solo PR verde ya dice "esto no avanza".
+BUCLE_DEFAULT = {"intentos_sin_progreso": 6}
+
+
+def bucle_de(declaracion) -> int:
+    """Con cuántos intentos sin progreso corta el bucle (#141): el K que el
+    repo declara en `bucle.intentos_sin_progreso` de `routing.json`, con el
+    default razonable cuando no declara nada o declara algo que no vale
+    (no un entero ≥ 1): el default es el que corta la noche que se comió a
+    sí misma (#139), un `0` o una cadena no lo van a cortar."""
+    k = BUCLE_DEFAULT["intentos_sin_progreso"]
+    if isinstance(declaracion, dict):
+        b = declaracion.get("bucle")
+        if isinstance(b, dict):
+            v = b.get("intentos_sin_progreso")
+            if isinstance(v, int) and not isinstance(v, bool) and v >= 1:
+                k = v
+    return k
+
+
 def leer_models(path=MODELS) -> Optional[dict]:
     """`~/.pi/agent/models.json` crudo, o None si no existe o no se lee."""
     try:

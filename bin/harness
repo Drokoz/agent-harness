@@ -223,7 +223,7 @@ from harness.snapshot import as_dict, snapshot  # noqa: E402
 from harness import usage as usage_mod  # noqa: E402
 from harness.usage import (Cuota, EstadoCuota, UsageIlegible,  # noqa: E402
                            aplicar_cuota)
-from harness.state import (costo_promedio, de_ticket, intentos, intentos_pr,  # noqa: E402
+from harness.state import (ceremonia, costo_promedio, de_ticket, intentos, intentos_pr,  # noqa: E402
                            intentos_pr_que_escalan, intentos_que_escalan,
                            minutos_de_ticket, motivos_de_abandono,
                            motivos_de_abandono_pr, pasos, ultimo_gate_rojo,
@@ -690,6 +690,13 @@ def resumen_de(args, snap, contexts, quota_agg, quota_registros):
     resumen = construir(eventos, prs,
                         desde=None if desde_dt is None else _iso_utc(desde_dt),
                         hasta=_ahora_str(), resolver_pr=_resolver_pr(snap))
+    # La ceremonia de la corrida (#141) se mide en la ventana del período:
+    # la razón que se degrada cuando hay actividad sin avance (la noche
+    # del 6→7, #139). `ceremonia` ya devuelve un dict con sus cuatro claves.
+    resumen = replace(resumen,
+                      ceremonia=ceremonia(eventos,
+                                          desde=_iso_utc(desde_dt)
+                                          if desde_dt is not None else None).__dict__)
     if quota_agg is None:
         return resumen
     return _con_cuota(resumen, eventos_todos, contexts, quota_agg, quota_registros)
@@ -1356,7 +1363,10 @@ def _run_loop(args, contexts, log_path):
     # foto de ahora y cada pasada la relee (arriba) para ver el cambio. La
     # CLI puede acotarlo más, no amplificarlo por encima de la config.
     piso, max_pasadas = _topes_bucle(args, contexts[0])
-    spec = BucleSpec(piso=piso, max_pasadas=max_pasadas)
+    # #141: el umbral de ceremonia se declara en el repo (routing.json),
+    # con default razonable: sin sensor, la noche del 6→7 (#139) vuelve.
+    k = routing_mod.bucle_de(routing_mod.cargar_declaracion())
+    spec = BucleSpec(piso=piso, max_pasadas=max_pasadas, ceremonia_max=k)
     # #114: preguntar barato antes de barrer completo. Sin slug resolvable
     # (o con --sin-vigilar) no existe: cada vuelta barra completo.
     vigilar = None if args.sin_vigila else _armar_vigilar(contexts)

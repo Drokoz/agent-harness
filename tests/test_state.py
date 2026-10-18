@@ -733,5 +733,107 @@ class TestCostoPromedio(unittest.TestCase):
         self.assertAlmostEqual(state.costo_promedio(evs), 0.6)
 
 
+
+
+
+class TestCeremonia(unittest.TestCase):
+    """El sensor de ceremonia (#141): intentos y gasto contra progreso
+    (gate verde con PR), medidos en la ventana de la corrida (#139).
+
+    El log sintético reproduce la noche del 6→7 de septiembre (#139):
+    seis horas de reintentos sin un solo PR verde.
+    """
+
+    HORA = "2026-09-06T{h:02d}:00:00Z"
+
+    @classmethod
+    def _ts(cls, h, mm):
+        return "2026-09-06T{:02d}:{:02d}:00Z".format(h, mm)
+
+    def intento(self, h, run, ticket="koku#7", fallo=False):
+        if fallo:
+            return ev("agente", "ticket/7", "fallo: no arranco",
+                      self._ts(h, 0), run_id=run, ticket=ticket, attempt=h)
+        # Cada reintento sube `attempt`, como lo numera el dispatcher.
+        return ev("agente", "ticket/7", "koku-7 (kind pi, pane w9:p1)",
+                  self._ts(h, 0), run_id=run, ticket=ticket, attempt=h)
+
+    def bloque(self, h, run):
+        """Un intento que termina en abandono: arranca, gate rojo, costo,
+        abandono. Un bloque por hora, como la noche real."""
+        return [
+            self.intento(h, run),
+            ev("gate", "ticket/7", "rojo: unittest", self._ts(h, 10), run_id=run),
+            ev("costo", "ticket/7", "$0.50", self._ts(h, 12), run_id=run),
+            ev("abandono", "ticket/7", "gate rojo en el worktree: sin PR",
+               self._ts(h, 15), run_id=run, clase="modelo"),
+        ]
+
+    def noche_6_7(self):
+        evs = [ev("corrida", "corrida", "inicio: 1 ticket(s)", self._ts(0, 0),
+                 run_id="c0")]
+        for i in range(6):
+            evs += self.bloque(1 + i, "r{}".format(i + 1))
+        return evs
+
+    def test_la_noche_6_a_7_se_mide_entera(self):
+        c = state.ceremonia(self.noche_6_7(), desde=self._ts(0, 0))
+        self.assertEqual(c.intentos, 6)
+        self.assertEqual(c.progresos, 0)
+        self.assertEqual(c.racha, 6, "sin progreso, la racha es todo")
+        self.assertAlmostEqual(c.usd, 3.0)
+        # 6 corridas de 15 min cada una (mismos minutos que el reloj de #116).
+        self.assertAlmostEqual(c.minutos, 90.0)
+
+    def test_sin_desde_mide_el_log_entero(self):
+        c = state.ceremonia(self.noche_6_7())
+        self.assertEqual((c.intentos, c.progresos), (6, 0))
+
+    def test_desde_acota_a_la_corrida(self):
+        """Regla de #139: la ventana es de ESTA corrida, no del log entero."""
+        c = state.ceremonia(self.noche_6_7(), desde=self._ts(3, 0))
+        self.assertEqual(c.intentos, 4, "los bloques de las 3, 4, 5 y 6")
+        self.assertAlmostEqual(c.usd, 2.0)
+        self.assertEqual(c.progresos, 0)
+
+    def test_un_pr_verde_es_progreso_y_corta_el_contador(self):
+        evs = self.bloque(1, "r1") + self.bloque(2, "r2")
+        evs.append(ev("gate", "ticket/7", "verde", self._ts(3, 20), run_id="r2"))
+        evs.append(ev("pr", "ticket/7", "PR #21 abierto (gate verde)",
+                      self._ts(3, 21), run_id="r2"))
+        evs += [self.intento(4, "r3"), self.intento(5, "r4")]
+        c = state.ceremonia(evs, desde=self._ts(0, 0))
+        self.assertEqual(c.progresos, 1)
+        self.assertEqual(c.intentos, 4, "los cuatro de la ventana")
+        self.assertEqual(c.racha, 2, "la racha: sólo los que van DESPUÉS del PR")
+        self.assertEqual(c.ratio, 4.0)
+
+    def test_intentos_fallidos_cuentan(self):
+        evs = [self.intento(1, "r1", fallo=True),
+               self.intento(2, "r2", fallo=True)]
+        c = state.ceremonia(evs)
+        self.assertEqual(c.intentos, 2)
+
+    def test_ventana_vacia(self):
+        c = state.ceremonia(self.noche_6_7(), desde="2026-09-09T00:00:00Z")
+        self.assertEqual((c.intentos, c.progresos), (0, 0))
+        self.assertEqual(c.ratio, 0.0)
+
+    def test_un_intento_es_ticket_e_intento_no_la_pasada(self):
+        """En producción el run_id es de la pasada entera (hasta --max
+        tickets): dos agentes en la misma pasada son dos intentos."""
+        evs = [self.intento(1, "p1", ticket="koku#7"),
+               self.intento(1, "p1", ticket="koku#8")]
+        self.assertEqual(state.ceremonia(evs).intentos, 2)
+
+    def test_el_mantenedor_no_es_ceremonia(self):
+        """Resolver conflictos de un PR (ticket `repo#prN`) no escribe
+        línea `pr`: si contara como ceremonia, una noche que destraba PRs
+        se cortaría sola."""
+        evs = [self.intento(1, "p1", ticket="koku#pr5"),
+               self.intento(2, "p2", ticket="koku#pr6")]
+        self.assertEqual(state.ceremonia(evs).intentos, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
