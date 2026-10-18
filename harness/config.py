@@ -30,6 +30,7 @@ con el nombre del contexto y el campo que hay que arreglar.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -331,10 +332,10 @@ def _topes(raw, donde):
     for campo in ("budget_minutos", "piso", "max_usd"):
         if campo in raw:
             v = _num(raw[campo], '"{}"'.format(campo), donde)
-            if v < 0:
+            if not (v >= 0 and math.isfinite(v)):
                 raise ConfigError(
-                    '{}: "{}" tiene que ser mayor o igual que cero'.format(
-                        donde, campo))
+                    '{}: "{}" tiene que ser un número finito mayor o igual '
+                    'que cero'.format(donde, campo))
             kw[campo] = v
     if "max_pasadas" in raw:
         v = raw["max_pasadas"]

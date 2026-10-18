@@ -179,6 +179,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -453,8 +454,7 @@ def main(argv=None):
         return quota_main(args, contexts)
     if args.command == "usage":
         return usage_main(args, contexts)
-    if getattr(args, "max_usd", None) is not None and args.max_usd < 0:
-        sys.stderr.write("harness: --max-usd tiene que ser >= 0\n")
+    if _validar_max_usd(args):
         return 2
     if args.command == "run":
         try:
@@ -1366,6 +1366,16 @@ def _topes_bucle(args, ctx):
     max_pasadas = (t.max_pasadas if args.max_pasadas is None
                    else min(t.max_pasadas, args.max_pasadas))
     return piso, max_pasadas
+
+
+def _validar_max_usd(args):
+    """2 si `--max-usd` no es un número finito >= 0 (NaN cierra, #165)."""
+    v = getattr(args, "max_usd", None)
+    if v is not None and not (v >= 0 and math.isfinite(v)):
+        sys.stderr.write("harness: --max-usd tiene que ser un número finito "
+                         ">= 0\n")
+        return 2
+    return 0
 
 
 def _max_usd(args, ctx):

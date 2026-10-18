@@ -694,20 +694,28 @@ def motivo_presupuesto_reloj(minutos, budget_minutos):
 
 
 # ------------------------------------------------------------ tope de gasto
+# Sin costo medio en el historial (primer arranque), cada job pagado se
+# estima en esto: conservador, para que una corrida sin crédito medible no
+# despache la tanda entera contra un estimado de cero.
+ESTIMADO_SIN_HISTORIAL = 1.0
+
+
 def motivo_tope_gasto(max_usd, gastado, estimado):
     """(#165) Por qué un job que cuesta plata NO se despacha, o "" si cabe.
 
     `max_usd` es el tope de gasto de la corrida (un techo, no un piso),
     `gastado` lo que la corrida lleva gastado (más lo reservado por los
     jobs en vuelo) y `estimado` el costo medio de un job
-    (`state.costo_promedio`; None = sin historial, se estima 0). Con tope
+    (`state.costo_promedio`; None = sin historial, se estima
+    `ESTIMADO_SIN_HISTORIAL`). Con tope
     0 no sale ningún job pagado; si no, no sale si gastado + estimado
     supera el tope, ni si el tope ya se alcanzó."""
-    est = estimado or 0.0
-    if max_usd <= 0:
+    est = ESTIMADO_SIN_HISTORIAL if estimado is None else estimado
+    if not max_usd > 0:
         return ("tope de gasto US$0.00: la corrida no autoriza gastar plata "
                 "(topes.max_usd / --max-usd)")
-    if gastado >= max_usd or gastado + est > max_usd:
+    # Escrito para que un NaN en cualquier lado cierre, no abra.
+    if not (gastado < max_usd and gastado + est <= max_usd):
         return ("tope de gasto: gastado US${:.2f} + estimado US${:.2f} "
                 "supera el tope de US${:.2f} de la corrida".format(
                     gastado, est, max_usd))
@@ -765,8 +773,16 @@ class TopeGasto:
             if motivo:
                 self.rechazados += 1
             else:
-                self._reservas[id(job)] = self.estimado or 0.0
+                self._reservas[id(job)] = (ESTIMADO_SIN_HISTORIAL
+                                           if self.estimado is None
+                                           else self.estimado)
             return motivo
+
+    def liberar(self, token):
+        """Suelta una reserva sin pasarla a gasto cerrado (el revisor: su
+        costo real lo trae el delta de créditos cuando se puede medir)."""
+        with self._lock:
+            self._reservas.pop(id(token), None)
 
     def cerrar(self, jobs):
         """Al final de la tanda: las reservas pasan a gasto cerrado, con el
@@ -1235,6 +1251,7 @@ class Dispatcher:
         self.credits = credits or (lambda: None)  # () -> usado (float) | None
         # Jobs pagados que el tope de gasto dejó sin despachar (#165).
         self._sin_despachar_gasto = 0
+        self._lock_gasto = threading.Lock()
         # Sin inyectar, el reloj real; resuelto en la llamada para que
         # parchear `time.sleep` alcance a esta instancia.
         self.dormir = dormir or time.sleep
@@ -1517,7 +1534,8 @@ class Dispatcher:
             return ""
         motivo = tope.reservar(job)
         if motivo:
-            self._sin_despachar_gasto += 1
+            with self._lock_gasto:
+                self._sin_despachar_gasto += 1
         return motivo
 
     def _permitir_claude(self, job):
@@ -2126,11 +2144,27 @@ class Dispatcher:
         clasifica `fallida`) y hasta un error inesperado —un bug del
         revisor— no tumba un job que ya terminó bien: la review queda
         `fallida` y el PR igual aparece en el resumen."""
+        revisor = self._revisor()
+        tope = self.spec.tope_gasto
+        token = None
+        if (tope is not None and getattr(revisor, "kind", "pi")
+                not in RUNNERS_SIN_CREDITOS):
+            # #165: el revisor por defecto es pi y gasta plata, aunque el
+            # job haya sido de Claude: pasa por el tope como cualquier job.
+            token = object()
+            motivo = tope.reservar(token)
+            if motivo:
+                self._log(job, "review", ref,
+                          "PR #{}: review omitida: {}".format(num, motivo))
+                return
         try:
-            revision = self._revisor().revisar_pr(job.slug, num)
+            revision = revisor.revisar_pr(job.slug, num)
         except Exception as e:
             revision = Revision("fallida",
                                 motivo="error del revisor: {}".format(e))
+        finally:
+            if token is not None:
+                tope.liberar(token)
         self._log(job, "review", ref, cuerpo_revision(num, revision))
 
     def _pr_mide_el_head(self, job, ref, num):

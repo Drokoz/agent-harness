@@ -2598,9 +2598,10 @@ class TestTopeDeGasto(unittest.TestCase):
         job pagado reserva US$1.00: con tope 2.5 salen dos, no la tanda
         entera."""
         tope = dispatch.TopeGasto(2.5)
-        for _ in range(2):
-            self.assertEqual(tope.reservar(object()), "")
-        self.assertIn("tope de gasto", tope.reservar(object()))
+        jobs = [object() for _ in range(3)]  # vivos: la reserva va por id
+        for j in jobs[:2]:
+            self.assertEqual(tope.reservar(j), "")
+        self.assertIn("tope de gasto", tope.reservar(jobs[2]))
         self.assertAlmostEqual(tope.gastado(), 2.0)
 
     def test_nan_cierra(self):
