@@ -26,7 +26,7 @@ que entró antes y cuenta dos veces lo que entró dos veces — no aparece en ni
 
 ## Regla 2 — Una fuente que no se pudo leer se reporta como ilegible, nunca como "no había nada"
 
-**Cumple.** La distinción `None` (no se pudo leer) vs `[]` (leído, y no hay nada) se hace
+**Parcial** (issue #178). La distinción `None` (no se pudo leer) vs `[]` (leído, y no hay nada) se hace
 en los adaptadores y sobrevive hasta la pantalla y el exit code. Casos:
 
 - **El tracker**: `issues: None` degrada el repo (`harness/snapshot.py:381-382`);
@@ -41,7 +41,7 @@ en los adaptadores y sobrevive hasta la pantalla y el exit code. Casos:
   estado. **Matiz honesto:** un binario de herdr caído en el medio de la sesión se lee
   como "ninguno trabajando", no como "ilegible". Consecuencia contenida: `estado_frontier`
   (`harness/state.py:525`) marca el ticket `libre` y se re-despacha — gasto de un
-  intento, no un dato falso duradero —, pero la pantalla sí miente.
+  intento, no un dato falso duradero —, pero la pantalla sí miente — por eso la regla queda **Parcial**: #178.
 - **El PR/estado en vivo**: `pr_state` devuelve `None` si no se pudo consultar
   (`harness/adapters.py:218-229`); el ticket se queda con lo que dice el log, sin
   corregirse a ciegas (`harness/summary.py:309-322`).
@@ -106,7 +106,7 @@ Tres issues:
 
 | Parte | Estado |
 |---|---|
-| Lugar que el agente no edita | **Cumple**: la config vive en `~/.config/harness/config.json`, fuera del repo y fuera del worktree, y el guard bloquea escrituras fuera del worktree (`extensions/harness-guard/reglas.ts:288` + la regla `write/edit` al final de `reglas.ts`); el dispatcher la lee, nunca la escribe (`harness/adapters.py:93-105`) |
+| Lugar que el agente no edita | **Cumple**: la config vive en `~/.config/harness/config.json`, fuera del repo y fuera del worktree, y el guard bloquea escrituras fuera del worktree (`extensions/harness-guard/reglas.ts:293-294`); el dispatcher la lee, nunca la escribe (`harness/adapters.py:93-105`) |
 | Releídas en cada corrida | **No**: se leen una vez al arrancar el proceso (`bin/harness:378`) y la corrida entera —incluido `--loop`, que puede durar la noche— corre con esa foto. Issue #163 abajo |
 | Si no se pueden leer, se detiene | **No**: sin config en el disco se usan los defaults del código en silencio. Issue #164 abajo |
 
@@ -140,7 +140,7 @@ Tres issues: #165, #166, #167.
 
 | Parte | Estado |
 |---|---|
-| Solo lectura donde solo se lee | **Parcial**: el revisor de diff corre en pi con `--tools read,grep,find,ls` (`harness/review.py:262,273-276`); el guard de máquina bloquea merge/force-push/DELETE fuera del worktree (`extensions/harness-guard/reglas.ts:185,191-193`); pero el peldaño Claude no tiene el equivalente forzado (sus skills de proyecto se cargan igual, `docs/harness/sesion-minima.md`): issue #167 abajo |
+| Solo lectura donde solo se lee | **Parcial**: el revisor de diff corre en pi con `--tools read,grep,find,ls` (`harness/review.py:262,273-276`); el guard de máquina bloquea merge (`reglas.ts:185`), force-push (`reglas.ts:142`) y `gh api` DELETE (`reglas.ts:191-193`); pero el peldaño Claude no tiene el equivalente forzado (sus skills de proyecto se cargan igual, `docs/harness/sesion-minima.md`): issue #167 abajo |
 | Tope de gasto por corrida | **Parcial**: minutos de agente por ticket —el tope real, porque es la moneda que se acaba— con su ventana declarada (#116, `harness/dispatch.py:881`, `harness/state.py:120`, `bin/harness:619`); créditos solo como **piso** entre pasadas (`harness/dispatch.py:632`, `744-746`): impide arrancar, no detiene. Issues #165 y #166 abajo |
 
 **Issue #165 — el tope de gasto de la corrida no existe como tope: es piso, no techo.**
@@ -208,4 +208,4 @@ Abiertos el 2026-10-18, todos `ready-for-agent` y con #152 como parent (sub-issu
 | #166 | 6 | Los topes de la corrida no son preferencias re-leídas de config: defaults del código + flags de CLI |
 | #167 | 6 | La restricción de solo lectura / de escritura solo está forzada en pi; el peldaño Claude se sostiene con el prompt |
 
-Cada issue trae su propio test que reproduce el caso; este ticket no cambió código.
+Cada issue trae su propio test que reproduce el caso; este ticket no cambió código. Las citas `archivo:línea` son contra main `0628781`.
