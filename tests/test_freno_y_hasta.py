@@ -18,7 +18,7 @@ from harness import dispatch
 from harness.config import ConfigError, parse_config
 from harness.dispatch import BucleSpec, Dispatcher, EventLog, Pasada, bucle
 
-from test_dispatch import Mundo, job, log_en, spec
+from test_dispatch import PANE_CERO, Mundo, job, log_en, spec
 from test_smoke import load_harness_offline
 
 TZ = dispatch.TZ_SERVIDOR
@@ -270,3 +270,218 @@ class TestCliHasta(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ------------------------------------------------- revisión independiente
+import io  # noqa: E402
+import os  # noqa: E402
+import shutil  # noqa: E402
+from unittest import mock  # noqa: E402
+
+import test_bucle  # noqa: E402
+import test_proposal  # noqa: E402
+from harness.dispatch import DispatchSpec  # noqa: E402
+from harness.proposal import JUEZ_QWEN, Proponer  # noqa: E402
+
+
+class TestProponerConFreno(unittest.TestCase):
+    """El proposer de frontera vacía también lanza agentes: el freno y la
+    hora límite valen antes de cada uno (generador y juez)."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.repo_path = self.d / "repos" / "fake"
+        self.repo_path.mkdir(parents=True)
+        self.freno = self.d / "freno"
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _correr(self, mundo, **kw):
+        spec = DispatchSpec(contexto="t", kind="pi", model="qwen/qwen3.8-27b",
+                            freno=str(self.freno), **kw)
+        log = EventLog(self.d / "ev.jsonl", "t")
+        prop = Proponer(spec, log, run_cmd=mundo.cmd)
+        res = prop.proponer_repo("fake", "Drokoz/fake", str(self.repo_path),
+                                 3, JUEZ_QWEN)
+        return res, leer(log)
+
+    def test_freno_puesto_el_proposer_no_lanza_agentes(self):
+        self.freno.write_text("")
+        mundo = test_proposal.MundoProponer(
+            known_issues=[], proposals=[test_proposal._propuesta()])
+        res, eventos = self._correr(mundo)
+        self.assertEqual([c for c in mundo.llamadas
+                          if c[0][:3] == ("herdr", "agent", "start")], [])
+        self.assertEqual([e for e in eventos if e["tipo"] == "worktree"], [])
+        self.assertEqual(res["abiertas"], 0)
+        self.assertTrue(any("freno" in d for d in res["detalle"]),
+                        res["detalle"])
+        self.assertTrue(any(e["tipo"] == "corte" and "freno" in e["cuerpo"]
+                            for e in eventos), eventos)
+
+    def test_hasta_pasada_el_proposer_no_lanza_agentes(self):
+        mundo = test_proposal.MundoProponer(
+            known_issues=[], proposals=[test_proposal._propuesta()])
+        hasta = datetime(2026, 10, 18, 7, 0, tzinfo=TZ)
+        spec = DispatchSpec(contexto="t", kind="pi", hasta=hasta)
+        log = EventLog(self.d / "ev.jsonl", "t")
+        prop = Proponer(spec, log, run_cmd=mundo.cmd,
+                        ahora=lambda: hasta + timedelta(minutes=1))
+        res = prop.proponer_repo("fake", "Drokoz/fake", str(self.repo_path),
+                                 3, JUEZ_QWEN)
+        self.assertEqual(res["abiertas"], 0)
+        self.assertTrue(any("hora límite" in d for d in res["detalle"]),
+                        res["detalle"])
+
+
+class TestBucleNoProponeConFreno(unittest.TestCase):
+    def test_freno_tras_la_pasada_vacia_no_corre_el_proposer(self):
+        with tempfile.TemporaryDirectory() as d:
+            freno = Path(d) / "freno"
+            llamados = []
+
+            def pasada():
+                freno.write_text("")
+                return Pasada(False, "nada")
+
+            log = EventLog(Path(d) / "ev.jsonl", "h")
+            corte = bucle(pasada, BucleSpec(), log, freno=str(freno),
+                          dormir=lambda s: None,
+                          proposer_vacio=lambda: llamados.append(1) or "x")
+        self.assertEqual(llamados, [])
+        self.assertIn("freno", corte)
+
+    def test_hasta_tras_la_pasada_vacia_no_corre_el_proposer(self):
+        hasta = datetime(2026, 10, 18, 7, 0, tzinfo=TZ)
+        reloj = {"t": hasta - timedelta(minutes=5)}
+        llamados = []
+
+        def pasada():
+            reloj["t"] = hasta + timedelta(minutes=1)
+            return Pasada(False, "nada")
+
+        with tempfile.TemporaryDirectory() as d:
+            log = EventLog(Path(d) / "ev.jsonl", "h")
+            corte = bucle(pasada, BucleSpec(), log, dormir=lambda s: None,
+                          hasta=hasta, ahora=lambda: reloj["t"],
+                          proposer_vacio=lambda: llamados.append(1) or "x")
+        self.assertEqual(llamados, [])
+        self.assertIn("hora límite", corte)
+
+
+class TestRequeueTrasElCorte(unittest.TestCase):
+    def test_el_job_recolocado_tras_el_corte_cuenta_como_sin_despachar(self):
+        """Un job que perdió el prompt y vuelve a la cola cuando el freno ya
+        está puesto no se pierde del conteo del corte."""
+        with tempfile.TemporaryDirectory() as d:
+            freno = Path(d) / "freno"
+            # El prompt nunca llega (contexto 0%): el job se recoloca, y
+            # para entonces el freno ya está puesto.
+            m = Mundo(pane_out=PANE_CERO)
+
+            def prompt(args):
+                freno.write_text("")
+                if "8" in args[3]:
+                    import time as _t
+                    _t.sleep(0.2)  # 8 vuelve a la cola DESPUÉS del corte
+                return (True, '{"result":{"agent":{"agent_status":"stalled"}}}')
+
+            m.responder(lambda a: a[:3] == ["herdr", "agent", "prompt"], prompt)
+            # 7 y 8 corren; 9 espera. El freno aparece con el prompt: 9 no
+            # arranca, y 7 y 8 vuelven a la cola después del corte.
+            res, lineas = despachar(m, [job(7), job(8), job(9)],
+                                    freno=str(freno), max_parallel=2,
+                                    verify_wait_s=0.01, verify_poll_s=0.01,
+                                    verify_retries=1)
+            self.assertTrue(any("vuelve a la cola" in l["cuerpo"]
+                                for l in lineas), "se recolocó")
+        (corte,) = cortes(lineas)
+        self.assertIn("3 job(s) sin despachar", corte)
+
+
+class TestHastaDeConfigSoloDeNoche(unittest.TestCase):
+    def setUp(self):
+        self.h = load_harness_offline()
+        self.ctx = TestCliHasta._ctx(None, "07:00")
+        self.inicio = datetime(2026, 10, 18, 14, 0, tzinfo=TZ)
+
+    def test_run_suelto_ignora_topes_hasta(self):
+        args = self.h.build_parser().parse_args(["run"])
+        self.assertIsNone(self.h._hasta_de(args, self.ctx, self.inicio))
+
+    def test_run_suelto_con_hasta_explicito_lo_usa(self):
+        args = self.h.build_parser().parse_args(["run", "--hasta", "18:00"])
+        self.assertEqual(self.h._hasta_de(args, self.ctx, self.inicio),
+                         datetime(2026, 10, 18, 18, 0, tzinfo=TZ))
+
+    def test_de_noche_vale_la_config(self):
+        args = self.h.build_parser().parse_args(["run", "--loop"])
+        self.assertEqual(
+            self.h._hasta_de(args, self.ctx, self.inicio, noche=True),
+            datetime(2026, 10, 18, 7, 0, tzinfo=TZ))
+
+
+class TestRunSueltoDeDiaConHastaEnConfig(unittest.TestCase):
+    """config `topes.hasta` 07:00, `harness run` a las 14:00 sin --hasta:
+    despacha normal. La hora límite de la config es de la noche (--loop)."""
+
+    _raw = test_bucle.LaFronteraSeRecalcula._raw
+    _issue = test_bucle.LaFronteraSeRecalcula._issue
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        conf = json.loads(test_bucle.LaFronteraSeRecalcula.CONFIG)
+        conf["contexts"]["h"]["topes"] = {"hasta": "07:00"}
+        self.d.joinpath("config.json").write_text(json.dumps(conf))
+        self.log_path = self.d / "events.jsonl"
+        self.cli = load_harness_offline()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_despacha_normal(self):
+        mundo = Mundo(prs=[{"number": 31, "headRefName": "ticket/9"}])
+        args = self.cli.build_parser().parse_args([
+            "run", "--context", "h", "--log", str(self.log_path)])
+        cli = self.cli
+        with mock.patch.object(cli, "OFFLINE", False), \
+             mock.patch.object(cli, "INICIO_CORRIDA",
+                               datetime(2026, 10, 18, 14, 0, tzinfo=TZ)), \
+             mock.patch.object(cli, "collect", return_value=self._raw(
+                 [self._issue(9, "ready-for-agent")])), \
+             mock.patch.object(cli.adapters, "run", mundo.cmd), \
+             mock.patch.object(cli, "_creditos_usado", return_value=None), \
+             mock.patch.object(cli, "_creditos_restantes", return_value=99.0), \
+             mock.patch.object(cli, "_sesiones_de_pi",
+                               return_value=(lambda *a: None, lambda *a: None)), \
+             mock.patch.dict(os.environ, {"HERDR_ENV": "1", "HOME": str(self.d),
+                                          "HARNESS_CONFIG_DIR": str(self.d)}), \
+             mock.patch("time.sleep"):
+            self.d.joinpath("repos", "agent-harness").mkdir(parents=True)
+            contexto = cli.load_config().select("h")
+            with mock.patch("sys.stdout", new=io.StringIO()):
+                code = cli.run_main(args, contexto)
+        eventos = test_bucle.leer_log(self.log_path)
+        self.assertEqual(code, 0)
+        self.assertEqual([e for e in eventos if e["tipo"] == "corte"], [])
+        self.assertTrue(any(e["tipo"] == "pr" and "PR #31 abierto" in e["cuerpo"]
+                            for e in eventos))
+
+
+class TestLoopConHastaPasada(unittest.TestCase):
+    def test_loop_con_hasta_pasada_sale_2_con_mensaje(self):
+        cli = load_harness_offline()
+        inicio = datetime(2026, 10, 18, 8, 0, tzinfo=TZ)
+        args = cli.build_parser().parse_args(["run", "--loop", "--hasta",
+                                              "07:00"])
+        ctx = TestCliHasta._ctx(None)
+        err = io.StringIO()
+        with mock.patch.object(cli, "INICIO_CORRIDA", inicio), \
+             mock.patch.object(cli, "_ahora_tz",
+                               return_value=inicio + timedelta(minutes=1)), \
+             mock.patch("sys.stderr", new=err):
+            code = cli.run_main(args, [ctx])
+        self.assertEqual(code, 2)
+        self.assertIn("hora límite 07:00", err.getvalue())
