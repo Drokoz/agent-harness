@@ -1017,8 +1017,10 @@ def run_main(args, contexts, solo=None):
                                       kind=peldano["kind"], model=peldano["model"],
                                       extra_args=tuple(peldano["extra_args"]),
                                       # #42: las skills del ticket salen de
-                                      # su body, no de la corrida.
-                                      skills=skills_de(i.body),
+                                      # su body, no de la corrida. #142: el
+                                      # body también lleva `## Parent`, la
+                                      # intención del spec para el prompt.
+                                      skills=skills_de(i.body), body=i.body,
                                       gate_tail=gate_tail, wip=wip,
                                       minutos_acumulado=minutos))
         # El tamaño de la tanda lo decide el presupuesto (#68): los
@@ -1195,7 +1197,8 @@ def _una_pasada(args, ctx, log):
                             kind=peldano["kind"], model=peldano["model"],
                             extra_args=tuple(peldano["extra_args"]),
                             # #42: las skills del ticket salen de su body.
-                            skills=skills_de(i.body),
+                            # #142: el body también lleva `## Parent`.
+                            skills=skills_de(i.body), body=i.body,
                             gate_tail=gate_tail, wip=wip,
                             minutos_acumulado=minutos))
     jobs = _filtrar_por_cuota(args, cuota, jobs, log)
