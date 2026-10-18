@@ -21,6 +21,14 @@ contexto, un worktree y un pane de herdr por ticket, con tope de paralelismo
 y nunca hay merge automático. Todo queda anotado en un log JSONL append-only de
 eventos. Un contexto con `autonomy: manual` no se toca solo.
 
+Ninguna corrida real sin plan aprobado (#176): `harness run --plan` (con los mismos
+flags que la corrida, p.ej. `--loop`) lista sin efectos lo que se despacharía —repo,
+ticket, runner, modelo, peldaño, por qué y costo estimado— y el total contra el tope;
+`harness aprobar` lo muestra, pide confirmación y deja
+`~/.local/state/harness/aprobado-FECHA` con su hash. `harness run` sin esa aprobación
+(o con un plan que cambió) sale distinto de cero sin crear nada. Ver
+`docs/harness/config.md` §"Plan aprobado".
+
 `harness usage` lee la cuota **real** de Claude (a nivel de cuenta): la
 statusline de las sesiones del harness si está fresca, si no `/usage` en un
 pane temporal de herdr. `harness run` la consulta antes de lanzar Claude:
