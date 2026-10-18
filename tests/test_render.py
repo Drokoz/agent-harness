@@ -450,6 +450,37 @@ class TestResumen(unittest.TestCase):
         self.assertNotIn("revisión", self.pantalla(r))
 
 
+class TestCeremonia(unittest.TestCase):
+    """La razón ceremonia/progreso de la corrida (#141) en la pantalla."""
+
+    def pantalla(self, resumen):
+        return render(SNAP, resumen=resumen, color=False)
+
+    def test_la_corrida_que_avanza_muestra_su_razon(self):
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    ceremonia={"intentos": 2, "minutos": 30.0, "usd": 1.25,
+                               "progresos": 2})
+        salida = self.pantalla(r)
+        linea = [l for l in salida.splitlines()
+                 if "ceremonia de la corrida" in l]
+        self.assertEqual(len(linea), 1)
+        self.assertIn("2 intento(s) / 2 progreso(s) (ratio 1.0)", linea[0])
+        self.assertIn("30 min", linea[0])
+        self.assertIn("US$1.25", linea[0])
+
+    def test_la_noche_sin_avance_muestra_la_degeneracion(self):
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z",
+                    ceremonia={"intentos": 6, "minutos": 300.0, "usd": 2.0,
+                               "progresos": 0})
+        linea = [l for l in self.pantalla(r).splitlines()
+                 if "ceremonia de la corrida" in l][0]
+        self.assertIn("6 intento(s) / 0 progreso(s) (ratio 6.0)", linea)
+
+    def test_sin_ceremonia_no_se_muestra(self):
+        r = Resumen(estado="ok", desde="2026-08-21T23:00:00Z")
+        self.assertNotIn("ceremonia", self.pantalla(r))
+
+
 class TestEstadoFrontera(unittest.TestCase):
     """El ticket #43: la línea de cada ticket de la frontera muestra su estado."""
 

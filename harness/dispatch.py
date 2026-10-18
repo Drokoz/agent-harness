@@ -925,12 +925,12 @@ def bucle(ejecutar_pasada, spec, log, creditos=None, freno=None,
             # progreso y nada verde: esperar más no va a mergear nada.
             cer = state.ceremonia(leer_eventos(alvo.path),
                                   desde=desde_corrida)
-            if cer.intentos >= spec.ceremonia_max:
+            if cer.racha >= spec.ceremonia_max:
                 motivo = ("ceremonia: {} intentos sin progreso "
                           "({} min de agente, US${:.2f} desde el último "
                           "progreso; tope {})".format(
-                              cer.intentos, int(round(cer.minutos)),
-                              cer.usd, spec.ceremonia_max))
+                              cer.racha, int(round(cer.racha_minutos)),
+                              cer.racha_usd, spec.ceremonia_max))
                 break
         esperado += espera
         dormir(espera)

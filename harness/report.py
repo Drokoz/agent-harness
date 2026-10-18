@@ -144,6 +144,15 @@ def _resumen(r):
         cifras.append(("Cuota de la semana",
                        f"{round(cuota_semana):,} tok ({round(harness):,} harness)",
                        "machine"))
+    # La razón ceremonia/progreso de la corrida (#141): con cuántos
+    # intentos se compraron los progresos de la ventana.
+    cer = r.get("ceremonia")
+    if cer:
+        intentos, prog = cer.get("intentos") or 0, cer.get("progresos") or 0
+        ratio = (intentos / prog) if prog else float(intentos)
+        cifras.append(("Ceremonia de la corrida",
+                       f"{intentos} intentos / {prog} progreso (ratio {ratio:.1f})",
+                       "machine"))
     kpis = "".join(
         f'<div class="kpi"><span class="kpi-n is-{t}">{_esc(v)}</span>'
         f'<span class="kpi-l">{_esc(l)}</span></div>' for l, v, t in cifras)

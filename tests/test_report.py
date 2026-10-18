@@ -132,6 +132,18 @@ class TestCuota(unittest.TestCase):
         h = render_html(snap())
         self.assertNotIn("Cuota de la semana", h)
 
+    def test_ceremonia_de_la_corrida(self):
+        """La razón ceremonia/progreso de la corrida (#141)."""
+        s = snap()
+        s["resumen"]["ceremonia"] = {"intentos": 6, "minutos": 300.0,
+                                     "usd": 2.0, "progresos": 0}
+        h = render_html(s)
+        self.assertIn("Ceremonia de la corrida", h)
+        self.assertIn("6 intentos / 0 progreso (ratio 6.0)", h)
+
+    def test_sin_ceremonia_no_muestra_el_kpi(self):
+        self.assertNotIn("Ceremonia de la corrida", render_html(snap()))
+
     def test_costo_por_ticket_en_las_dos_monedas(self):
         s = snap()
         s["resumen"]["tickets"] = [{"repo": "agent-harness", "number": 2,

@@ -782,6 +782,7 @@ class TestCeremonia(unittest.TestCase):
         c = state.ceremonia(self.noche_6_7(), desde=self._ts(0, 0))
         self.assertEqual(c.intentos, 6)
         self.assertEqual(c.progresos, 0)
+        self.assertEqual(c.racha, 6, "sin progreso, la racha es todo")
         self.assertAlmostEqual(c.usd, 3.0)
         # 6 corridas de 15 min cada una (mismos minutos que el reloj de #116).
         self.assertAlmostEqual(c.minutos, 90.0)
@@ -805,8 +806,9 @@ class TestCeremonia(unittest.TestCase):
         evs += [self.intento(4, "r3"), self.intento(5, "r4")]
         c = state.ceremonia(evs, desde=self._ts(0, 0))
         self.assertEqual(c.progresos, 1)
-        self.assertEqual(c.intentos, 2, "sólo los que van DESPUÉS del PR")
-        self.assertEqual(c.ratio, 2.0)
+        self.assertEqual(c.intentos, 4, "los cuatro de la ventana")
+        self.assertEqual(c.racha, 2, "la racha: sólo los que van DESPUÉS del PR")
+        self.assertEqual(c.ratio, 4.0)
 
     def test_intentos_fallidos_cuentan(self):
         evs = [self.intento(1, "r1", fallo=True),

@@ -137,6 +137,12 @@ class Resumen:
     costo: float = 0.0
     cuota_semana: Optional[float] = None
     cuota_semana_harness: Optional[float] = None
+    # La ceremonia de la corrida (#141), medida en la ventana del período:
+    # intentos (después del último progreso), minutos de agente, US$ y
+    # progresos; la razón la calcula la pantalla. Sale de `harness.state`,
+    # que importa de `summary`, así que el cruce lo hace el CLI, igual que
+    # la cuota. None cuando no se calculó (offline).
+    ceremonia: Optional[dict] = None
 
     @property
     def paso_algo(self):
@@ -403,4 +409,5 @@ def as_dict(r: Resumen):
         "costo": r.costo,
         "cuota_semana": r.cuota_semana,
         "cuota_semana_harness": r.cuota_semana_harness,
+        "ceremonia": dict(r.ceremonia) if r.ceremonia is not None else None,
     }
