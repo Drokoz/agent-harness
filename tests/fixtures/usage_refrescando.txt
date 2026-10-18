@@ -1,0 +1,40 @@
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+  1 more notice hidden
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $0.0000
+   Total duration (API):  0s
+   Total duration (wall): 30s
+   Total code changes:    0 lines added, 0 lines removed
+   Usage:                 0 input, 0 output, 0 cache read, 0 cache write
+
+
+   Plugin skill-listing footprint
+   What each plugin's skill descriptions add to the system prompt (cached input after
+   the first turn). Agents and MCP tools not yet counted.
+
+   vercel                      4 skills · ~169 tok/turn
+   product-management          1 skill · ~32 tok/turn
+
+   Total                       ~200 tok/turn
+
+   Current session
+   █████████                                          18% used
+   Resets 1:10am (America/Santiago)
+
+   Current week (all models)
+   ███                                                6% used
+   Resets Oct 23, 6pm (America/Santiago)
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine — does not include other devices
+   or claude.ai
+
+   Scanning local sessions…
+
+   Refreshing…
+
+   Esc to cancel

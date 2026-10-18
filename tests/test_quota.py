@@ -206,6 +206,51 @@ class TestSemanaInicio(unittest.TestCase):
                          dt("2026-08-14T21:00:00"))
 
 
+class TestResetEnUtc(unittest.TestCase):
+    """#148: el reset es viernes 21:00 UTC fijo, no 17:00 hora de Chile.
+    En julio (UTC-4) cae a las 17:00 locales; en octubre (UTC-3, horario de
+    verano) a las 18:00 — lo que dice `/usage`."""
+
+    def test_julio_el_reset_es_17_locales(self):
+        inicio = semana_inicio(dt("2026-07-08T12:00:00"))
+        self.assertEqual(inicio, dt("2026-07-03T21:00:00"))
+        self.assertEqual(inicio.strftime("%H:%M"), "17:00")
+
+    def test_octubre_el_reset_es_18_locales(self):
+        inicio = semana_inicio(dt("2026-10-20T12:00:00"))
+        self.assertEqual(inicio, dt("2026-10-16T21:00:00"))
+        self.assertEqual(inicio.strftime("%H:%M %z"), "18:00 -0300")
+
+    def test_octubre_los_bordes(self):
+        self.assertEqual(semana_inicio(dt("2026-10-23T20:59:59")),
+                         dt("2026-10-16T21:00:00"))
+        self.assertEqual(semana_inicio(dt("2026-10-23T21:00:00")),
+                         dt("2026-10-23T21:00:00"))
+
+    def test_julio_los_bordes(self):
+        self.assertEqual(semana_inicio(dt("2026-07-10T20:59:59")),
+                         dt("2026-07-03T21:00:00"))
+        self.assertEqual(semana_inicio(dt("2026-07-10T21:00:00")),
+                         dt("2026-07-10T21:00:00"))
+
+    def test_entre_17_y_18_locales_de_octubre_sigue_la_semana_vieja(self):
+        # Viernes 23-oct 17:30 SCL = 20:30 UTC: antes del reset real.
+        self.assertEqual(semana_inicio(dt("2026-10-23T20:30:00")),
+                         dt("2026-10-16T21:00:00"))
+
+    def test_la_tabla_muestra_la_hora_local_real(self):
+        regs = [{"timestamp": dt("2026-10-20T12:00:00"),
+                 "modelo": "claude-opus-5", "dir": "-u-docs-koku",
+                 "archivo": "a.jsonl",
+                 "tokens": {"input": 10, "cache_creation": 0,
+                            "cache_read": 0, "output": 0, "thinking": 0,
+                            "total": 10}}]
+        texto = render_quota(agregar(regs, RAIZ))
+        self.assertNotIn("reset vie 17:00", texto)
+        self.assertIn("vie 21:00 UTC", texto)
+        self.assertIn("2026-10-16 18:00", texto)
+
+
 class TestPico5h(unittest.TestCase):
     def test_racha_dentro_de_la_ventana(self):
         v, desde, hasta = pico_5h([(dt("2026-08-25T10:00:00"), 1000),

@@ -1,0 +1,15 @@
+   Current session
+   ████████▌                                          17% used
+   Resets 1:10am (America/Santiago)
+
+   Current week (all models)
+   ███                                                6% used
+   Resets Oct 23, 6pm (America/Santiago)
+
+   Current week (Fable)
+                                                      0% used
+   Resets Oct 23, 6pm (America/Santiago)
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine — does not include other devices
+   or claude.ai

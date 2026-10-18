@@ -19,3 +19,15 @@ para que un diff se lea; el contenido no se tocó, con una excepción: los monto
 `data.total_credits` y `data.total_usage`, que es todo lo que lee el harness — pero
 capturarla en vivo pide la API key personal, y el saldo real no es un dato que este
 repo necesite versionar.
+
+## `/usage` de Claude Code (`harness usage`)
+
+Texto de la pantalla, no JSON: `herdr pane read <pane> --source recent` sobre un
+pane con `claude` interactivo después de mandarle `/usage`, capturado en el
+homeserver el 2026-10-17. Barras y espacios tal cual.
+
+| archivo | qué es |
+| --- | --- |
+| `usage_homeserver.txt` | los tres buckets (sesión, semana, Fable) y el epígrafe de "What's contributing" |
+| `usage_refrescando.txt` | la pantalla entera mientras todavía dice "Refreshing…": arriba el bloque "Session" y el "Plugin skill-listing footprint" (con sus propios números, que el parser ignora), y todavía sin el bucket de Fable |
+| `usage_completo.txt` | ya refrescada, con la sección de abajo ("Last 24h", con porcentajes que NO son la cuota) y los resets con minutos (`5:59pm`) |

@@ -1,0 +1,38 @@
+   Current session
+   █████████                                          18% used
+   Resets 1:09am (America/Santiago)
+
+   Current week (all models)
+   ███                                                6% used
+   Resets Oct 23, 5:59pm (America/Santiago)
+
+   Current week (Fable)
+                                                      0% used
+   Resets Oct 23, 6pm (America/Santiago)
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine — does not include other devices
+   or claude.ai
+
+   Last 24h · these are independent characteristics of your usage, not a breakdown
+
+   92% of your usage was at >150k context
+    Longer sessions are more expensive even when cached. /compact mid-task, /clear
+    when switching to new tasks.
+
+   50% of your usage came from subagent-heavy sessions
+    Each subagent runs its own requests. Be deliberate about spawning them — and
+    consider configuring a cheaper model for simpler subagents.
+
+   17% of your usage came from subagents under "general-purpose"
+    If this runs frequently, consider configuring its subagents with a cheaper
+    model or tightening their prompts.
+                                                                                         ↓
+
+
+                                                                       ◐ medium · /effort
+───────────────────────────────────────────────────────────────────────────────────────────
+❯
+───────────────────────────────────────────────────────────────────────────────────────────
+  Opus 5.5
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
