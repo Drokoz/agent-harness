@@ -20,3 +20,9 @@ contexto, un worktree y un pane de herdr por ticket, con tope de paralelismo
 (`--max`, por defecto 2). El gate es la red: ningún PR sin `scripts/gate.sh` verde,
 y nunca hay merge automático. Todo queda anotado en un log JSONL append-only de
 eventos. Un contexto con `autonomy: manual` no se toca solo.
+
+`harness usage` lee la cuota **real** de Claude (a nivel de cuenta): la
+statusline de las sesiones del harness si está fresca, si no `/usage` en un
+pane temporal de herdr. `harness run` la consulta antes de lanzar Claude:
+espera el reset de la sesión de 5h si hace falta y dimensiona la tanda con
+la semana. Ver `docs/harness/quota.md`.

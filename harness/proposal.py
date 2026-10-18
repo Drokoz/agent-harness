@@ -241,6 +241,28 @@ def decidir_peldano_juez(forzado_qwen, tope_semanal, usado_semana,
                                                      piso)
 
 
+def decidir_peldano_juez_usage(forzado_qwen, semana_pct, sesion_pct,
+                               piso_frac, umbral_sesion):
+    """(peldaño, motivo) del juez (#115) con la cuota REAL de `/usage` (a
+    nivel de cuenta, `harness usage`): `semana_pct` y `sesion_pct` en 0-100.
+    El mismo piso que `decidir_peldano_juez`, pero sin calibración: el %
+    ya es del tope. Con la sesión de 5h sobre el umbral, Qwen: el juez no
+    espera un reset. Puro."""
+    if forzado_qwen:
+        return JUEZ_QWEN, "forzado a Qwen (--juez-qwen)"
+    if sesion_pct is not None and sesion_pct >= umbral_sesion * 100:
+        return JUEZ_QWEN, "/usage: sesión de 5h al {}% (umbral {:.0f}%): " \
+                          "corre en Qwen".format(sesion_pct, umbral_sesion * 100)
+    restante = 100 - semana_pct
+    if restante < piso_frac * 100:
+        return JUEZ_QWEN, "/usage: piso de cuota: queda {:.0f}% de la semana " \
+                          "(piso {:.0f}%): corre en Qwen".format(
+                              restante, piso_frac * 100)
+    return JUEZ_CLAUDE, "/usage: piso de cuota respetado: queda {:.0f}% de " \
+                        "la semana (piso {:.0f}%)".format(restante,
+                                                          piso_frac * 100)
+
+
 # ------------------------------------------------------------------- prompts
 def prompt_generador(maximo):
     """El trabajo del generador, en una línea. En inglés: es machine-facing.

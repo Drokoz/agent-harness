@@ -1,9 +1,151 @@
-# `harness quota`: la cuota de Claude por las sesiones locales
+# La cuota de Claude: `harness usage` (real) y `harness quota` (estimada)
 
-El `/usage` de Claude Code dice "based on local sessions on this machine": calcula
-el consumo leyendo los `.jsonl` de las sesiones locales. `harness quota` lee la
-misma fuente (`~/.claude/projects/**/*.jsonl`) y mide la cuota sola, sin anotar
-nada a mano. Cada línea de mensaje asistente trae el modelo y el `usage`
+Dos comandos, dos cosas distintas:
+
+- **`harness usage`**: la cuota **real**, la de la cuenta. Las barras de
+  `/usage` ("Current session", "Current week (all models)", "Current week
+  (Fable)") son server-side: incluyen el consumo de otros equipos (el Mac del
+  9-5, claude.ai). Es lo que usa `harness run` para decidir. Ver abajo.
+- **`harness quota`**: la **estimación** local, leyendo los `.jsonl` de
+  `~/.claude/projects`. Sirve para atribuir (por proyecto, por ticket,
+  harness vs resto), no para saber cuánto queda: no ve otras máquinas.
+
+Ojo con la advertencia de `/usage` "Approximate, based on local sessions on
+this machine — does not include other devices": **aplica sólo a la sección
+de abajo** ("What's contributing to your limits usage?"), no a las barras de
+arriba. Las barras son de la cuenta; esa sección (y `harness quota`) son
+locales.
+
+## `harness usage`: la cuota real
+
+    harness usage                  la tabla: % y reset de cada bucket, con la
+                                   fuente y la antigüedad de cada dato
+    harness usage --json           lo mismo, parseable
+    harness usage --fuente F       auto (por defecto) | statusline | usage
+    harness usage --pane ID        el pane de herdr desde el cual abrir el
+                                   temporal (por defecto HERDR_PANE_ID, o el
+                                   enfocado de `herdr pane list` fuera de herdr)
+
+Fuentes, en orden (`--fuente auto`):
+
+1. **La statusline de las sesiones del harness.** Claude Code le pasa al
+   comando de statusline, por stdin, `rate_limits` (`five_hour` y
+   `seven_day`, con `used_percentage` y `resets_at` en epoch).
+   `scripts/statusline-harness` lo anota, atómico, en
+   `~/.local/state/harness/rate_limits.json` (o `$XDG_STATE_HOME/harness/`)
+   junto a la hora de captura y el `session_id`. Las sesiones de Claude que
+   lanza el harness (peldaños 3 y 4) lo llevan en `--settings`
+   (`dispatch.SETTINGS_CLAUDE`); la statusline personal del usuario no se
+   toca (con `--setting-sources project` sus settings no entran a esas
+   sesiones). Así cada ticket de Claude refresca la cuota gratis. Si el
+   archivo es más nuevo que `quota.statusline_max_edad_min` (10 min), se usa
+   sin abrir nada, salvo que el reset de algún bucket ya haya pasado (ese %
+   es de antes del reset: se va a `/usage`) o que `capturado` esté en el
+   futuro (más de 60 s). Límites: aparece recién después de la primera
+   respuesta del modelo, y no trae el bucket por modelo (Fable).
+   `capturado` es la hora de escritura, no la del dato: una sesión que
+   quedó con números viejos podría pisar a una más nueva. Se mitiga sin
+   resolverlo del todo: un `rate_limits` con el reset de 5h anterior al
+   guardado no reemplaza el archivo.
+2. **`/usage`, capturado por herdr.** Abre un pane temporal (`herdr pane
+   split --no-focus`, cwd = `repos.root` del contexto, una carpeta en la
+   que Claude ya confía), corre `claude`, espera la TUI con `herdr pane
+   wait-output`, manda `/usage`, espera "Current week", lee
+   (`--source recent-unwrapped`), relee mientras diga "Refreshing…", y
+   **siempre** cierra (Escape + `pane close`, también si algo falla). No
+   llama al modelo. Es la única fuente en frío y la única con los buckets
+   por modelo. Tarda ~3 s. `herdr pane close` es asíncrono: el pane puede
+   seguir en `herdr pane list` un segundo después.
+
+Si ninguna se puede leer, `harness usage` sale 1 con el motivo de las dos.
+**Nunca inventa un número**: el parser de `/usage` (`usage.parsear_usage`)
+falla explícito si falta el bloque de la sesión o de la semana, si un bucket
+no trae "% used" o si un reset no se entiende. Formatos de reset aceptados:
+`1:10am`, `6pm`, `18:30`, `Oct 23, 6pm`, `Oct 23 at 6pm`, `in 2h 15m`, con o
+sin zona entre paréntesis (sin zona, America/Santiago).
+
+### El `--json` (el contrato para #145, #146, #147)
+
+```json
+{
+  "alcance": "cuenta",
+  "fuente": "usage",
+  "consultado": "2026-10-17T23:44:15-03:00",
+  "sesion": {"pct": 24, "reset": "2026-10-18T01:10:00-03:00",
+             "fuente": "usage", "leido": "2026-10-17T23:44:15-03:00", "edad_s": 0},
+  "semana": {"pct": 7, "reset": "2026-10-23T18:00:00-03:00", "...": "..."},
+  "por_modelo": {"Fable": {"pct": 0, "reset": "2026-10-23T18:00:00-03:00", "...": "..."}}
+}
+```
+
+Los `%` son 0-100 como en `/usage`; los resets, ISO 8601 con offset de
+Santiago. `fuente` (arriba) es `usage`, `statusline` o la combinación; cada
+bucket dice la suya, cuándo se leyó y su antigüedad en segundos. Con la
+statusline, `por_modelo` viene vacío. El cupo por noche (#145), el router
+(#146) y la ventana de quema (#147) pueden consumir esto (o
+`harness.usage.leer_cuota` directo) en vez de la estimación local.
+
+### Lo que hace `harness run` con la cuota
+
+`run` (y `run --loop`) consulta la cuota **antes de cada tanda que tiene
+tickets de Claude** y **antes de cada ticket de Claude** (la costura
+`DispatchSpec.permitir_claude`). La consulta tiene un caché de 2 min con
+lock: los tickets de Claude que arrancan en paralelo comparten una sola
+captura, y pasar cualquier reset invalida el caché. Los tickets de Qwen no la gastan, así que
+sin Claude en la tanda no se consulta nada. Cada consulta y cada decisión
+quedan en el log de eventos (`tipo: cuota`), y los tickets que no entran,
+como `fuera` con el motivo.
+
+1. **Sesión de 5h** sobre `umbral_sesion`: no se lanza Claude. Si en la
+   tanda hay trabajo de Qwen, Claude queda fuera de esta tanda y la noche
+   sigue; si sólo queda Claude, se **espera el reset** más 60 s (en tramos
+   de 5 min, atendiendo el freno de `--loop`) y se vuelve a consultar. La
+   hora límite es la de la corrida: la primera `hora_limite` después de
+   que arrancó (una corrida de las 23:00 termina a las 07:00; una que
+   arrancó a las 08:00, a las 07:00 del día siguiente). Si el reset cae
+   después, o la hora límite ya pasó, no se espera: Claude no corre más en
+   esa corrida. Una sesión cuyo reset ya pasó no cuenta: su % es de la
+   ventana anterior.
+2. **Semana**: queda `100% − usado`; se reserva `reserva_diaria` por cada
+   día que falta al reset (para el 9-5 y el resto); lo que sobra es la
+   holgura, y `holgura / costo_ticket` es el tope de tickets de Claude de la
+   tanda. Mientras más cerca del reset y más cuota sin usar, más tickets.
+   Sin holgura, ningún ticket de Claude.
+3. **Fallback**: si `/usage` (y la statusline) no se pueden leer, se usa la
+   estimación de `harness quota` (sólo la semana, y sólo con
+   `quota.tope_semanal`), y se anota en el log que se cayó a ella y por qué.
+   Sin estimación tampoco, no hay tope por cuota (lo de antes).
+
+El juez de `proponer` (#115) usa el `%` real de la semana contra
+`--piso-cuota`, y con la sesión de 5h sobre el umbral corre en Qwen; si la
+cuota real no se lee, decide con la estimación como antes.
+
+### Umbrales (config del contexto, `quota.*`)
+
+| Campo | Default | Qué es |
+|---|---|---|
+| `umbral_sesion` | `0.90` | fracción de la sesión de 5h desde la cual no se lanza Claude |
+| `reserva_diaria` | `0.08` | fracción de la semana que se deja libre por día al reset (con 7 días, 56%; la última noche, casi nada) |
+| `costo_ticket` | `0.02` | fracción de la semana que se estima que se come un ticket de Claude: dimensiona la tanda |
+| `hora_limite` | `"07:00"` | HH:MM America/Santiago: la espera del reset de la sesión no pasa de acá |
+| `statusline_max_edad_min` | `10` | minutos que vale el archivo de la statusline antes de capturar `/usage` |
+
+Ejemplo de la cuenta: semana al 20% con 2 días al reset → queda 80%,
+reserva 16%, holgura 64% → hasta 32 tickets de Claude. Semana al 70% con 6
+días → reserva 48% > 30%: ninguno.
+
+### Fragilidad
+
+El texto de `/usage` no tiene contrato. Si cambia, `harness usage` falla con
+un mensaje que dice qué bloque o qué línea no entendió, y `run` cae a la
+estimación (anotado). Las fixtures reales están en `tests/fixtures/usage_*.txt`:
+si el formato cambia, se recaptura ahí. La statusline (`rate_limits`) es
+JSON estructurado y bastante menos frágil.
+
+## `harness quota`: la estimación local
+
+`harness quota` lee las sesiones locales (`~/.claude/projects/**/*.jsonl`) y
+mide la cuota sola, sin anotar nada a mano. Cada línea de mensaje asistente trae el modelo y el `usage`
 completo (`input`, `cache_creation`, `cache_read`, `output`, `thinking` — el
 thinking va dentro del output y no suma dos veces).
 
@@ -37,7 +179,9 @@ Qué dice la tabla:
   ventana rodante de la cuota de 5h: es lo comparable contra el "% used ·
   resets ..." de `/usage`.
 - **por semana**: el total ponderado por semana, con el reset de **viernes
-  17:00 America/Santiago** (la "Current week" de `/usage`). El corte por
+  21:00 UTC** (#148: el reset está fijo en UTC; en Santiago es 17:00 con
+  UTC-4 y 18:00 en horario de verano, como dice `/usage`). Cada semana se
+  muestra con su inicio en hora local real. El corte por
   semana es el que contesta "cuánto vamos esta semana", y por eso importa
   que esté ponderado: crudo, quedaba dominado por `cache_read`.
 - **por día**: el total ponderado por fecha calendario en America/Santiago
@@ -111,9 +255,10 @@ Cada corrida escribe una línea `tipo: quota` en el log de eventos
 todo lo demás. En modo offline (`HARNESS_OFFLINE=1`) no escribe: el gate no
 tiene efectos de lado.
 
-## Limitaciones (las mismas que `/usage`)
+## Limitaciones (las de la sección local de `/usage`, no las de sus barras)
 
 1. **Es aproximado**: la fuente son las sesiones locales, no el servidor.
+   Para la cuota real, `harness usage`.
 2. **Sólo ve las sesiones locales de esta máquina**: no ve otros dispositivos
    ni (claude.ai). Otros usuarios de la máquina se declaran con
    `quota.projects`/`--projects` (#75); uno ilegible se salta y el total se

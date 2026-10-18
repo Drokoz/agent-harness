@@ -28,6 +28,23 @@
                                     no se pueda leer se salta y el total se
                                     marca como piso (≥).
 
+    harness usage                   la cuota REAL de Claude: abre `claude` en
+                                    un pane temporal de herdr, lee `/usage`
+                                    (a nivel de cuenta: incluye otros
+                                    equipos) y cierra el pane. % de la sesión
+                                    de 5h, de la semana y por modelo, con sus
+                                    resets (America/Santiago). No llama al
+                                    modelo. Sale 1 si no se pudo leer
+    harness usage --json            lo mismo, parseable (los resets en ISO)
+    harness usage --fuente F        auto (por defecto: la statusline de las
+                                    sesiones de Claude del harness si está
+                                    fresca, sin abrir nada; si no, /usage),
+                                    statusline o usage (el único que trae
+                                    los buckets por modelo, p.ej. Fable)
+    harness usage --pane ID         el pane de herdr desde el cual abrir el
+                                    temporal (por defecto el propio, o el
+                                    enfocado si se corre fuera de herdr)
+
     harness costo                   el costo real por peldaño de la escalera
                                     (#96) y su tasa de éxito: cruza las sesiones
                                     de pi (el costo por mensaje, #90) contra el
@@ -66,6 +83,13 @@
                                     20m, 30m) y antes de cada barrido
                                     pregunta barato "¿cambió algo?" (#114)
     harness run --loop --freno F    archivo que, si aparece, frena el bucle
+
+    `run` consulta la cuota real (`harness usage`) antes de cada tanda con
+    tickets de Claude y antes de cada ticket de Claude: con la sesión de 5h
+    sobre `quota.umbral_sesion` no lanza Claude (si sólo queda Claude,
+    espera el reset, con tope en `quota.hora_limite`), y la semana decide
+    cuántos tickets de Claude caben. Si /usage no se lee, usa la estimación
+    de `harness quota` y lo anota. Ver docs/harness/quota.md.
 
     harness maintain                el mantenedor de conflictos (#56): recorre
                                     los PRs abiertos, y los que no son mergeables
@@ -153,8 +177,9 @@ import os
 import re
 import shutil
 import sys
+import time
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -181,12 +206,17 @@ from harness.maintain import (CONFLICTING, MantenJob, Mantener,  # noqa: E402
                               mergeable_de)
 from harness.proposal import (GENERADOR, JUEZ_CLAUDE, JUEZ_QWEN,  # noqa: E402
                               MAX_PROPOSITAS_DEFAULT, Proponer,
-                              decidir_peldano_juez)
+                              decidir_peldano_juez,
+                              decidir_peldano_juez_usage)
 from harness.render import linea_evento, render  # noqa: E402
 from harness.quota import (agregar, as_dict as quota_as_dict, cuota_por_ventana,  # noqa: E402
                            fuentes_desde_spec, leer_fuentes, puntos_de_ticket,
-                           render_quota, resumen_evento, semana_de)
+                           render_quota, resumen_evento, semana_de,
+                           semana_reset)
 from harness.snapshot import as_dict, snapshot  # noqa: E402
+from harness import usage as usage_mod  # noqa: E402
+from harness.usage import (Cuota, EstadoCuota, UsageIlegible,  # noqa: E402
+                           aplicar_cuota)
 from harness.state import (costo_promedio, de_ticket, intentos, intentos_pr,  # noqa: E402
                            intentos_pr_que_escalan, intentos_que_escalan,
                            minutos_de_ticket, motivos_de_abandono,
@@ -222,12 +252,13 @@ def build_parser():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", nargs="?", default="status",
                    choices=["status", "decisions", "run", "maintain", "report",
-                            "quota", "costo", "proponer", "ideas",
+                            "quota", "usage", "costo", "proponer", "ideas",
                             "doctor"],
                    help="status (la pantalla), decisions (las decisiones), "
                         "run (el dispatcher de la frontera), "
                         "maintain (el mantenedor de conflictos, #56), "
                         "quota (la cuota de Claude por sesiones locales), "
+                        "usage (la cuota REAL de Claude, de /usage por herdr), "
                         "costo (el costo real por peldaño, #96), "
                         "proponer (el generador y el juez de trabajo nuevo, #115), "
                         "ideas (el agente semanal de ideas, #117) "
@@ -283,6 +314,16 @@ def build_parser():
                    help="quota: carpeta(s) de sesiones separadas por coma "
                         "(por defecto ~/.claude/projects de este usuario, o la "
                         "lista que declare quota.projects en config)")
+    p.add_argument("--pane", default="",
+                   help="usage: el pane de herdr desde el cual abrir el "
+                        "temporal de /usage (por defecto HERDR_PANE_ID, o el "
+                        "enfocado de `herdr pane list` fuera de herdr)")
+    p.add_argument("--fuente", default="auto",
+                   choices=["auto", "statusline", "usage"],
+                   help="usage: de dónde leer la cuota: auto (la statusline "
+                        "de las sesiones del harness si está fresca, si no "
+                        "/usage por herdr), statusline o usage (el único con "
+                        "los buckets por modelo)")
     p.add_argument("--sessions", default="",
                    help="costo: carpeta de sesiones de pi (por defecto "
                         "~/.pi/agent/sessions)")
@@ -350,6 +391,8 @@ def main(argv=None):
         return 0
     if args.command == "quota":
         return quota_main(args, contexts)
+    if args.command == "usage":
+        return usage_main(args, contexts)
     if args.command == "run":
         try:
             solo = _solo_de(args.only)
@@ -468,6 +511,105 @@ def quota_main(args, contexts):
     return 0
 
 
+def _capturar_usage(ctx, pane=""):
+    """La cuota real de `/usage`: un pane temporal de
+    herdr con `claude`, cerrado siempre. Lanza `UsageIlegible`. La cwd es
+    la raíz de repos del contexto (una carpeta en la que Claude ya confía);
+    los avisos (un pane que no cerró, un refresco que no terminó) van a
+    stderr: no cambian el número, pero no se callan."""
+    run_cmd = adapters.run
+    base = pane or usage_mod.pane_base_de(run_cmd, os.environ)
+    cwd = Path(ctx.repos.root).expanduser() if ctx else Path.home()
+    texto, avisos = usage_mod.capturar(run_cmd, pane_base=base, cwd=str(cwd))
+    for a in avisos:
+        sys.stderr.write("harness: usage: {}\n".format(a))
+    return usage_mod.parsear_usage(texto, datetime.now(usage_mod.TZ))
+
+
+def _leer_usage(ctx, pane="", fuente="auto"):
+    """La cuota real de la mejor fuente (`usage.leer_cuota`): el archivo de
+    la statusline de las sesiones de Claude del harness si está fresco
+    (`quota.statusline_max_edad_min`); si no, `/usage` por herdr. Lanza
+    `UsageIlegible` con los motivos de las dos."""
+    max_edad = timedelta(minutes=(ctx.quota.statusline_max_edad_min
+                                  if ctx else 10))
+    return usage_mod.leer_cuota(
+        lambda: usage_mod.leer_rate_limits(usage_mod.ruta_rate_limits(),
+                                           datetime.now(usage_mod.TZ),
+                                           max_edad),
+        lambda: _capturar_usage(ctx, pane), fuente)
+
+
+def usage_main(args, contexts):
+    """`harness usage`: la cuota REAL de Claude, de `/usage`. Sale 1 con el
+    motivo si no se pudo leer o entender: nunca un número inventado."""
+    if OFFLINE:
+        sys.stderr.write("harness: usage necesita herdr y claude (sin "
+                         "HARNESS_OFFLINE)\n")
+        return 2
+    ctx = contexts[0] if contexts else None
+    try:
+        u = _leer_usage(ctx, args.pane, args.fuente)
+    except UsageIlegible as e:
+        sys.stderr.write("harness: usage: no se pudo leer /usage: {}\n".format(e))
+        return 1
+    ahora = datetime.now(usage_mod.TZ)
+    if args.como_json:
+        json.dump(usage_mod.as_dict(u, ahora), sys.stdout, indent=2,
+                  ensure_ascii=False, sort_keys=True)
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(usage_mod.render_usage(u, ahora))
+    log = EventLog(_estado_dir() / "harness" / "events.jsonl",
+                   ctx.name if ctx else "harness")
+    log.write("usage", "usage", "{}: sesión {}%, semana {}%{}".format(
+        u.semana.fuente, u.sesion.pct, u.semana.pct,
+        "".join(", {} {}%".format(b.nombre, b.pct) for b in u.por_modelo)))
+    return 0
+
+
+def _estimar_cuota(args, ctx):
+    """El fallback de la cuota (cuando /usage no se lee): la estimación de
+    `harness quota` sobre las sesiones locales. Sólo la semana (la sesión de
+    5h no tiene tope calibrado), y sólo con `quota.tope_semanal`: sin él no
+    hay porcentaje que dar, y se devuelve None."""
+    if not ctx.quota.tope_semanal:
+        return None
+    registros, fuentes = leer_fuentes(_rutas_sesiones(args, [ctx]))
+    agg = agregar(registros, [Path(ctx.repos.root).expanduser()],
+                  fuentes=fuentes)
+    ahora = datetime.now(timezone.utc)
+    harness_sem, resto_sem = semana_de(agg, ahora)
+    pct = round((harness_sem + resto_sem) / ctx.quota.tope_semanal * 100, 1)
+    return EstadoCuota(fuente="estimacion", semana_pct=pct,
+                       semana_reset=semana_reset(ahora))
+
+
+def _cuota_de(args, ctx, log):
+    """La cuota de la corrida (`harness.usage.Cuota`): /usage primero, la
+    estimación si no, cada consulta anotada en el log (`tipo: cuota`)."""
+    return Cuota(leer_usage=lambda: _leer_usage(ctx, getattr(args, "pane", "")),
+                 estimar=lambda: _estimar_cuota(args, ctx),
+                 politica=ctx.quota.politica(),
+                 ahora=lambda: datetime.now(usage_mod.TZ),
+                 anotar=lambda s: log.write("cuota", "cuota", s),
+                 inicio=INICIO_CORRIDA)
+
+
+def _filtrar_por_cuota(args, cuota, candidatos, log):
+    """Los candidatos que la cuota de Claude deja entrar; los demás quedan
+    `fuera` en el log y en pantalla, con su motivo."""
+    entran, fuera = aplicar_cuota(
+        candidatos, cuota, ahora=lambda: datetime.now(usage_mod.TZ),
+        dormir=time.sleep, anotar=lambda s: log.write("cuota", "cuota", s),
+        freno=getattr(args, "freno", "") or None)
+    for j, motivo in fuera:
+        log.write("fuera", "ticket/{}".format(j.issue), motivo,
+                  ticket="{}#{}".format(j.repo, j.issue))
+        sys.stdout.write("  FUERA  #{}/{} {}\n".format(j.issue, j.repo, motivo))
+    return entran
+
+
 # El arranque de ESTE proceso: para el presupuesto de reloj (#116), "la
 # noche" es la corrida que está viva. Un ticket que se comió las tres
 # noches anteriores empieza la de hoy con el presupuesto entero — contarlo
@@ -475,6 +617,9 @@ def quota_main(args, contexts):
 # fuera con 1130 min contra un tope de 180 y una noche gastada en 60
 # vueltas vacías).
 INICIO_NOCHE = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+# El mismo arranque, para la hora límite de la cuota (`quota.hora_limite`):
+# se mide desde que arrancó la corrida, no desde cada consulta.
+INICIO_CORRIDA = datetime.now(usage_mod.TZ)
 
 
 def _ahora_str():
@@ -763,8 +908,13 @@ def run_main(args, contexts, solo=None):
                       "desconoce".format(r.name))
             sys.stdout.write('harness: "{}": {}: no se pudo leer el tracker '
                              '(gh no contestó)\n'.format(ctx.name, r.name))
+        # La cuota real de Claude (/usage): se consulta antes de cada
+        # tanda con Claude y antes de cada ticket de Claude (la costura
+        # `permitir_claude`), no para los de Qwen, que no la gastan.
+        cuota = _cuota_de(args, ctx, log)
         spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
-                            kind=args.kind, model=args.model)
+                            kind=args.kind, model=args.model,
+                            permitir_claude=cuota.permitir_claude)
         costo_de_pi, salida_de_pi = _sesiones_de_pi()
         disp = Dispatcher(spec, log, run_cmd=adapters.run,
                           credits=_creditos_usado
@@ -844,6 +994,7 @@ def run_main(args, contexts, solo=None):
         # créditos que quedan contra el costo medio del historial, más el
         # margen, más los topes manuales. Lo que se queda fuera se anota
         # en el log, no se omite en silencio.
+        candidatos = _filtrar_por_cuota(args, cuota, candidatos, log)
         if solo is not None:
             log.write("corrida", "corrida",
                       "solo: se despachan solo los issues pedidos ({})".format(
@@ -946,8 +1097,10 @@ def _una_pasada(args, ctx, log):
     corte = ("tracker ilegible: {}".format(
                  ", ".join(r.name for r in ilegibles))
              if ilegibles else "")
+    cuota = _cuota_de(args, ctx, log)
     spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
-                        kind=args.kind, model=args.model)
+                        kind=args.kind, model=args.model,
+                        permitir_claude=cuota.permitir_claude)
     costo_de_pi, salida_de_pi = _sesiones_de_pi()
     disp = Dispatcher(spec, log, run_cmd=adapters.run,
                       credits=_creditos_usado
@@ -1014,6 +1167,7 @@ def _una_pasada(args, ctx, log):
                             skills=skills_de(i.body),
                             gate_tail=gate_tail, wip=wip,
                             minutos_acumulado=minutos))
+    jobs = _filtrar_por_cuota(args, cuota, jobs, log)
     if not jobs:
         extra = " ({} parkeado(s))".format(parkeados) if parkeados else ""
         sys.stdout.write('harness: "{}": nada en la frontera{}\n'.format(
@@ -1189,6 +1343,20 @@ def _peldano_juez_para(args, ctx, log, repo):
     bucle de la noche— respetando el piso de cuota (`--piso-cuota` contra
     `quota.tope_semanal`, la misma fuente que `harness quota`); sin cuota
     para gastarla, o forzado a mano (`--juez-qwen`), corre entero en Qwen."""
+    # La cuota real primero (#115 sobre /usage): sin calibración, el % ya
+    # es del tope y es de la cuenta entera. Si no se lee, la estimación de
+    # siempre, y se anota.
+    if not args.juez_qwen:
+        try:
+            u = _leer_usage(ctx, getattr(args, "pane", ""))
+        except UsageIlegible as e:
+            log.write("cuota", "cuota", "/usage ilegible ({}): el juez decide "
+                      "con la estimación de harness quota".format(e))
+        else:
+            peldano, motivo = decidir_peldano_juez_usage(
+                False, u.semana.pct, u.sesion.pct, args.piso_cuota,
+                ctx.quota.umbral_sesion)
+            return _anotar_juez(log, repo, peldano, motivo)
     usado = 0.0
     if ctx.quota.tope_semanal:
         registros, fuentes = leer_fuentes(_rutas_sesiones(args, [ctx]))
@@ -1199,6 +1367,10 @@ def _peldano_juez_para(args, ctx, log, repo):
     peldano, motivo = decidir_peldano_juez(args.juez_qwen,
                                            ctx.quota.tope_semanal, usado,
                                            args.piso_cuota)
+    return _anotar_juez(log, repo, peldano, motivo)
+
+
+def _anotar_juez(log, repo, peldano, motivo):
     etiqueta = peldano["kind"]
     if peldano.get("model"):
         etiqueta += " " + peldano["model"]

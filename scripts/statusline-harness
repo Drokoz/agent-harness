@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""La statusline de las sesiones de Claude del harness.
+
+Claude Code le pasa por stdin un JSON con `rate_limits` (sesión de 5h y
+semana, a nivel de cuenta). Este script lo anota en
+`$XDG_STATE_HOME/harness/rate_limits.json` (por defecto
+`~/.local/state/harness/`), atómico, para que `harness usage` y `harness
+run` lean la cuota real sin abrir un pane. Imprime una línea corta.
+
+Nunca falla: una statusline rota no puede tumbar la sesión de un ticket.
+La ponen las sesiones del harness (`dispatch.SETTINGS_CLAUDE`, vía
+`--settings`); la statusline personal del usuario no se toca.
+"""
+
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+def main():
+    try:
+        from harness.usage import TZ, escribir_rate_limits, ruta_rate_limits
+        entrada = json.loads(sys.stdin.read() or "{}")
+        escribir_rate_limits(entrada, ruta_rate_limits(), datetime.now(TZ))
+        rl = entrada.get("rate_limits") or {}
+        partes = ["harness"]
+        for clave, nombre in (("five_hour", "5h"), ("seven_day", "7d")):
+            pct = (rl.get(clave) or {}).get("used_percentage")
+            if pct is not None:
+                partes.append("{} {}%".format(nombre, pct))
+        print(" · ".join(partes))
+    except Exception:
+        print("harness")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

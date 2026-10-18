@@ -10,6 +10,7 @@ un comando de merge.
 
 import json
 import re
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -41,10 +42,17 @@ PI_MINIMA = ["--no-skills",
              "--skill", ".pi/skills/implement",
              "--skill", ".pi/skills/tdd",
              "--model", "qwen/qwen3.8-27b"]
+# Las sesiones de Claude del harness llevan la statusline del harness
+# (`scripts/statusline-harness`): anota `rate_limits` en el estado, y así
+# cada ticket refresca la cuota real gratis mientras trabaja.
+STATUSLINE = shlex.quote(str(ROOT / "scripts" / "statusline-harness"))
+SETTINGS_CLAUDE = {"autoMode": {"skipAutoPermissionPrompt": True},
+                   "statusLine": {"type": "command", "command": STATUSLINE}}
 CLAUDE_MINIMA = ["--strict-mcp-config",
                  "--setting-sources", "project",
                  "--permission-mode", "auto",
-                 "--settings", '{"autoMode":{"skipAutoPermissionPrompt":true}}']
+                 "--settings", json.dumps(SETTINGS_CLAUDE,
+                                          separators=(",", ":"))]
 
 
 class Mundo:
@@ -2078,19 +2086,16 @@ class TestSesionMinima(unittest.TestCase):
         args = args_sesion_minima("claude", ("implement", "tdd"),
                                   modelo="sonnet",
                                   extra_args=("--effort", "medium"))
-        self.assertEqual(args, [
-            "--strict-mcp-config",
-            "--setting-sources", "project",
-            "--permission-mode", "auto",
-            "--settings", '{"autoMode":{"skipAutoPermissionPrompt":true}}',
+        self.assertEqual(args, CLAUDE_MINIMA + [
             "--model", "sonnet",
             "--effort", "medium"])
-        # Ni un plugin ni un servidor MCP, y la config extra es JSON válido.
+        # Ni un plugin ni un servidor MCP, y la config extra es JSON válido:
+        # el opt-in de auto y la statusline del harness (no la del usuario:
+        # `--setting-sources project` ya la deja afuera).
         self.assertNotIn("--plugin-dir", args)
         self.assertNotIn("--mcp-config", args)
         self.assertEqual(
-            json.loads(args[args.index("--settings") + 1]),
-            {"autoMode": {"skipAutoPermissionPrompt": True}})
+            json.loads(args[args.index("--settings") + 1]), SETTINGS_CLAUDE)
 
     def test_ninguna_sesion_lleva_resume_ni_continue(self):
         for kind in ("pi", "claude", "codex"):

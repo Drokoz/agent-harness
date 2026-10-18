@@ -30,6 +30,7 @@ con el nombre del contexto y el campo que hay que arreglar.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -93,10 +94,29 @@ class QuotaSpec:
     la cuota mira un solo usuario del sistema (`~/.claude/projects`); con la
     lista, suma los declarados, y una fuente ilegible se salta y marca el
     total como piso.
+
+    `umbral_sesion`, `reserva_diaria`, `costo_ticket` y `hora_limite` son
+    la política de `harness run` sobre la cuota real de `/usage`
+    (`harness.usage.PoliticaCuota`, docs/harness/quota.md); sin declarar,
+    los defaults de ahí.
     """
 
     tope_semanal: Optional[float] = None
     projects: Optional[List[str]] = None
+    umbral_sesion: float = 0.90
+    reserva_diaria: float = 0.08
+    costo_ticket: float = 0.02
+    hora_limite: str = "07:00"
+    # Cuánto vale el archivo de la statusline (`harness usage`): más viejo
+    # que esto, se captura /usage por herdr.
+    statusline_max_edad_min: float = 10.0
+
+    def politica(self):
+        from harness.usage import PoliticaCuota
+        return PoliticaCuota(umbral_sesion=self.umbral_sesion,
+                             reserva_diaria=self.reserva_diaria,
+                             costo_ticket=self.costo_ticket,
+                             hora_limite=self.hora_limite)
 
 
 @dataclass
@@ -262,7 +282,9 @@ def _quota(raw, donde):
         return QuotaSpec()
     raw = _obj(raw, donde + ' → "quota"')
     donde = donde + ' → "quota"'
-    _keys(raw, ("tope_semanal", "projects"), donde)
+    _keys(raw, ("tope_semanal", "projects", "umbral_sesion",
+                "reserva_diaria", "costo_ticket", "hora_limite",
+                "statusline_max_edad_min"), donde)
     tope = None
     if "tope_semanal" in raw:
         tope = _num(raw["tope_semanal"], '"tope_semanal"', donde)
@@ -279,7 +301,33 @@ def _quota(raw, donde):
         for p in raw_p:
             _str(p, "cada ruta de projects", donde)
         projects = list(raw_p)
-    return QuotaSpec(tope_semanal=tope, projects=projects)
+    politica = {}
+    for campo, minimo, abierto in (("umbral_sesion", 0.0, True),
+                                   ("reserva_diaria", 0.0, False),
+                                   ("costo_ticket", 0.0, True)):
+        if campo in raw:
+            v = _num(raw[campo], '"{}"'.format(campo), donde)
+            if v > 1 or v < minimo or (abierto and v == minimo):
+                raise ConfigError('{}: "{}" es una fracción: tiene que estar '
+                                  'entre 0 y 1{}'.format(
+                                      donde, campo,
+                                      " (y mayor que 0)" if abierto else ""))
+            politica[campo] = v
+    if "hora_limite" in raw:
+        h = _str(raw["hora_limite"], '"hora_limite"', donde)
+        m = re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", h)
+        if not m:
+            raise ConfigError('{}: "hora_limite" tiene que ser HH:MM (24 h, '
+                              'America/Santiago), p.ej. "07:00"'.format(donde))
+        politica["hora_limite"] = h
+    if "statusline_max_edad_min" in raw:
+        v = _num(raw["statusline_max_edad_min"], '"statusline_max_edad_min"',
+                 donde)
+        if v <= 0:
+            raise ConfigError('{}: "statusline_max_edad_min" tiene que ser '
+                              'mayor que cero (minutos)'.format(donde))
+        politica["statusline_max_edad_min"] = v
+    return QuotaSpec(tope_semanal=tope, projects=projects, **politica)
 
 
 def _context(name, raw):

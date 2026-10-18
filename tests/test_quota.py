@@ -27,7 +27,8 @@ from harness.quota import (PESOS, agregar, as_dict, atribuir, codificar_path,
                            cuota_por_ventana, decodificar_uso, fuentes_desde_spec,
                            leer_fuentes, leer_sesiones, parsear_linea, pico_5h,
                            ponderar, puntos_de_ticket, render_quota,
-                           resumen_evento, semana_de, semana_inicio)
+                           resumen_evento, semana_de, semana_inicio,
+                           semana_reset)
 
 HARNESS = support.ROOT / "bin" / "harness"
 SESIONES = support.FIXTURES / "claude_sessions"
@@ -204,6 +205,68 @@ class TestSemanaInicio(unittest.TestCase):
         """Jueves 16:00 SCL (20:00 UTC) todavía está en la semana anterior."""
         self.assertEqual(semana_inicio(dt("2026-08-21T20:00:00")),
                          dt("2026-08-14T21:00:00"))
+
+
+class TestResetEnUtc(unittest.TestCase):
+    """#148: el reset es viernes 21:00 UTC fijo, no 17:00 hora de Chile.
+    En julio (UTC-4) cae a las 17:00 locales; en octubre (UTC-3, horario de
+    verano) a las 18:00 — lo que dice `/usage`."""
+
+    def test_julio_el_reset_es_17_locales(self):
+        inicio = semana_inicio(dt("2026-07-08T12:00:00"))
+        self.assertEqual(inicio, dt("2026-07-03T21:00:00"))
+        self.assertEqual(inicio.strftime("%H:%M"), "17:00")
+
+    def test_octubre_el_reset_es_18_locales(self):
+        inicio = semana_inicio(dt("2026-10-20T12:00:00"))
+        self.assertEqual(inicio, dt("2026-10-16T21:00:00"))
+        self.assertEqual(inicio.strftime("%H:%M %z"), "18:00 -0300")
+
+    def test_octubre_los_bordes(self):
+        self.assertEqual(semana_inicio(dt("2026-10-23T20:59:59")),
+                         dt("2026-10-16T21:00:00"))
+        self.assertEqual(semana_inicio(dt("2026-10-23T21:00:00")),
+                         dt("2026-10-23T21:00:00"))
+
+    def test_julio_los_bordes(self):
+        self.assertEqual(semana_inicio(dt("2026-07-10T20:59:59")),
+                         dt("2026-07-03T21:00:00"))
+        self.assertEqual(semana_inicio(dt("2026-07-10T21:00:00")),
+                         dt("2026-07-10T21:00:00"))
+
+    def test_entre_17_y_18_locales_de_octubre_sigue_la_semana_vieja(self):
+        # Viernes 23-oct 17:30 SCL = 20:30 UTC: antes del reset real.
+        self.assertEqual(semana_inicio(dt("2026-10-23T20:30:00")),
+                         dt("2026-10-16T21:00:00"))
+
+    def test_la_tabla_muestra_la_hora_local_real(self):
+        regs = [{"timestamp": dt("2026-10-20T12:00:00"),
+                 "modelo": "claude-opus-5", "dir": "-u-docs-koku",
+                 "archivo": "a.jsonl",
+                 "tokens": {"input": 10, "cache_creation": 0,
+                            "cache_read": 0, "output": 0, "thinking": 0,
+                            "total": 10}}]
+        texto = render_quota(agregar(regs, RAIZ))
+        self.assertNotIn("reset vie 17:00", texto)
+        self.assertIn("vie 21:00 UTC", texto)
+        self.assertIn("2026-10-16 18:00", texto)
+
+
+class TestSemanaReset(unittest.TestCase):
+    """Revisión de #159: el reset siguiente se suma en UTC; sumar 7 días de
+    reloj local daba 1 h de error en las semanas de cambio de horario."""
+
+    def test_semana_del_cambio_de_abril(self):
+        self.assertEqual(semana_reset(dt("2027-04-05T12:00:00")),
+                         dt("2027-04-09T21:00:00"))
+
+    def test_semana_del_cambio_de_septiembre(self):
+        self.assertEqual(semana_reset(dt("2027-09-06T12:00:00")),
+                         dt("2027-09-10T21:00:00"))
+
+    def test_en_el_reset_es_el_siguiente(self):
+        self.assertEqual(semana_reset(dt("2026-10-23T21:00:00")),
+                         dt("2026-10-30T21:00:00"))
 
 
 class TestPico5h(unittest.TestCase):
