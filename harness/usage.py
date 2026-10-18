@@ -341,6 +341,13 @@ def leer_rate_limits(ruta, ahora, max_edad):
     if edad > max_edad:
         return None, "statusline: viejo: {} min (máx {} min)".format(
             int(edad.total_seconds() // 60), int(max_edad.total_seconds() // 60))
+    # Un bucket cuyo reset ya pasó es de antes del reset: su % no vale,
+    # aunque el archivo sea "fresco" (revisión de #159). Se descarta el
+    # archivo entero y se va a /usage.
+    for b in (sesion, semana):
+        if b.reset is not None and b.reset <= ahora:
+            return None, ("statusline: el reset de {!r} ({}) ya pasó: el dato "
+                          "es de antes del reset".format(b.nombre, _hhmm(b.reset)))
     return Usage(sesion=sesion, semana=semana), ""
 
 
@@ -548,8 +555,13 @@ def decidir(estado, ahora, politica):
        reset; lo que sobra (`holgura`) dividido `costo_ticket` es el tope de
        tickets de Claude. Sin holgura, nada de Claude. Más cerca del reset
        o con más cuota sin usar -> más tickets.
-    3. Sin dato de la semana: sin tope (lo de antes de leer /usage)."""
-    if (estado.sesion_pct is not None
+    3. Sin dato de la semana: sin tope (lo de antes de leer /usage).
+
+    Una sesión cuyo reset ya pasó no cuenta: ese % es de la ventana
+    anterior (revisión de #159)."""
+    sesion_vigente = (estado.sesion_reset is None
+                      or estado.sesion_reset > ahora)
+    if (estado.sesion_pct is not None and sesion_vigente
             and estado.sesion_pct >= politica.umbral_sesion * 100):
         base = "sesión de 5h al {}% (umbral {:.0f}%)".format(
             estado.sesion_pct, politica.umbral_sesion * 100)
@@ -604,6 +616,11 @@ def esperar_hasta(hasta, ahora, dormir, freno=None, paso=300.0):
         dormir(min(paso, falta))
 
 
+# Después del reset de la sesión se espera un poco antes de volver a
+# consultar: el servidor tarda en reflejar la ventana nueva.
+MARGEN_RESET = timedelta(seconds=60)
+
+
 def aplicar_cuota(candidatos, cuota, ahora, dormir, anotar, freno=None,
                   max_esperas=3):
     """Los candidatos de la tanda, filtrados por la cuota de Claude.
@@ -620,9 +637,10 @@ def aplicar_cuota(candidatos, cuota, ahora, dormir, anotar, freno=None,
         solo_claude = all(es_claude(j) for j in candidatos)
         if d.claude or d.esperar_hasta is None or not solo_claude:
             break
+        hasta = d.esperar_hasta + MARGEN_RESET
         anotar("{}: sólo queda Claude, espero hasta {}".format(
-            d.motivo, _hhmm(d.esperar_hasta)))
-        if not esperar_hasta(d.esperar_hasta, ahora, dormir, freno):
+            d.motivo, _hhmm(hasta)))
+        if not esperar_hasta(hasta, ahora, dormir, freno):
             anotar("freno puesto durante la espera de la cuota")
             break
         d = cuota.decidir()
