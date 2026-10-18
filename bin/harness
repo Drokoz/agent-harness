@@ -213,7 +213,8 @@ from harness import routing as routing_mod  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
 from harness.dispatch import (BucleSpec, Corrida, DispatchSpec,  # noqa: E402
                               Dispatcher, EventLog, Job, Pasada,
-                              RUNNER_POR_DEFECTO, RUNNERS_CORRIDA, TopeGasto,
+                              ESCALERA_CLAUDE, RUNNER_POR_DEFECTO,
+                              RUNNERS_CORRIDA, TopeGasto,
                               bucle, cosechar, decidir_tanda, elegir_peldano,
                               motivo_presupuesto_reloj, skills_de,
                               transcripcion_path)
@@ -1077,6 +1078,7 @@ def run_main(args, contexts, solo=None):
         corrida = _corrida_de(args, ctx, log)
         spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
                             kind=corrida.kind, model=args.model,
+                            revisor_pi=corrida.usa_pi(),
                             permitir_claude=cuota.permitir_claude,
                             budget_minutos=ctx.topes.budget_minutos,
                             hasta=_hasta_de(args, ctx, INICIO_CORRIDA),
@@ -1272,6 +1274,7 @@ def _una_pasada(args, ctx, log):
     corrida = _corrida_de(args, ctx, log)
     spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
                         kind=corrida.kind, model=args.model,
+                        revisor_pi=corrida.usa_pi(),
                         permitir_claude=cuota.permitir_claude,
                         budget_minutos=ctx.topes.budget_minutos,
                         freno=getattr(args, "freno", "") or None,
@@ -1698,14 +1701,19 @@ def _proponer_ctx(args, ctx, log, en_bucle=False):
         return 'contexto "{}": autonomía manual, no propone nada'.format(
             ctx.name)
     crudo = collect([ctx])
+    corrida = _corrida_de(args, ctx)
     partes = []
     for r in crudo["contexts"][0]["repos"]:
         if not r.get("slug") or not r.get("exists", {}).get("gate"):
             continue
         # #175: desde el bucle, el freno y la hora límite de la noche valen
         # también para el generador y el juez (y el corte a hasta + 30).
-        spec = DispatchSpec(contexto=ctx.name, kind=GENERADOR["kind"],
-                            model=GENERADOR["model"],
+        # #174: en una corrida sin pi (o en un repo con runner_min
+        # claude), generador y juez corren en Claude; nunca en Qwen.
+        pi_ok = corrida.usa_pi(r["name"])
+        generador = GENERADOR if pi_ok else ESCALERA_CLAUDE[0]
+        spec = DispatchSpec(contexto=ctx.name, kind=generador["kind"],
+                            model=generador["model"],
                             freno=(getattr(args, "freno", "") or None)
                             if en_bucle else None,
                             hasta=_hasta_de(args, ctx, INICIO_CORRIDA,
@@ -1715,9 +1723,17 @@ def _proponer_ctx(args, ctx, log, en_bucle=False):
                                 leer_eventos(log.path) if log is not None
                                 else []))
         prop = Proponer(spec, log, run_cmd=adapters.run)
-        peldano_juez = _peldano_juez_para(args, ctx, log, r["name"])
+        if pi_ok:
+            peldano_juez = _peldano_juez_para(args, ctx, log, r["name"])
+        else:
+            peldano_juez = _anotar_juez(
+                log, r["name"], JUEZ_CLAUDE,
+                "corrida {} ({}) sin pi: juez Claude, nunca Qwen{}".format(
+                    corrida.kind, corrida.fuente,
+                    " (--juez-qwen ignorado)" if args.juez_qwen else ""))
         res = prop.proponer_repo(r["name"], r["slug"], r.get("path", ""),
-                                 args.max_propuestas, peldano_juez)
+                                 args.max_propuestas, peldano_juez,
+                                 generador=generador)
         for d in res["detalle"]:
             sys.stdout.write("  {} {}\n".format(r["name"], d))
         partes.append("{}: {} abierta(s), {} promovida(s), {} rechazada(s), "
@@ -1847,6 +1863,7 @@ def maintain_main(args, contexts):
         corrida = _corrida_de(args, ctx, log)
         spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
                             kind=corrida.kind, model=args.model,
+                            revisor_pi=corrida.usa_pi(),
                             tope_gasto=_tope_gasto(args, ctx, log,
                                                    eventos_previos))
         costo_de_pi, salida_de_pi = _sesiones_de_pi()

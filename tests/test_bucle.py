@@ -1300,8 +1300,10 @@ class LosTopesVienenDeLaConfig(unittest.TestCase):
         """Sin `topes.max_usd` (default 0) la corrida no gasta plata: el
         ticket en el peldaño de pi queda fuera y no prende nada."""
         self.d.joinpath("config.json").write_text(self._cfg(gasto=None))
+        # `--kind pi` (#174): el ticket en el peldaño de pi.
         args = self.cli.build_parser().parse_args([
-            "run", "--context", "h", "--log", str(self.log_path)])
+            "run", "--context", "h", "--log", str(self.log_path),
+            "--kind", "pi"])
         mundo = Mundo(prs=[])
         with mock.patch.object(self.cli, "OFFLINE", False), \
              mock.patch.object(self.cli, "collect",

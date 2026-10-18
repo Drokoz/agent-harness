@@ -590,7 +590,8 @@ class Proponer(Dispatcher):
         resumen["juez"] = resumen["juez"] or "sin juez (corte: {})".format(corte)
         return True
 
-    def proponer_repo(self, repo, slug, repo_path, maximo, peldano_juez):
+    def proponer_repo(self, repo, slug, repo_path, maximo, peldano_juez,
+                      generador=GENERADOR):
         """Una noche de proponer sobre un repo: generador -> validación y
         apertura a `needs-triage` -> juez -> promoción. Devuelve un dict de
         resumen para el llamador (y para el log del bucle).
@@ -616,8 +617,8 @@ class Proponer(Dispatcher):
         gen = ProponeJob(repo=repo, repo_path=repo_path, slug=slug,
                          rol="generador", salida="proposals.json",
                          maximo=maximo, issues_conocidos=tuple(conocidos),
-                         kind=GENERADOR["kind"], model=GENERADOR["model"],
-                         extra_args=tuple(GENERADOR["extra_args"]))
+                         kind=generador["kind"], model=generador["model"],
+                         extra_args=tuple(generador["extra_args"]))
         if self._cortar_propuesta(resumen, ref_g):
             return resumen
         self.run_job(gen)

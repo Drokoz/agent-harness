@@ -491,6 +491,8 @@ ESCALERA_CLAUDE = tuple(p for p in ESCALERA if p["kind"] == "claude")
 # contexto). Claude es el default: va por suscripción; pi/Qwen gasta
 # OpenRouter y es opt-in.
 RUNNERS_CORRIDA = ("claude", "pi")
+# El revisor de PRs de una corrida sin pi (#174): sonnet, read-only.
+REVISOR_CLAUDE = {"kind": "claude", "model": "sonnet"}
 RUNNER_POR_DEFECTO = "claude"
 # La etiqueta con que un ticket pide el runner barato (#174).
 ETIQUETA_BARATA = "runner:cheap"
@@ -511,6 +513,15 @@ class Corrida:
     fuente: str = "por defecto"
     permitir_pi: bool = False
     runner_min: Optional[dict] = None
+
+    def usa_pi(self, repo=None):
+        """¿Puede esta corrida gastar pi fuera de la escalera de un ticket
+        (revisor de PRs, generador y juez de proponer)? Sólo una corrida
+        `pi` o con `--permitir-pi`, y nunca en un repo con `runner_min`
+        claude."""
+        if repo is not None and (self.runner_min or {}).get(repo) == "claude":
+            return False
+        return self.kind == "pi" or self.permitir_pi
 
 
 def peldano_de(escalados, escalera=ESCALERA):
@@ -1257,7 +1268,13 @@ class DispatchSpec:
 
     contexto: str
     max_parallel: int = 2
-    kind: str = "pi"
+    # El runner de la corrida (#174): Claude por defecto, pi es opt-in. Los
+    # jobs normalmente traen su peldaño (`elegir_peldano`); esto es lo que
+    # usa uno que no lo trae.
+    kind: str = "claude"
+    # El revisor de PRs (#46) corre en pi sólo si la corrida lo permite
+    # (`Corrida.usa_pi`, #174); si no, en Claude sonnet, read-only.
+    revisor_pi: bool = False
     model: str = ""
     wait_ms: int = 3_600_000      # espera máxima por agente (una noche)
     watchdog_check_min: int = 5   # cada N minutos se mide si el agente avanza (#41)
@@ -2232,11 +2249,20 @@ class Dispatcher:
 
     def _revisor(self):
         """El revisor de #46: el inyectado, o el real, armado una sola vez
-        con el `run_cmd` de la corrida (runner barato por default)."""
+        con el `run_cmd` de la corrida: pi si la corrida lo permite
+        (`spec.revisor_pi`), Claude sonnet read-only si no (#174)."""
         if self._revisor_cache is None:
-            self._revisor_cache = (self._revisor_inyectado or
-                                   Revisor(self.run_cmd,
-                                           timeout=self.spec.review_timeout))
+            if self._revisor_inyectado is not None:
+                self._revisor_cache = self._revisor_inyectado
+            elif self.spec.revisor_pi:
+                self._revisor_cache = Revisor(
+                    self.run_cmd, timeout=self.spec.review_timeout)
+            else:
+                # #174: una corrida sin pi no tiene revisor pi.
+                self._revisor_cache = Revisor(
+                    self.run_cmd, kind=REVISOR_CLAUDE["kind"],
+                    model=REVISOR_CLAUDE["model"],
+                    timeout=self.spec.review_timeout)
         return self._revisor_cache
 
     def _revisar(self, job, ref, num):
