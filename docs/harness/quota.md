@@ -39,8 +39,14 @@ Fuentes, en orden (`--fuente auto`):
    toca (con `--setting-sources project` sus settings no entran a esas
    sesiones). Así cada ticket de Claude refresca la cuota gratis. Si el
    archivo es más nuevo que `quota.statusline_max_edad_min` (10 min), se usa
-   sin abrir nada. Límites: aparece recién después de la primera respuesta
-   del modelo, y no trae el bucket por modelo (Fable).
+   sin abrir nada, salvo que el reset de algún bucket ya haya pasado (ese %
+   es de antes del reset: se va a `/usage`) o que `capturado` esté en el
+   futuro (más de 60 s). Límites: aparece recién después de la primera
+   respuesta del modelo, y no trae el bucket por modelo (Fable).
+   `capturado` es la hora de escritura, no la del dato: una sesión que
+   quedó con números viejos podría pisar a una más nueva. Se mitiga sin
+   resolverlo del todo: un `rate_limits` con el reset de 5h anterior al
+   guardado no reemplaza el archivo.
 2. **`/usage`, capturado por herdr.** Abre un pane temporal (`herdr pane
    split --no-focus`, cwd = `repos.root` del contexto, una carpeta en la
    que Claude ya confía), corre `claude`, espera la TUI con `herdr pane
@@ -83,17 +89,23 @@ statusline, `por_modelo` viene vacío. El cupo por noche (#145), el router
 
 `run` (y `run --loop`) consulta la cuota **antes de cada tanda que tiene
 tickets de Claude** y **antes de cada ticket de Claude** (la costura
-`DispatchSpec.permitir_claude`). Los tickets de Qwen no la gastan, así que
+`DispatchSpec.permitir_claude`). La consulta tiene un caché de 2 min con
+lock: los tickets de Claude que arrancan en paralelo comparten una sola
+captura, y pasar cualquier reset invalida el caché. Los tickets de Qwen no la gastan, así que
 sin Claude en la tanda no se consulta nada. Cada consulta y cada decisión
 quedan en el log de eventos (`tipo: cuota`), y los tickets que no entran,
 como `fuera` con el motivo.
 
 1. **Sesión de 5h** sobre `umbral_sesion`: no se lanza Claude. Si en la
    tanda hay trabajo de Qwen, Claude queda fuera de esta tanda y la noche
-   sigue; si sólo queda Claude, se **espera el reset** (en tramos de 5 min,
-   atendiendo el freno de `--loop`) y se vuelve a consultar. Si el reset
-   cae después de `hora_limite`, no se espera: Claude no corre más en esa
-   corrida.
+   sigue; si sólo queda Claude, se **espera el reset** más 60 s (en tramos
+   de 5 min, atendiendo el freno de `--loop`) y se vuelve a consultar. La
+   hora límite es la de la corrida: la primera `hora_limite` después de
+   que arrancó (una corrida de las 23:00 termina a las 07:00; una que
+   arrancó a las 08:00, a las 07:00 del día siguiente). Si el reset cae
+   después, o la hora límite ya pasó, no se espera: Claude no corre más en
+   esa corrida. Una sesión cuyo reset ya pasó no cuenta: su % es de la
+   ventana anterior.
 2. **Semana**: queda `100% − usado`; se reserva `reserva_diaria` por cada
    día que falta al reset (para el 9-5 y el resto); lo que sobra es la
    holgura, y `holgura / costo_ticket` es el tope de tickets de Claude de la
