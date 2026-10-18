@@ -253,7 +253,7 @@ def _run_ssh(ssh, script, timeout):
     `subprocess` (corto, 30 s por defecto) cubre el host que conecta y se
     cuelga."""
     return subprocess.run(
-        ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o",
+        ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o",
          "ConnectTimeout=10", ssh, "python3", "-", "--json"],
         input=script.encode("utf-8"), capture_output=True, timeout=timeout)
 

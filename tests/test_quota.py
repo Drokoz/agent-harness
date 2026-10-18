@@ -1138,6 +1138,21 @@ class TestCliRemotas(unittest.TestCase):
         self.assertIn("quota.remotas", p.stdout)
 
 
+
+class TestRunSsh(unittest.TestCase):
+    """Sin llave que sirva, ssh no puede caer a pedir password en la tty:
+    la corrida nocturna no tiene a nadie que la escriba y se colgaría
+    hasta el timeout (revisión de #162)."""
+
+    def test_ssh_no_interactivo(self):
+        from unittest import mock
+        from harness import quota
+        with mock.patch.object(quota.subprocess, "run") as run:
+            quota._run_ssh("u@h", "print(1)", 5)
+        args = run.call_args[0][0]
+        self.assertIn("BatchMode=yes", args)
+        self.assertLess(args.index("BatchMode=yes"), args.index("u@h"))
+
 if __name__ == "__main__":
     unittest.main()
 
