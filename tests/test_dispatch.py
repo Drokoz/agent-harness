@@ -2576,6 +2576,24 @@ class TestTopeDeGasto(unittest.TestCase):
         self.assertIn("review omitida", reviews[0])
         self.assertIn("tope de gasto", reviews[0])
 
+    def test_la_review_sin_credito_medible_queda_como_gasto(self):
+        """Sin crédito medible, la reserva del revisor de pi pasa a gasto
+        al terminar: si no, cada review de Claude volvería a caber y el
+        tope dejaría de ser techo. Tope 1.5, sin historial (US$1.00 por
+        review): la primera corre, la segunda se omite."""
+        tope = dispatch.TopeGasto(1.5, usado=lambda: None)
+        m = Mundo(prs=[{"number": 31, "headRefName": "ticket/7"},
+                       {"number": 32, "headRefName": "ticket/8"}])
+        res, lineas = self._despachar(m, [job_de_peldano(2, issue=7),
+                                          job_de_peldano(2, issue=8)],
+                                      tope, max_parallel=1)
+        self.assertEqual([j.estado for j in res], ["hecho", "hecho"])
+        reviews = [l["cuerpo"] for l in lineas if l["tipo"] == "review"]
+        self.assertEqual(len(reviews), 2, lineas)
+        self.assertEqual(len([r for r in reviews if "review omitida" in r]),
+                         1, reviews)
+        self.assertGreaterEqual(tope.gastado(), 1.0)
+
     def test_revisor_de_claude_no_pasa_por_el_tope(self):
         class Revisor:
             kind = "claude"
