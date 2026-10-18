@@ -23,7 +23,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest import mock
@@ -584,6 +584,32 @@ STDIN_STATUSLINE = {
 }
 
 
+class _ResetsFrescos(unittest.TestCase):
+    """Los `resets_at` de `STDIN_STATUSLINE` son epochs fijos del día del
+    captura: pasados ellos, un archivo escrito AHORA se descarta como "de
+    antes del reset" y la suite se rompe sola (time bomb). Cada test que
+    compara contra el `now` real se corre con los resets recalculados de
+    forma relativa (siempre a futuro): lo que se prueba es la lógica de
+    frescura, no la fecha de la fixture."""
+
+    @classmethod
+    def setUpClass(cls):
+        ahora = datetime.now(timezone.utc)
+        cls.sesion = int((ahora + timedelta(hours=4, minutes=48)).timestamp())
+        cls.semana = int((ahora + timedelta(days=4, hours=23)).timestamp())
+        cls._patch = mock.patch.dict(
+            STDIN_STATUSLINE["rate_limits"],
+            {"five_hour": {"used_percentage": 22, "resets_at": cls.sesion},
+             "seven_day": {"used_percentage": 6, "resets_at": cls.semana}})
+        cls._patch.start()
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._patch.stop()
+        super().tearDownClass()
+
+
 class TestStatusline(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -785,7 +811,7 @@ class TestConfig(unittest.TestCase):
 
 
 # --------------------------------------------------------------------- CLI
-class TestCli(unittest.TestCase):
+class TestCli(_ResetsFrescos, unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.d = Path(self.tmp.name)
@@ -1136,7 +1162,7 @@ class TestCapturadoEnElFuturo(unittest.TestCase):
 
 
 # ------------------- #159 revisión 5: una sesión vieja no pisa a una nueva
-class TestNoPisarConDatosViejos(unittest.TestCase):
+class TestNoPisarConDatosViejos(_ResetsFrescos, unittest.TestCase):
     def test_un_reset_anterior_al_guardado_no_reemplaza(self):
         with tempfile.TemporaryDirectory() as d:
             ruta = Path(d) / "harness" / "rate_limits.json"
