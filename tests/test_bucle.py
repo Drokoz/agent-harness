@@ -691,6 +691,150 @@ class LaVigilacionBarata(unittest.TestCase):
             self.assertTrue(v(), "firma nueva: hay que barrer")
 
 
+class LaConfigSeRelee(unittest.TestCase):
+    """#163 (regla 5 de la auditoría #152): las preferencias se releen en
+    cada corrida, no con la foto del arranque; si dejan de poder leerse a
+    mitad de bucle, el bucle se detiene con el motivo en el log — no sigue
+    con la vieja. Se corre la `run_main` real con el mundo de mentira,
+    tocando la config en el disco entre pasadas: `collect` se llama una vez
+    por pasada, así que su lado de lado es el gancho "entre pasadas"."""
+
+    def _cfg(self, provider="openrouter"):
+        return json.dumps({
+            "default_context": "h",
+            "contexts": {
+                "h": {"tracker": {"kind": "github"},
+                      "repos": {"root": "~/repos", "paths": ["agent-harness"]},
+                      "autonomy": "frontier",
+                      "budget": {"polarity": "remaining",
+                                 "provider": provider},
+                      "run": {"kind": "local"}},
+            },
+        })
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        self.d.joinpath("config.json").write_text(self._cfg())
+        self.d.joinpath("repos", "agent-harness").mkdir(parents=True)
+        self.log_path = self.d / "events.jsonl"
+        self.freno = self.d / "freno"
+        loader = SourceFileLoader("harness_cli_config", str(HARNESS))
+        spec = importlib.util.spec_from_loader("harness_cli_config", loader)
+        self.cli = importlib.util.module_from_spec(spec)
+        loader.exec_module(self.cli)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _raw_vacio(self):
+        """El mundo de mentira, con la frontera vacía: cada pasada corre de
+        verdad (`_una_pasada` completo) y termina en "nada en la frontera",
+        que es una espera, no un fin — el bucle sigue y relee."""
+        return {
+            "offline": False,
+            "agents": [],
+            "contexts": [{
+                "name": "h", "tracker": "github", "autonomy": "frontier",
+                "vault": None, "run": "local",
+                "budget": {"polarity": "remaining", "provider": "openrouter",
+                           "credits": None, "total": 0.0, "used": 0.0},
+                "repos": [{
+                    "name": "agent-harness", "tracker": "github",
+                    "slug": "Drokoz/agent-harness", "branch": "main",
+                    "default_branch": "main",
+                    "readiness_source": "default-branch",
+                    "status_porcelain": "",
+                    "path": str(self.d / "repos" / "agent-harness"),
+                    "exists": {"gate": True, "skills": True, "context": True},
+                    "issues": [], "prs": [], "prs_merged": [],
+                    "closed_count": 0,
+                }],
+            }],
+        }
+
+    def _loop(self, al_largo=None, extra=()):
+        """`run --loop` con la `run_main` real (config NO parcheada: el disco
+        es la fuente de verdad). `al_largo(i)` corre al arrancar la pasada i
+        (en el lado de lado de `collect`): es el "a mitad de bucle"."""
+        args = self.cli.build_parser().parse_args(
+            ["run", "--context", "h", "--loop", "--log", str(self.log_path),
+             "--freno", str(self.freno), "--piso", "3", "--max-pasadas", "9",
+             "--sin-proponer", *extra])
+        mundo = Mundo(prs=[])
+        vistas = []
+
+        def collect_mock(contextos):
+            i = len(vistas)
+            vistas.append(contextos)
+            if al_largo:
+                al_largo(i)
+            return self._raw_vacio()
+
+        salida = io.StringIO()
+        with mock.patch.object(self.cli, "OFFLINE", False), \
+             mock.patch.object(self.cli, "collect", side_effect=collect_mock), \
+             mock.patch.object(self.cli.adapters, "run", mundo.cmd), \
+             mock.patch.object(self.cli, "_creditos_usado", return_value=None), \
+             mock.patch.object(self.cli, "_creditos_restantes",
+                               return_value=99.0), \
+             mock.patch.object(self.cli, "_sesiones_de_pi",
+                               return_value=(lambda *a: None,
+                                             lambda *a: None)), \
+             mock.patch.dict(os.environ, {"HERDR_ENV": "1", "HOME": str(self.d),
+                                          "HARNESS_CONFIG_DIR": str(self.d)}), \
+             mock.patch("time.sleep"):
+            contextos = self.cli.load_config().select("h")
+            with mock.patch("sys.stdout", new=salida):
+                code = self.cli.run_main(args, contextos)
+        return code, salida.getvalue(), leer_log(self.log_path), vistas
+
+    def test_cambiar_la_config_entre_pasadas_lo_ve_la_siguiente(self):
+        """Entre la pasada 1 y la 2 se cambia la config en el disco: la
+        pasada 2 la relee y la ve (no corre con la foto del arranque). El
+        proveedor de presupuesto se cambia de `openrouter` a `none`: lo que
+        la pasada 2 ve es el contexto REPARSEO, no el del arranque."""
+        def al_largo(i):
+            if i == 0:
+                # La edit de la madrugada.
+                self.d.joinpath("config.json").write_text(
+                    self._cfg(provider="none"))
+            else:
+                # La segunda pasada ya corrió: frena para no seguir mirando.
+                self.freno.write_text("")
+
+        code, salida, eventos, vistas = self._loop(al_largo)
+        self.assertEqual(len(vistas), 2, "dos pasadas completas")
+        self.assertEqual(vistas[0][0].budget.provider, "openrouter",
+                         "la primera pasada: la config del arranque")
+        self.assertEqual(vistas[1][0].budget.provider, "none",
+                         "la segunda leyó la config ya editada en el disco")
+        self.assertEqual(code, 0)
+        self.assertIn("corte: freno", salida)
+
+    def test_romper_la_config_entre_pasadas_detiene_con_motivo(self):
+        """La config deja de poder leerse a mitad de bucle (rota): el bucle
+        corta con el motivo en el log de eventos y sale distinto de cero —
+        no sigue con la foto vieja."""
+        def al_largo(i):
+            if i == 0:
+                # La rompen en la madrugada: JSON inválido.
+                self.d.joinpath("config.json").write_text("{ no es json")
+
+        code, salida, eventos, vistas = self._loop(al_largo)
+        self.assertNotEqual(code, 0, "config ilegible: no puede salir 0")
+        self.assertEqual(len(vistas), 1,
+                         "cortó antes de que la segunda pasada corriera")
+        fin = [e for e in eventos if e["tipo"] == "bucle"][-1]
+        self.assertIn("config ilegible", fin["cuerpo"])
+        self.assertIn("JSON inválido", fin["cuerpo"])
+        anotadas = [e for e in eventos if e["tipo"] == "corrida"
+                    and "config ilegible" in e["cuerpo"]]
+        self.assertEqual(len(anotadas), 1,
+                         "el motivo queda en el log de la pasada que lo vio")
+        self.assertIn("config ilegible", salida)
+
+
 class LaLineaViva(unittest.TestCase):
     """#114: en TTY las vueltas vacías seguidas se colapsan en una línea
     que se actualiza en el sitio; el trabajo la baja."""

@@ -1277,18 +1277,37 @@ def _run_loop(args, contexts, log_path):
         sys.stderr.write("harness: run necesita adaptadores y una sesión de "
                          "herdr (sin HARNESS_OFFLINE, con HERDR_ENV=1)\n")
         return 2
+    # La selección de contexto (nombre, --all) es del arranque; la config
+    # SÍ se relee en cada pasada (#163, regla 5 de la auditoría #152): una
+    # corrida que dura la noche no corre con la foto que tomó al arrancar.
+    nombre = contexts[0].name if contexts else "harness"
+
     # El piso se mide contra el mismo proveedor que la corrida cobra:
     # sin OpenRouter no hay crédito que medir, y sin medir el piso no corta.
     provider = next((c.budget.provider for c in contexts), None)
     creditos = (_creditos_restantes if provider == "openrouter" else None)
-    nombre = contexts[0].name if contexts else "harness"
 
     def _una_corrida():
         # Una corrida nueva por pasada: su propio run_id, y la línea
         # `pasada` se anota en ella, no en una corrida fantasma.
         log = EventLog(log_path, nombre)
+        # Las preferencias se releen en cada corrida (#163): editar la config
+        # en el medio rige la siguiente pasada, y una config que deja de poder
+        # leerse (borrada, rota, sin permisos) detiene el bucle con el motivo
+        # en el log, en vez de seguir con la foto vieja — igual que un tracker
+        # que no contesta (#130), porque los dos son el mismo mundo: una
+        # fuente que no se lee no se adivina.
+        try:
+            contextos = load_config().select(
+                args.context, todos=args.todos)
+        except ConfigError as e:
+            corte = ("config ilegible: {} (el bucle se detiene en vez de "
+                     "seguir con la config del arranque, #163)".format(e))
+            log.write("corrida", "corrida", corte)
+            sys.stdout.write("harness: {}\n".format(corte))
+            return Pasada(False, "config ilegible", log=log, corte=corte)
         trabajo, partes, corte = False, [], ""
-        for ctx in contexts:
+        for ctx in contextos:
             p = _una_pasada(args, ctx, log)
             trabajo = trabajo or p.trabajo
             partes.append(p.detalle)
@@ -1324,10 +1343,14 @@ def _run_loop(args, contexts, log_path):
                   creditos=creditos, freno=args.freno or None,
                   proposer_vacio=proposer, vigilar=vigilar)
     sys.stdout.write("harness: bucle: corte: {}\n".format(corte))
-    # Un corte por tracker ilegible no es una noche terminada: es un mundo
-    # que no se pudo leer. Sale distinto de cero, como el freno viejo de
-    # #91 dejó de salir 0.
-    return 1 if corte.startswith("tracker ilegible") else 0
+    # Un corte por una fuente que no se puede leer (el tracker, #130; la
+    # config, #163) no es una noche terminada: es un mundo que se conoce a
+    # medias. Sale distinto de cero, como el freno viejo de #91 dejó de
+    # salir 0.
+    if (corte.startswith("tracker ilegible")
+            or corte.startswith("config ilegible")):
+        return 1
+    return 0
 
 
 def costo_main(args):
