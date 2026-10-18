@@ -134,7 +134,8 @@ contextos default.
 
 **Parcial.** El tope por corrida existe para el reloj (minutos de agente) y para los
 créditos *entre* pasadas; **no existe tope de gasto dentro de la propia corrida**
-(piso, no techo), y la restricción de lectura en el runner Claude no está forzada.
+(piso, no techo), y la restricción de lectura/escritura solo está forzada en pi — en
+Claude se sostiene con el prompt (issue #167).
 Tres issues: #165, #166, #167.
 
 | Parte | Estado |
