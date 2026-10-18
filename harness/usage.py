@@ -321,6 +321,10 @@ def _bucket_rl(nombre, crudo, leido):
     return Bucket(nombre, _pct(pct), reset, "statusline", leido)
 
 
+# Desajuste de reloj tolerado entre quien escribió el archivo y quien lo lee.
+TOLERANCIA_RELOJ = timedelta(seconds=60)
+
+
 def leer_rate_limits(ruta, ahora, max_edad):
     """`(Usage, "")` desde el archivo de la statusline si está fresco (más
     nuevo que `max_edad`), o `(None, motivo)`: no existe, está roto o es
@@ -339,6 +343,9 @@ def leer_rate_limits(ruta, ahora, max_edad):
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
         return None, "statusline: {} ilegible ({})".format(ruta, e)
     edad = ahora - leido
+    if edad < -TOLERANCIA_RELOJ:
+        return None, "statusline: capturado en el futuro ({}): reloj " \
+                     "desajustado o archivo ajeno".format(leido.isoformat())
     if edad > max_edad:
         return None, "statusline: viejo: {} min (máx {} min)".format(
             int(edad.total_seconds() // 60), int(max_edad.total_seconds() // 60))
