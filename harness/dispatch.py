@@ -230,7 +230,7 @@ def podar_transcripciones(dir, repo, issue, keep=TRANSCRIPCIONES_POR_TICKET,
     return borrados
 
 
-def prompt_de(issue, gate_tail=None, wip=None):
+def prompt_de(issue, gate_tail=None, wip=None, parent_intencion=None):
     """El trabajo de un agente, en una línea. En inglés: es machine-facing.
 
     `gate_tail` es la cola del gate rojo del intento anterior (peldaño 2 de
@@ -247,6 +247,17 @@ def prompt_de(issue, gate_tail=None, wip=None):
     y exige que la decisión quede registrada en el log (el primer commit
     del intento), para poder medir cuál de las dos funciona mejor.
     Sin WIP, el prompt es el de siempre, sin ruido extra.
+
+    `parent_intencion` (#142, el "Refocus" de OpenRig): la cadena de
+    intención del ticket (título + primera frase del spec padre, ya
+    aplanada y truncada por `intencion_padre`). Con ella, el prompt dice a
+    qué sirve el ticket y exige, antes de abrir el PR, revisar que el diff
+    no se salga del alcance del ticket ni de esa intención -- lo que no
+    sirva se deja fuera y se anota como follow-up, no se implementa. Sin
+    intención, el prompt es el de siempre, sin ruido extra: una decisión de
+    agrandar el alcance que es localmente defendible desde la ventana de
+    contexto del agente es la que convierte un ticket chico en un refactor
+    que nadie pidió.
     """
     texto = (
         "Read AGENTS.md and CONTEXT.md, then implement GitHub issue {} in this "
@@ -277,6 +288,14 @@ def prompt_de(issue, gate_tail=None, wip=None):
             "be measured: make the first commit of this attempt start with "
             '"WIP decision: resume" or "WIP decision: discard", followed by a "'
             "one-line reason.".format(intento, motivo, transcripcion)
+        )
+    if parent_intencion:
+        texto += (
+            " This issue serves: {}. Before opening the PR, review the diff "
+            "against the issue scope and that intent: if it drifts beyond "
+            "either, leave the extra work OUT and list it as a follow-up in "
+            "the PR description instead of implementing it.".format(
+                una_linea(parent_intencion))
         )
     return una_linea(texto)
 
@@ -309,6 +328,84 @@ def skills_de(cuerpo):
             if _SKILL_NOMBRE_RE.match(nombre) and nombre not in skills:
                 skills.append(nombre)
     return tuple(skills)
+
+
+# --------------------------------------------------------------------- padre
+# #142 ("Refocus"): el ticket ya declara su spec padre en la sección
+# `## Parent` (`#34`). El harness lo lee y le pasa al agente la cadena de
+# intención -- título y primera frase del spec, sin el spec entero -- para
+# que la decisión de agrandar el alcance no sea localmente defendible.
+# La sección, como `Skills:`, es una convención del ticket, no del harness.
+_PADRE_RE = re.compile(r"(?ims)^##\s+parent\s*$(.*?)(?=^##\s|\Z)")
+# Con o sin espacio entre el # y el número ("#34" / "# 34").
+_PADRE_NUMERO_RE = re.compile(r"# ?(\d+)")
+# Cuánto del spec padre cabe en el prompt (#142): el prompt se manda como
+# una sola línea, así que la intención se aplana y se trunca.
+INTENCION_MAX = 300
+
+
+def padre_de(cuerpo):
+    """El número del spec padre del ticket: la sección `## Parent` del
+    cuerpo (`#34`). Puro. Sin sección, sección vacía o sección sin un
+    número reconocible, None -- el prompt queda el de siempre y el
+    despacho no se toca.
+
+    Sólo se mira la sección: una mención `#99` en el resto del cuerpo no
+    es el padre. Si la sección lista varios números (p. ej. "#34 y #35"),
+    vale el primero: el padre del ticket, no el de la lista."""
+    m = _PADRE_RE.search(cuerpo or "")
+    if not m:
+        return None
+    n = _PADRE_NUMERO_RE.search(m.group(1))
+    return int(n.group(1)) if n else None
+
+
+def intencion_padre(slug, numero, run_cmd, max_chars=INTENCION_MAX):
+    """La intención del spec padre para el prompt del implementador (#142):
+    el título del issue `numero` de `slug` más la primera frase de su
+    `## What to build` (o del body si no hay), aplanado a una línea y
+    truncado a `max_chars` -- el prompt viaja como una sola línea y el spec
+    entero no cabe (ni hace falta).
+
+    `run_cmd` es el de la corrida: `(args, cwd=None, timeout) -> (ok, out)`.
+    Un fallo (gh no contesta, issue borrado, salida ilegible) devuelve
+    None sin lanzar: el despacho sigue sin la intención, no se bloquea."""
+    try:
+        ok, out = run_cmd(["gh", "issue", "view", str(numero),
+                           "--json", "title,body", "-R", slug], timeout=60)
+        if not ok:
+            return None
+        issue = json.loads(out)
+    except (ValueError, OSError):
+        return None
+    if not isinstance(issue, dict):
+        return None
+    titulo = (issue.get("title") or "").strip()
+    body = issue.get("body") or ""
+    resumen = _primera_frase(_seccion(body, "what to build") or body)
+    if not titulo and not resumen:
+        return None
+    texto = "Spec: {}".format(titulo) if titulo else "Spec"
+    if resumen:
+        texto += " {}".format(resumen)
+    return una_linea(texto)[:max_chars]
+
+
+def _seccion(cuerpo, nombre):
+    """El contenido de una sección `## nombre` del cuerpo (mayúsculas a
+    voluntad), hasta la siguiente sección o el fin. None si no existe."""
+    m = re.search(r"(?ims)^##\s+{}\s*$(.*?)(?=^##\s|\Z)".format(re.escape(nombre)),
+                  cuerpo or "")
+    return m.group(1) if m else None
+
+
+def _primera_frase(texto):
+    """La primera frase no vacía del texto: hasta el primer punto (o
+    punto final de pregunta/exclamación) con espacio o fin detrás."""
+    t = (texto or "").strip()
+    m = re.search(r"[^.!?]+[.!?]\s+", t)
+    return m.group(0).strip() if m else (t.split("\n\n")[0].strip()[:200]
+                                         if t else "")
 
 
 # Los settings de las sesiones de Claude del harness: el opt-in de auto y
@@ -861,6 +958,11 @@ class Job:
     # (intento, motivo, transcripcion) del commit WIP que quedó en la rama
     # por un abandono previo (#80); None = sin WIP, prompt de siempre.
     wip: Optional[Tuple[int, str, str]] = None
+    # El body del ticket (#142): de él sale `padre_de`, que lleva a la
+    # intención del spec padre en el prompt. "" = sin body conocido
+    # (mantenedor, tests que no lo necesitan): sin intención, prompt
+    # de siempre.
+    body: str = ""
 
 
 @dataclass
@@ -978,7 +1080,24 @@ class Dispatcher:
         return nombre_agente(job.repo, job.issue)
 
     def _prompt(self, job):
-        return prompt_de(job.issue, job.gate_tail, job.wip)
+        return prompt_de(job.issue, job.gate_tail, job.wip,
+                         parent_intencion=self._intencion_de(job))
+
+    def _intencion_de(self, job):
+        """(#142) La cadena de intención del ticket: la del spec padre
+        (`padre_de` sobre el body), resuelta con una `gh issue view`.
+        Sin `## Parent`, no hay intención y ni se consulta GitHub. Un
+        fallo en la lectura (red, issue borrado) no bloquea el despacho:
+        se despacha sin la intención y queda anotado en el log."""
+        padre = padre_de(job.body)
+        if padre is None:
+            return None
+        intencion = intencion_padre(job.slug, padre, self.run_cmd)
+        if intencion is None:
+            self._log(job, "padre", self._ref_de(job),
+                      "intención del spec #{} no disponible: fallo al "
+                      "leerlo, se despacha sin ella".format(padre))
+        return intencion
 
     def _baseline(self, job, ref):
         """Lo que el job debía preservar antes de despachar. El ticket no

@@ -22,8 +22,9 @@ import support
 from harness import adapters, dispatch, state
 from harness.dispatch import (ESCALERA, DispatchSpec, Dispatcher, EventLog, Job,
                               SKILLS_IMPLEMENTADOR, args_sesion_minima, cosechar,
-                              decidir_tanda, nombre_agente, peldano_de, prompt_de,
-                              skills_de, una_linea, worktree_path)
+                              decidir_tanda, intencion_padre, nombre_agente,
+                              padre_de, peldano_de, prompt_de, skills_de,
+                              una_linea, worktree_path)
 
 ROOT = support.ROOT
 HARNESS = ROOT / "bin" / "harness"
@@ -164,11 +165,13 @@ def spec(**kw):
 
 def job(issue=7, repo="koku", path="/repos/koku", slug="Drokoz/koku",
         attempt=1, kind="", model="", extra_args=(), gate_tail=None,
-        wip=None, minutos_acumulado=0.0, skills=SKILLS_IMPLEMENTADOR):
+        wip=None, minutos_acumulado=0.0, skills=SKILLS_IMPLEMENTADOR,
+        body=None):
     return Job(repo=repo, repo_path=path, slug=slug, issue=issue,
                attempt=attempt, kind=kind, model=model,
                extra_args=extra_args, gate_tail=gate_tail, wip=wip,
-               minutos_acumulado=minutos_acumulado, skills=skills)
+               minutos_acumulado=minutos_acumulado, skills=skills,
+               body=body)
 
 
 def job_de_peldano(escalados, **kw):
@@ -466,6 +469,127 @@ class TestPuros(unittest.TestCase):
         self.assertIn("arbol sucio", p)
 
 
+class TestPadreDe(unittest.TestCase):
+    """`padre_de` (#142): el número del spec padre desde la sección
+    `## Parent` del cuerpo del ticket. Puro: si no está o no se entiende,
+    None -- el prompt sin padre es el de siempre."""
+
+    def test_extrae_el_numero(self):
+        self.assertEqual(padre_de("## Parent\n\n#34\n"), 34)
+
+    def test_extrae_con_ruido_alrededor(self):
+        cuerpo = ("# Título\n\n## Parent\n\n#34\n\n## What to build\n\n" +
+                  "Texto del ticket. Mención a #99 que no es el padre.\n")
+        self.assertEqual(padre_de(cuerpo), 34)
+
+    def test_solo_un_numero_en_las_primeras_lineas(self):
+        self.assertEqual(padre_de("## Parent\n# 34"), 34)
+        self.assertEqual(padre_de("## Parent\n# 34 y # 35"), 34)
+
+    def test_sin_seccion_padre(self):
+        self.assertIsNone(padre_de("# Ticket\n\n## What to build\n\nCosas."))
+
+    def test_seccion_padre_vacia(self):
+        self.assertIsNone(padre_de("## Parent\n\n## What to build\n\nCosas."))
+
+    def test_seccion_ilegible(self):
+        self.assertIsNone(padre_de("## Parent\n\nNingún issue acá.\n"))
+
+    def test_seccion_mayusculas_a_voluntad(self):
+        self.assertEqual(padre_de("## PARENT\n\n#34"), 34)
+
+    def test_cuerpo_vacio_o_nulo(self):
+        self.assertIsNone(padre_de(""))
+        self.assertIsNone(padre_de(None))
+
+
+class TestIntencionPadre(unittest.TestCase):
+    """`intencion_padre` (#142): título + primera frase del spec padre,
+    aplanado y truncado para entrar en el prompt de una línea. Un fallo
+    en `gh` (red, issue borrado) devuelve None y no lanza: el despacho
+    sigue sin la intención."""
+
+    @staticmethod
+    def _mundo(respuesta):
+        m = []  # las llamadas
+        def cmd(args, cwd=None, timeout=30):
+            m.append(tuple(args))
+            return respuesta
+        return m, cmd
+
+    def test_titulo_y_primera_frase_truncados(self):
+        _, cmd = self._mundo((True, json.dumps({
+            "title": "La frontera de tickets",
+            "body": "El harness consume tickets. Segunda frase del spec.\n"
+                    "\n## Acceptance criteria\n"})))
+        intencion = intencion_padre("Drokoz/koku", 34, cmd)
+        self.assertIn("La frontera de tickets", intencion)
+        self.assertIn("El harness consume tickets.", intencion)
+        # La primera frase sí; la segunda no: el spec entero no viaja.
+        self.assertNotIn("Segunda frase", intencion)
+        # Aplanado: el prompt resultante es de una línea.
+        self.assertNotIn("\n", intencion)
+        self.assertLessEqual(len(intencion), 300)
+
+    def test_llama_a_gh_con_el_slug(self):
+        llamadas, cmd = self._mundo((True, json.dumps(
+            {"title": "T", "body": "B"})))
+        intencion_padre("Drokoz/koku", 34, cmd)
+        (args,) = llamadas
+        self.assertEqual(args[:4], ("gh", "issue", "view", "34"))
+        self.assertIn("-R", args)
+        self.assertIn("Drokoz/koku", args)
+
+    def test_issue_borrado_devuelve_none_y_no_lanza(self):
+        _, cmd = self._mundo((False, "GraphQL: Could not resolve"))
+        self.assertIsNone(intencion_padre("Drokoz/koku", 34, cmd))
+
+    def test_salida_no_json_devuelve_none(self):
+        _, cmd = self._mundo((True, "<html>502</html>"))
+        self.assertIsNone(intencion_padre("Drokoz/koku", 34, cmd))
+
+
+class TestPromptConIntencion(unittest.TestCase):
+    """`prompt_de` con la intención del padre (#142): el refocus de
+    OpenRig. Con intención, el prompt dice a qué sirve el ticket y pide
+    revisar el alcance antes del PR; sin ella, el prompt es exactamente
+    el de hoy."""
+
+    def test_sin_intencion_el_prompt_es_el_de_siempre(self):
+        self.assertEqual(prompt_de(7),
+                         prompt_de(7, parent_intencion=None))
+        self.assertEqual(prompt_de(7), prompt_de(7, ""))
+        self.assertNotIn("This issue serves", prompt_de(7))
+
+    def test_con_intencion_la_incluye_y_es_una_linea(self):
+        p = prompt_de(7, parent_intencion="Spec: La frontera de tickets. " +
+                      "El harness consume tickets.")
+        self.assertNotIn("\n", p)
+        self.assertIn("This issue serves", p)
+        self.assertIn("La frontera de tickets", p)
+
+    def test_con_intencion_pide_revisar_el_alcance_antes_del_pr(self):
+        p = prompt_de(7, parent_intencion="Spec: X. Y.")
+        self.assertIn("scope", p.lower())
+        # Lo que no sirva se deja fuera y se anota como follow-up, no se
+        # implementa.
+        self.assertIn("follow-up", p)
+
+    def test_intencion_multilinea_se_aplana(self):
+        p = prompt_de(7, parent_intencion="Spec: T\nB\nc")
+        self.assertNotIn("\n", p)
+        self.assertNotIn("\r", p)
+
+    def test_con_intencion_y_wip_y_gate_to_en_una_linea(self):
+        p = prompt_de(7, gate_tail="boom\nline2",
+                      wip=(1, "arbol sucio", "/t.log"),
+                      parent_intencion="Spec: T. B.")
+        self.assertNotIn("\n", p)
+        self.assertIn("boom", p)
+        self.assertIn("WIP", p)
+        self.assertIn("This issue serves", p)
+
+
 class TestPeldanoDe(unittest.TestCase):
     """`peldano_de` (#38): puro, sin memoria -- `escalados` es lo único que
     entra, y siempre sale de releer el log (`state.intentos_que_escalan`)."""
@@ -710,6 +834,44 @@ class TestCicloDeVida(unittest.TestCase):
         texto = prompt_call[0][4]  # herdr agent prompt <target> <texto> ...
         self.assertNotIn("\n", texto)
         self.assertNotIn("\r", texto)
+
+    def test_el_dispatcher_lee_el_padre_y_lo_incluye_en_el_prompt(self):
+        """#142: el ticket declara `## Parent`, el dispatcher lo resuelve
+        vía `gh` y el prompt enviado dice a qué sirve el ticket."""
+        m = Mundo()
+        m.responder(lambda a: a[:3] == ["gh", "issue", "view"] and "34" in a,
+                    (True, json.dumps({
+                        "title": "La frontera de tickets",
+                        "body": "El harness consume tickets. Y más.\n"})))
+        despachar(m, [job(body="## Parent\n\n#34\n\n## What to build\n")])
+        (prompt_call,) = m.llamo("herdr", "agent", "prompt")
+        texto = prompt_call[0][4]
+        self.assertIn("This issue serves", texto)
+        self.assertIn("La frontera de tickets", texto)
+
+    def test_sin_padre_el_prompt_no_lleva_intencion(self):
+        """#142: ticket sin `## Parent`: ni se consulta gh por el padre ni
+        el prompt cambia respecto al de siempre."""
+        m = Mundo()
+        despachar(m, [job(body="## What to build\n\nCosas.\n")])
+        self.assertEqual(m.llamo("gh", "issue", "view", "--json"), [])
+        (prompt_call,) = m.llamo("herdr", "agent", "prompt")
+        self.assertNotIn("This issue serves", prompt_call[0][4])
+
+    def test_fallo_al_leer_el_padre_no_bloquea_y_queda_en_el_log(self):
+        """#142: `gh` no contesta por el padre (red, issue borrado): el job
+        se despacha igual, sin la intención, y el fallo queda anotado."""
+        m = Mundo()
+        m.responder(lambda a: a[:3] == ["gh", "issue", "view"] and "34" in a,
+                    (False, "GraphQL: Could not resolve to an issue"))
+        res, lineas = despachar(m, [job(body="## Parent\n\n#34\n")])
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        (prompt_call,) = m.llamo("herdr", "agent", "prompt")
+        self.assertNotIn("This issue serves", prompt_call[0][4])
+        anotadas = [l for l in lineas if l["tipo"] == "padre"]
+        self.assertEqual(len(anotadas), 1)
+        self.assertIn("koku#7", anotadas[0]["ticket"])
+        self.assertIn("fallo", anotadas[0]["cuerpo"])
 
     def test_bloqueado_se_abandona_y_sigue_el_siguiente(self):
         m = Mundo(prs=[{"number": 31, "headRefName": "ticket/7"},
