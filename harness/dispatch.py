@@ -21,6 +21,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import json
 import re
+import shlex
 import time
 import uuid
 from dataclasses import dataclass
@@ -310,6 +311,19 @@ def skills_de(cuerpo):
     return tuple(skills)
 
 
+# Los settings de las sesiones de Claude del harness: el opt-in de auto y
+# la statusline del harness, que anota la cuota real (`rate_limits`) en el
+# estado para `harness usage` -- cada ticket la refresca gratis mientras
+# trabaja. La statusline personal del usuario no se pisa: con
+# `--setting-sources project` sus settings no entran a estas sesiones.
+STATUSLINE_HARNESS = Path(__file__).resolve().parent.parent / "scripts" / "statusline-harness"
+SETTINGS_CLAUDE = json.dumps(
+    {"autoMode": {"skipAutoPermissionPrompt": True},
+     "statusLine": {"type": "command",
+                    "command": shlex.quote(str(STATUSLINE_HARNESS))}},
+    separators=(",", ":"))
+
+
 def args_sesion_minima(kind, skills, modelo="", extra_args=()):
     """Los args del agente (después del `--` de `herdr agent start`) para
     una sesión mínima (#42): sin servidores MCP, sin plugins, con las
@@ -345,8 +359,7 @@ def args_sesion_minima(kind, skills, modelo="", extra_args=()):
         args = ["--strict-mcp-config",
                 "--setting-sources", "project",
                 "--permission-mode", "auto",
-                "--settings",
-                '{"autoMode":{"skipAutoPermissionPrompt":true}}']
+                "--settings", SETTINGS_CLAUDE]
         if modelo:
             args += ["--model", modelo]
         return args + extra

@@ -36,6 +36,11 @@
                                     resets (America/Santiago). No llama al
                                     modelo. Sale 1 si no se pudo leer
     harness usage --json            lo mismo, parseable (los resets en ISO)
+    harness usage --fuente F        auto (por defecto: la statusline de las
+                                    sesiones de Claude del harness si está
+                                    fresca, sin abrir nada; si no, /usage),
+                                    statusline o usage (el único que trae
+                                    los buckets por modelo, p.ej. Fable)
     harness usage --pane ID         el pane de herdr desde el cual abrir el
                                     temporal (por defecto el propio, o el
                                     enfocado si se corre fuera de herdr)
@@ -313,6 +318,12 @@ def build_parser():
                    help="usage: el pane de herdr desde el cual abrir el "
                         "temporal de /usage (por defecto HERDR_PANE_ID, o el "
                         "enfocado de `herdr pane list` fuera de herdr)")
+    p.add_argument("--fuente", default="auto",
+                   choices=["auto", "statusline", "usage"],
+                   help="usage: de dónde leer la cuota: auto (la statusline "
+                        "de las sesiones del harness si está fresca, si no "
+                        "/usage por herdr), statusline o usage (el único con "
+                        "los buckets por modelo)")
     p.add_argument("--sessions", default="",
                    help="costo: carpeta de sesiones de pi (por defecto "
                         "~/.pi/agent/sessions)")
@@ -500,8 +511,8 @@ def quota_main(args, contexts):
     return 0
 
 
-def _leer_usage(ctx, pane=""):
-    """La cuota real de `/usage` (`harness usage`): un pane temporal de
+def _capturar_usage(ctx, pane=""):
+    """La cuota real de `/usage`: un pane temporal de
     herdr con `claude`, cerrado siempre. Lanza `UsageIlegible`. La cwd es
     la raíz de repos del contexto (una carpeta en la que Claude ya confía);
     los avisos (un pane que no cerró, un refresco que no terminó) van a
@@ -515,6 +526,20 @@ def _leer_usage(ctx, pane=""):
     return usage_mod.parsear_usage(texto, datetime.now(usage_mod.TZ))
 
 
+def _leer_usage(ctx, pane="", fuente="auto"):
+    """La cuota real de la mejor fuente (`usage.leer_cuota`): el archivo de
+    la statusline de las sesiones de Claude del harness si está fresco
+    (`quota.statusline_max_edad_min`); si no, `/usage` por herdr. Lanza
+    `UsageIlegible` con los motivos de las dos."""
+    max_edad = timedelta(minutes=(ctx.quota.statusline_max_edad_min
+                                  if ctx else 10))
+    return usage_mod.leer_cuota(
+        lambda: usage_mod.leer_rate_limits(usage_mod.ruta_rate_limits(),
+                                           datetime.now(usage_mod.TZ),
+                                           max_edad),
+        lambda: _capturar_usage(ctx, pane), fuente)
+
+
 def usage_main(args, contexts):
     """`harness usage`: la cuota REAL de Claude, de `/usage`. Sale 1 con el
     motivo si no se pudo leer o entender: nunca un número inventado."""
@@ -524,21 +549,21 @@ def usage_main(args, contexts):
         return 2
     ctx = contexts[0] if contexts else None
     try:
-        u = _leer_usage(ctx, args.pane)
+        u = _leer_usage(ctx, args.pane, args.fuente)
     except UsageIlegible as e:
         sys.stderr.write("harness: usage: no se pudo leer /usage: {}\n".format(e))
         return 1
-    leido = datetime.now(usage_mod.TZ)
+    ahora = datetime.now(usage_mod.TZ)
     if args.como_json:
-        json.dump(usage_mod.as_dict(u, leido), sys.stdout, indent=2,
+        json.dump(usage_mod.as_dict(u, ahora), sys.stdout, indent=2,
                   ensure_ascii=False, sort_keys=True)
         sys.stdout.write("\n")
     else:
-        sys.stdout.write(usage_mod.render_usage(u))
+        sys.stdout.write(usage_mod.render_usage(u, ahora))
     log = EventLog(_estado_dir() / "harness" / "events.jsonl",
                    ctx.name if ctx else "harness")
-    log.write("usage", "usage", "sesión {}%, semana {}%{}".format(
-        u.sesion.pct, u.semana.pct,
+    log.write("usage", "usage", "{}: sesión {}%, semana {}%{}".format(
+        u.semana.fuente, u.sesion.pct, u.semana.pct,
         "".join(", {} {}%".format(b.nombre, b.pct) for b in u.por_modelo)))
     return 0
 

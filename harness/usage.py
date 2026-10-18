@@ -6,8 +6,22 @@ máquinas ni otros usuarios. Las barras de `/usage` ("Current session",
 server-side: incluyen todo. Sólo la sección de abajo ("What's contributing
 to your limits usage?") es local, y esa no se lee.
 
-Tres piezas:
+Dos fuentes de la cuota real, en este orden:
 
+1. la statusline de las sesiones de Claude del harness
+   (`scripts/statusline-harness`): Claude Code le pasa por stdin
+   `rate_limits` (sesión de 5h y semana, con `resets_at` en epoch) y el
+   script lo anota en `~/.local/state/harness/rate_limits.json`. Si está
+   fresco (`quota.statusline_max_edad_min`), se usa sin abrir nada. No trae
+   el bucket por modelo (Fable) y sólo aparece después de la primera
+   respuesta del modelo en una sesión;
+2. `/usage`, capturado por herdr: la única fuente en frío y la única con
+   los buckets por modelo.
+
+Las piezas:
+
+- `escribir_rate_limits` / `leer_rate_limits`: el archivo de la statusline.
+- `leer_cuota`: la elección de fuente.
 - `parsear_usage` (puro): el texto de la pantalla -> `Usage`, con el % y el
   reset de cada bucket como datetime con zona (America/Santiago). El texto
   no tiene contrato: lo que no se entiende es `UsageIlegible`, con una
@@ -27,6 +41,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -49,6 +64,8 @@ class Bucket:
     nombre: str                    # "Current session", "Fable", ...
     pct: float                     # 0-100, tal cual lo muestra /usage
     reset: Optional[datetime]      # None = /usage no mostró reset
+    fuente: str = "usage"          # "usage" | "statusline"
+    leido: Optional[datetime] = None  # cuándo se capturó el dato
 
 
 @dataclass
@@ -198,7 +215,7 @@ def parsear_usage(texto, ahora):
                 header, " | ".join(bloques[header])))
         m = _HEADER_RE.match(header)
         nombre = m.group("modelo") if m.group("modelo") else header
-        return Bucket(nombre, pct, reset)
+        return Bucket(nombre, pct, reset, "usage", ahora)
 
     sesion = bucket(HEADER_SESION)
     semana = bucket(HEADER_SEMANA)
@@ -208,21 +225,31 @@ def parsear_usage(texto, ahora):
     return Usage(sesion=sesion, semana=semana, por_modelo=por_modelo)
 
 
-def _bucket_dict(b):
-    return {"pct": b.pct, "reset": b.reset.isoformat() if b.reset else None}
+def _bucket_dict(b, ahora):
+    edad = (int(round((ahora - b.leido).total_seconds()))
+            if (ahora is not None and b.leido is not None) else None)
+    return {"pct": b.pct, "reset": b.reset.isoformat() if b.reset else None,
+            "fuente": b.fuente,
+            "leido": b.leido.isoformat() if b.leido else None,
+            "edad_s": edad}
 
 
-def as_dict(u, leido=None):
+def as_dict(u, ahora=None):
     """El contrato de `harness usage --json`: lo que consumen el cupo por
     noche (#145), el router (#146) y la ventana de quema (#147). Los % son
-    0-100 como en /usage; los resets, ISO 8601 con offset de Santiago."""
+    0-100 como en /usage; los resets, ISO 8601 con offset de Santiago. Cada
+    dato dice de qué fuente vino y su antigüedad (`edad_s` contra `ahora`)."""
+    fuentes = []
+    for b in [u.sesion, u.semana] + list(u.por_modelo):
+        if b.fuente not in fuentes:
+            fuentes.append(b.fuente)
     return {
-        "fuente": "usage",
+        "fuente": "+".join(fuentes),
         "alcance": "cuenta",
-        "leido": leido.isoformat() if leido else None,
-        "sesion": _bucket_dict(u.sesion),
-        "semana": _bucket_dict(u.semana),
-        "por_modelo": {b.nombre: _bucket_dict(b) for b in u.por_modelo},
+        "consultado": ahora.isoformat() if ahora else None,
+        "sesion": _bucket_dict(u.sesion, ahora),
+        "semana": _bucket_dict(u.semana, ahora),
+        "por_modelo": {b.nombre: _bucket_dict(b, ahora) for b in u.por_modelo},
     }
 
 
@@ -234,16 +261,109 @@ def _cuando(dt):
     return "resetea {} {:%d-%m %H:%M}".format(dias[d.weekday()], d)
 
 
-def render_usage(u):
-    """La tabla corta de `harness usage`."""
+def render_usage(u, ahora=None):
+    """La tabla corta de `harness usage`, con la fuente de cada dato."""
     filas = [("sesión (5h)", u.sesion), ("semana (todos)", u.semana)]
     filas += [("semana ({})".format(b.nombre), b) for b in u.por_modelo]
-    lineas = ["cuota de Claude (/usage, a nivel de cuenta: incluye otros "
-              "equipos)"]
+    lineas = ["cuota de Claude (a nivel de cuenta: incluye otros equipos)"]
     for nombre, b in filas:
-        lineas.append("  {:<22} {:>5}%  {}".format(nombre, b.pct, _cuando(b.reset)))
+        origen = b.fuente
+        if ahora is not None and b.leido is not None:
+            origen += ", hace {}s".format(int((ahora - b.leido).total_seconds()))
+        lineas.append("  {:<22} {:>5}%  {}  ({})".format(
+            nombre, b.pct, _cuando(b.reset), origen))
     lineas.append("  (America/Santiago)")
     return "\n".join(lineas) + "\n"
+
+
+# --------------------------------------------------------------- statusline
+def ruta_rate_limits(env=None):
+    """Dónde anota la statusline: `$XDG_STATE_HOME/harness/rate_limits.json`
+    (por defecto `~/.local/state/harness/`), junto al log de eventos."""
+    env = os.environ if env is None else env
+    xdg = env.get("XDG_STATE_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+    return base / "harness" / "rate_limits.json"
+
+
+def escribir_rate_limits(entrada, ruta, ahora):
+    """Anota `rate_limits` del JSON de statusline, con la hora de captura y
+    el `session_id`. Atómico (temporal + `os.replace`): un lector nunca ve
+    medio archivo. Sin `rate_limits` (la sesión todavía no tuvo respuesta
+    del modelo) no escribe nada: no pisa un dato bueno con nada. Devuelve
+    si escribió."""
+    rl = entrada.get("rate_limits") if isinstance(entrada, dict) else None
+    if not isinstance(rl, dict) or not (rl.get("five_hour") or rl.get("seven_day")):
+        return False
+    ruta = Path(ruta)
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ruta.with_name(".{}.{}.tmp".format(ruta.name, os.getpid()))
+    tmp.write_text(json.dumps({"rate_limits": rl,
+                               "capturado": ahora.isoformat(),
+                               "session_id": entrada.get("session_id")},
+                              ensure_ascii=False))
+    os.replace(str(tmp), str(ruta))
+    return True
+
+
+def _bucket_rl(nombre, crudo, leido):
+    if not isinstance(crudo, dict):
+        raise ValueError("falta {}".format(nombre))
+    pct = crudo.get("used_percentage")
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        raise ValueError("{}.used_percentage no es un número".format(nombre))
+    reset = crudo.get("resets_at")
+    if reset is not None:
+        if isinstance(reset, bool) or not isinstance(reset, (int, float)):
+            raise ValueError("{}.resets_at no es epoch".format(nombre))
+        reset = datetime.fromtimestamp(reset, TZ)
+    return Bucket(nombre, _pct(pct), reset, "statusline", leido)
+
+
+def leer_rate_limits(ruta, ahora, max_edad):
+    """`(Usage, "")` desde el archivo de la statusline si está fresco (más
+    nuevo que `max_edad`), o `(None, motivo)`: no existe, está roto o es
+    viejo. Sin buckets por modelo: la statusline no los trae."""
+    ruta = Path(ruta)
+    if not ruta.exists():
+        return None, "statusline: {} no existe".format(ruta)
+    try:
+        data = json.loads(ruta.read_text())
+        leido = datetime.fromisoformat(data["capturado"])
+        if leido.tzinfo is None:
+            raise ValueError("capturado sin zona")
+        rl = data["rate_limits"]
+        sesion = _bucket_rl("Current session", rl.get("five_hour"), leido)
+        semana = _bucket_rl(HEADER_SEMANA, rl.get("seven_day"), leido)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        return None, "statusline: {} ilegible ({})".format(ruta, e)
+    edad = ahora - leido
+    if edad > max_edad:
+        return None, "statusline: viejo: {} min (máx {} min)".format(
+            int(edad.total_seconds() // 60), int(max_edad.total_seconds() // 60))
+    return Usage(sesion=sesion, semana=semana), ""
+
+
+def leer_cuota(leer_statusline, capturar_usage, fuente="auto"):
+    """La cuota real, de la mejor fuente disponible.
+
+    `fuente`: "auto" (la statusline si está fresca; si no, `/usage` por
+    herdr), "statusline" (sólo el archivo) o "usage" (sólo el pane: el
+    único con los buckets por modelo). Lanza `UsageIlegible` con los
+    motivos de todas las que se probaron."""
+    motivo_sl = ""
+    if fuente in ("auto", "statusline"):
+        u, motivo_sl = leer_statusline()
+        if u is not None:
+            return u
+        if fuente == "statusline":
+            raise UsageIlegible(motivo_sl)
+    try:
+        return capturar_usage()
+    except UsageIlegible as e:
+        if motivo_sl:
+            raise UsageIlegible("{}; /usage: {}".format(motivo_sl, e))
+        raise
 
 
 # ------------------------------------------------------------------ captura
@@ -335,9 +455,12 @@ def capturar(run_cmd, pane_base=None, cwd=None, comando="claude",
         if not esperar(match="Current week", ms=usage_ms):
             raise UsageIlegible("/usage no mostró 'Current week' en {}s".format(
                 usage_ms // 1000))
+        # wait-output ya vio "Current week", pero el primer read puede
+        # devolver la pantalla de antes (visto en legion), y los buckets
+        # por modelo llegan después de "Refreshing…": se relee.
         texto = leer()
         for _ in range(refresco_max):
-            if "Refreshing" not in texto:
+            if "Refreshing" not in texto and HEADER_SESION in texto:
                 break
             dormir(1)
             texto = leer()

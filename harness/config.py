@@ -107,6 +107,9 @@ class QuotaSpec:
     reserva_diaria: float = 0.08
     costo_ticket: float = 0.02
     hora_limite: str = "07:00"
+    # Cuánto vale el archivo de la statusline (`harness usage`): más viejo
+    # que esto, se captura /usage por herdr.
+    statusline_max_edad_min: float = 10.0
 
     def politica(self):
         from harness.usage import PoliticaCuota
@@ -280,7 +283,8 @@ def _quota(raw, donde):
     raw = _obj(raw, donde + ' → "quota"')
     donde = donde + ' → "quota"'
     _keys(raw, ("tope_semanal", "projects", "umbral_sesion",
-                "reserva_diaria", "costo_ticket", "hora_limite"), donde)
+                "reserva_diaria", "costo_ticket", "hora_limite",
+                "statusline_max_edad_min"), donde)
     tope = None
     if "tope_semanal" in raw:
         tope = _num(raw["tope_semanal"], '"tope_semanal"', donde)
@@ -316,6 +320,13 @@ def _quota(raw, donde):
             raise ConfigError('{}: "hora_limite" tiene que ser HH:MM (24 h, '
                               'America/Santiago), p.ej. "07:00"'.format(donde))
         politica["hora_limite"] = h
+    if "statusline_max_edad_min" in raw:
+        v = _num(raw["statusline_max_edad_min"], '"statusline_max_edad_min"',
+                 donde)
+        if v <= 0:
+            raise ConfigError('{}: "statusline_max_edad_min" tiene que ser '
+                              'mayor que cero (minutos)'.format(donde))
+        politica["statusline_max_edad_min"] = v
     return QuotaSpec(tope_semanal=tope, projects=projects, **politica)
 
 
