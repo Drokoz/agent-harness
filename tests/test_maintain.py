@@ -567,7 +567,10 @@ class TestCliMaintain(unittest.TestCase):
             mundo = self._mundo()
             rc, out, mundo = self._correr(
                 mod, mundo,
-                ["run", "--context", "harness", "--log", str(Path(tmp) / "ev.jsonl")],
+                # #176: sin plan aprobado; todo es Claude, así que vale
+                # la salida manual.
+                ["run", "--context", "harness", "--sin-aprobacion",
+                 "--log", str(Path(tmp) / "ev.jsonl")],
                 tmp)
             self.assertEqual(rc, 0, out)
             add_mant = [i for i, c in enumerate(mundo.llamadas)

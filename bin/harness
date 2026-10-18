@@ -99,6 +99,22 @@
                                     pregunta barato "¿cambió algo?" (#114)
     harness run --loop --freno F    archivo que, si aparece, frena el bucle
 
+    harness run --plan [flags]      no corre nada (#176): lista lo que se
+                                    despacharía (repo, ticket, runner, modelo,
+                                    peldaño, por qué, costo estimado) y el
+                                    total contra el tope; lo deja en
+                                    <estado>/harness/plan-FECHA.json con un hash
+    harness aprobar [--si]          muestra el plan de hoy, pide confirmación
+                                    y escribe <estado>/harness/aprobado-FECHA
+                                    con su hash (la ruta de harness-noche)
+    harness run --sin-aprobacion    manual (sin --loop): corre sin plan
+                                    aprobado sólo si todo es Claude
+
+    `run` (también --loop) no arranca sin un plan aprobado hoy cuyo hash sea
+    el del plan que calcula al arrancar: sale 2 sin crear nada. Con --loop,
+    cada pasada sólo despacha lo que el plan cubre, más tickets de Claude.
+    Ver docs/harness/config.md §"Plan aprobado".
+
     `run` consulta la cuota real (`harness usage`) antes de cada tanda con
     tickets de Claude y antes de cada ticket de Claude: con la sesión de 5h
     sobre `quota.umbral_sesion` no lanza Claude (si sólo queda Claude,
@@ -182,7 +198,8 @@ la mañana (ticket #7). `run` además deja el log JSONL de eventos.
 
 Con HARNESS_OFFLINE=1 corre en modo sin adaptadores: sin llamadas de red ni de
 gh/herdr. El gate lo usa para que el humo del CLI sea hermético. `run` no existe
-en ese modo: un dispatcher sin mundo no es un dispatcher.
+en ese modo: un dispatcher sin mundo no es un dispatcher. `run --plan` sí
+corre (sin tracker, el plan sale sin tickets): sirve para verlo sin red.
 """
 
 from __future__ import annotations
@@ -196,7 +213,7 @@ import shutil
 import sys
 import time
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -210,15 +227,18 @@ from harness import costo  # noqa: E402
 from harness import costo_pi  # noqa: E402
 from harness import doctor as doctor_mod  # noqa: E402
 from harness import routing as routing_mod  # noqa: E402
+from harness import plan as plan_mod  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
 from harness.dispatch import (BucleSpec, Corrida, DispatchSpec,  # noqa: E402
                               Dispatcher, EventLog, Job, Pasada,
                               ESCALERA_CLAUDE, RUNNER_POR_DEFECTO,
+                              ESTIMADO_SIN_HISTORIAL,
                               RUNNERS_CORRIDA, TopeGasto,
                               bucle, cosechar, decidir_tanda, elegir_peldano,
-                              motivo_presupuesto_reloj, skills_de,
+                              motivo_presupuesto_reloj, peldano_etiqueta,
+                              peldano_numero, skills_de,
                               transcripcion_path)
-from harness.dispatch import resolver_hasta  # noqa: E402
+from harness.dispatch import hhmm_de, resolver_hasta  # noqa: E402
 from harness.ideas import (IDEAS_CLAUDE, IDEAS_OPUS, Ideas,  # noqa: E402
                            MAX_IDEAS_DEFAULT, debe_correr,
                            guardar_ultima_corrida, leer_ideas_vault,
@@ -303,7 +323,7 @@ def build_parser():
     p.add_argument("command", nargs="?", default="status",
                    choices=["status", "decisions", "run", "maintain", "report",
                             "quota", "usage", "costo", "proponer", "ideas",
-                            "doctor"],
+                            "doctor", "aprobar"],
                    help="status (la pantalla), decisions (las decisiones), "
                         "run (el dispatcher de la frontera), "
                         "maintain (el mantenedor de conflictos, #56), "
@@ -311,8 +331,9 @@ def build_parser():
                         "usage (la cuota REAL de Claude, de /usage por herdr), "
                         "costo (el costo real por peldaño, #96), "
                         "proponer (el generador y el juez de trabajo nuevo, #115), "
-                        "ideas (el agente semanal de ideas, #117) "
-                        "o doctor (la salud de la máquina: routing de OpenRouter, #126)")
+                        "ideas (el agente semanal de ideas, #117), "
+                        "doctor (la salud de la máquina: routing de OpenRouter, #126) "
+                        "o aprobar (aprueba el plan de hoy de `run --plan`, #176)")
     p.add_argument("--context", metavar="NOMBRE",
                    help="un contexto en vez del de por defecto")
     p.add_argument("--all", action="store_true", dest="todos",
@@ -354,6 +375,21 @@ def build_parser():
                    help="run: fallback de modelo nativo (opcional); ídem --kind")
     p.add_argument("--log", default="",
                    help="run: dónde va el log JSONL de eventos")
+    p.add_argument("--plan", action="store_true", dest="solo_plan",
+                   help="run: no corre nada (#176): lista lo que se "
+                        "despacharía (repo, ticket, runner, modelo, peldaño, "
+                        "por qué y costo estimado), el total contra el tope, "
+                        "y deja el plan en <estado>/harness/plan-FECHA.json "
+                        "para `harness aprobar`. Con los mismos flags que "
+                        "la corrida que se va a aprobar (p.ej. --loop)")
+    p.add_argument("--sin-aprobacion", action="store_true",
+                   dest="sin_aprobacion",
+                   help="run (sin --loop): corre sin plan aprobado SOLO si "
+                        "todo lo que despacharía es Claude (US$0 en plata, "
+                        "tope de gasto forzado a 0); si algo paga, se niega "
+                        "igual (#176)")
+    p.add_argument("--si", action="store_true",
+                   help="aprobar: no pregunta (no interactivo)")
     p.add_argument("--loop", action="store_true",
                    help="run: repite la pasada hasta que corta algo (piso de "
                         "créditos, tope de pasadas con trabajo, o el archivo "
@@ -481,7 +517,23 @@ def main(argv=None):
             sys.stderr.write("harness: --only inválido: se esperaban números "
                              "separados por coma (p.ej. 38,47)\n")
             return 2
-        return run_main(args, contexts, solo)
+        if args.solo_plan:
+            return plan_main(args, contexts, solo)
+        # Lo que frena la corrida sin efectos va antes que la aprobación:
+        # el freno viejo o la falta de herdr se dicen como tales. Un
+        # contexto manual no toma nada: no hay qué aprobar.
+        if all(c.autonomy == "manual" for c in contexts):
+            return run_main(args, contexts, solo)
+        rc = (_no_arranca_el_bucle(args, contexts) if args.loop
+              else _sin_herdr())
+        if rc:
+            return rc
+        aprobado, rc = _exigir_aprobacion(args, contexts, solo)
+        if rc:
+            return rc
+        return run_main(args, contexts, solo, aprobado=aprobado)
+    if args.command == "aprobar":
+        return aprobar_main(args)
     if args.command == "maintain":
         return maintain_main(args, contexts)
     if args.command == "costo":
@@ -1022,7 +1074,286 @@ def _avisar_agentes_ilegibles(snap, ctx, log):
                      'contestó)\n'.format(ctx.name))
 
 
-def run_main(args, contexts, solo=None):
+# ----------------------------------------------------------- plan aprobado
+# #176: ninguna corrida real sin un plan que el dueño vio y aprobó.
+
+# El techo de gasto que aprobó el plan, por contexto: la config se relee en
+# cada pasada (#163), y subir `topes.max_usd` a mitad de la noche no sube
+# el tope de una corrida aprobada. Lo aplica `_tope_gasto`.
+TECHOS_USD = {}
+
+
+def _hoy():
+    """La fecha del plan y de la aprobación: la local de la máquina, la
+    misma que `date +%F` en `harness-noche`."""
+    return date.today().isoformat()
+
+
+def _costos_por_peldano(eventos):
+    """{número de peldaño: costo medio US$} de `harness costo` (#96): las
+    sesiones de pi cruzadas contra el log. Disco local, sólo lectura; si
+    no se puede leer, {} y el plan cae al costo medio por ticket."""
+    try:
+        v = costo.vista(costo_pi.leer_sesiones(), eventos)
+    except Exception:
+        return {}
+    return {n: d["costo_medio"] for n, d in (v.get("peldanos") or {}).items()
+            if d.get("costo_medio") is not None}
+
+
+def _estimado(peldano, por_peldano, promedio):
+    """(US$, de dónde sale) de un job: Claude no gasta plata; un peldaño
+    pagado, el promedio de `harness costo` de ese peldaño, o el costo medio
+    por ticket del historial, o el estimado conservador sin historial."""
+    if peldano["kind"] in plan_mod.SIN_PLATA:
+        return 0.0, "cuota de Claude"
+    n = peldano_numero(peldano["kind"], peldano["model"],
+                       peldano.get("extra_args"))
+    if por_peldano.get(n) is not None:
+        return float(por_peldano[n]), "harness costo, peldaño {}".format(n)
+    if promedio is not None:
+        return float(promedio), "costo medio por ticket del historial"
+    return ESTIMADO_SIN_HISTORIAL, "sin historial: estimado conservador"
+
+
+def _entrada_plan(repo, tipo, numero, titulo, peldano, motivo, por_peldano,
+                  promedio):
+    est, fuente = _estimado(peldano, por_peldano, promedio)
+    extra = tuple(peldano.get("extra_args") or ())
+    return {"repo": repo, "tipo": tipo, "numero": int(numero),
+            "titulo": titulo or "", "kind": peldano["kind"],
+            "model": peldano["model"], "extra_args": list(extra),
+            "peldano": peldano_etiqueta(peldano["kind"], peldano["model"],
+                                        extra),
+            "motivo": motivo, "estimado_usd": round(est, 4),
+            "estimado_fuente": fuente}
+
+
+def _planear(args, contexts, solo):
+    """El plan de la corrida que `args` describe (#176), SIN efectos: lee
+    el log de eventos y el tracker (el mismo `collect` de sólo lectura que
+    hace la corrida) y decide con `elegir_peldano`, igual que `run`. No
+    escribe el log, no cosecha (cosechar cierra issues), no parkea, no
+    consulta /usage (abre un pane), no crea ramas, worktrees ni panes.
+
+    Es la cota de arriba de lo que la corrida despacharía: la cuota de
+    Claude, el presupuesto de la tanda y el reloj sólo sacan, nunca
+    agregan. Sin `--loop` incluye además los PRs en conflicto que el
+    mantenedor resolvería (#56); el `--loop` no mantiene."""
+    log_path = (Path(args.log).expanduser() if args.log
+                else _estado_dir() / "harness" / "events.jsonl")
+    eventos = leer_eventos(log_path)
+    modo = "loop" if args.loop else "una"
+    ctxs = []
+    for ctx in contexts:
+        corrida = _corrida_de(args, ctx)
+        hasta = _hasta_de(args, ctx, INICIO_CORRIDA, noche=args.loop)
+        c = {"nombre": ctx.name,
+             "corrida": {"kind": corrida.kind, "fuente": corrida.fuente,
+                         "permitir_pi": corrida.permitir_pi,
+                         "runner_min": dict(corrida.runner_min or {}),
+                         "usa_pi": corrida.usa_pi()},
+             "max_usd": _max_usd(args, ctx),
+             "hasta": hhmm_de(hasta) if hasta is not None else "",
+             "freno": str(Path(args.freno).expanduser()) if args.freno else "",
+             "entradas": [], "notas": []}
+        ctxs.append(c)
+        if ctx.autonomy == "manual":
+            c["notas"].append("autonomía manual: este contexto no toma nada")
+            continue
+        crudo = collect([ctx], offline=OFFLINE)
+        crudo["eventos"] = eventos
+        snap = snapshot(crudo)
+        eventos_ctx = [e for e in eventos if e.get("contexto") == ctx.name]
+        promedio = costo_promedio(eventos_ctx)
+        por_peldano = _costos_por_peldano(eventos)
+        if not args.loop and not OFFLINE:
+            for r in crudo["contexts"][0]["repos"]:
+                if not r.get("slug") or not r.get("exists", {}).get("gate"):
+                    continue
+                for pr in r.get("prs") or []:
+                    numero = pr.get("number")
+                    if numero is None or not pr.get("headRefName"):
+                        continue
+                    if mergeable_de(r["slug"], numero,
+                                    adapters.run) != CONFLICTING:
+                        continue
+                    peldano, motivo = elegir_peldano(eventos, corrida,
+                                                     r["name"], numero,
+                                                     pr=True)
+                    if peldano is None:
+                        continue
+                    c["entradas"].append(_entrada_plan(
+                        r["name"], "pr", numero,
+                        "resolver conflicto: " + (pr.get("title") or ""),
+                        peldano, motivo, por_peldano, promedio))
+        parkeados = 0
+        for r in snap.contexts[0].repos:
+            if r.tracker_ilegible:
+                c["notas"].append("{}: tracker ilegible (gh no contestó): "
+                                  "su frontera se desconoce".format(r.name))
+            if not r.slug or not r.ready.get("gate"):
+                continue
+            for i in r.frontier:
+                if i.estado != "libre":
+                    continue
+                peldano, motivo = elegir_peldano(eventos, corrida, r.name,
+                                                 i.number, etiquetas=i.labels)
+                if peldano is None:
+                    parkeados += 1
+                    continue
+                if solo is not None and i.number not in solo:
+                    continue
+                c["entradas"].append(_entrada_plan(
+                    r.name, "ticket", i.number, i.title, peldano, motivo,
+                    por_peldano, promedio))
+        if parkeados:
+            c["notas"].append("{} ticket(s) con la escalera agotada: se "
+                              "parkean, no se despachan".format(parkeados))
+        if solo is not None:
+            c["notas"].append("--only {}".format(
+                ",".join(str(n) for n in sorted(solo))))
+    plan = {"version": plan_mod.VERSION, "fecha": _hoy(),
+            "creado": _iso_utc(datetime.now(timezone.utc)), "modo": modo,
+            "contextos": ctxs,
+            "estimado_usd": round(sum(
+                e["estimado_usd"] for c in ctxs for e in c["entradas"]
+                if e["kind"] not in plan_mod.SIN_PLATA), 4)}
+    return plan_mod.sellar(plan)
+
+
+def plan_main(args, contexts, solo):
+    """`harness run --plan` (#176): el plan, en pantalla y en
+    `<estado>/harness/plan-FECHA.json`. No corre nada."""
+    plan = _planear(args, contexts, solo)
+    ruta = plan_mod.ruta_plan(_estado_dir(), plan["fecha"])
+    plan_mod.guardar(ruta, plan)
+    sys.stdout.write(plan_mod.render(plan))
+    sys.stdout.write("\nplan guardado en {}\nsi está bien: harness aprobar "
+                     "(después, `harness run` con los mismos flags)\n".format(
+                         ruta))
+    return 0
+
+
+def aprobar_main(args):
+    """`harness aprobar` (#176): muestra el plan de hoy (el archivo que
+    dejó `run --plan`, no uno recalculado: se aprueba lo que se vio),
+    pide confirmación (`--si` no pregunta) y escribe `aprobado-FECHA` con
+    su hash. Un plan editado a mano no se aprueba."""
+    hoy = _hoy()
+    ruta = plan_mod.ruta_plan(_estado_dir(), hoy)
+    try:
+        plan = plan_mod.leer(ruta)
+    except plan_mod.PlanInvalido as e:
+        sys.stderr.write("harness: no hay plan de hoy que aprobar ({}).\n"
+                         "Primero: harness run --plan [los flags de la "
+                         "corrida, p.ej. --loop]\n".format(e))
+        return 2
+    sys.stdout.write(plan_mod.render(plan))
+    if not args.si:
+        if not sys.stdin.isatty():
+            sys.stderr.write("harness: aprobar sin terminal: pasá --si para "
+                             "aprobar sin preguntar\n")
+            return 2
+        try:
+            resp = input("\n¿Aprobar este plan? [s/N] ")
+        except EOFError:
+            resp = ""
+        if resp.strip().lower() not in ("s", "si", "sí", "y", "yes"):
+            sys.stderr.write("harness: no aprobado\n")
+            return 1
+    destino = plan_mod.ruta_aprobado(_estado_dir(), hoy)
+    plan_mod.escribir_aprobacion(destino, plan["hash"])
+    sys.stdout.write("aprobado: {} ({})\n".format(plan["hash"][:12], destino))
+    return 0
+
+
+def _exigir_aprobacion(args, contexts, solo):
+    """(#176) Antes de cualquier efecto: el plan que la corrida calcula al
+    arrancar tiene que ser el aprobado hoy. Devuelve `(plan, 0)` para
+    correr, o `(None, código)` con el motivo en stderr y nada creado.
+
+    `--sin-aprobacion` (sólo sin `--loop`): una corrida manual en que todo
+    es Claude corre sin aprobación, con tope de gasto 0; si algo paga, se
+    niega igual."""
+    como = ("Para correr: harness run --plan{} (con los mismos flags), "
+            "revisarlo, y harness aprobar.\n".format(
+                " --loop" if args.loop else ""))
+    if args.sin_aprobacion and args.loop:
+        sys.stderr.write("harness: --sin-aprobacion no vale con --loop: la "
+                         "noche siempre necesita un plan aprobado.\n" + como)
+        return None, 2
+    plan = _planear(args, contexts, solo)
+    if args.sin_aprobacion:
+        if plan_mod.paga(plan):
+            sys.stderr.write(
+                "harness: --sin-aprobacion sólo vale si todo es Claude, y "
+                "este plan gasta plata:\n")
+            for nombre, e in plan_mod.pagadas(plan):
+                sys.stderr.write("  {}: {} #{} en {} {}\n".format(
+                    nombre, e["repo"], e["numero"], e["kind"], e["model"]))
+            if not plan_mod.pagadas(plan):
+                sys.stderr.write("  la corrida usa pi para el revisor/"
+                                 "proponer (--kind pi / --permitir-pi)\n")
+            sys.stderr.write(como)
+            return None, 2
+        return plan_mod.sin_plata(plan), 0
+    ruta = plan_mod.ruta_aprobado(_estado_dir(), plan["fecha"])
+    aprobado = plan_mod.leer_aprobacion(ruta)
+    if aprobado is None:
+        sys.stderr.write("harness: no hay plan aprobado hoy ({} no existe o "
+                         "está vacío): no se corre nada.\n".format(ruta) + como)
+        return None, 2
+    if aprobado != plan["hash"]:
+        sys.stderr.write("harness: el plan cambió desde la aprobación "
+                         "(aprobado {}, vigente {}): no se corre nada.\n"
+                         .format(aprobado[:12], plan["hash"][:12]))
+        try:
+            visto = plan_mod.leer(plan_mod.ruta_plan(_estado_dir(),
+                                                     plan["fecha"]))
+        except plan_mod.PlanInvalido:
+            visto = None
+        if visto is not None and visto.get("hash") == aprobado:
+            for linea in plan_mod.diferencias(visto, plan):
+                sys.stderr.write("  {}\n".format(linea))
+        sys.stderr.write(como)
+        return None, 2
+    return plan, 0
+
+
+def _techo_aprobado(aprobado, ctx):
+    """Con plan aprobado, su tope para `ctx` queda de techo del
+    `TopeGasto` (lo comparten las pasadas y el proponer del bucle). Un
+    contexto que el plan no trae: techo 0."""
+    if aprobado is None:
+        return
+    techo = plan_mod.techo_usd(aprobado, ctx.name)
+    TECHOS_USD[ctx.name] = 0.0 if techo is None else techo
+
+
+def _filtrar_por_plan(aprobado, ctx, jobs, log, tipo="ticket"):
+    """(#176) Los jobs que el plan aprobado cubre (o que van a Claude); los
+    demás quedan `fuera` en el log y en pantalla. Sin plan (`None`), todos:
+    la puerta está en `_exigir_aprobacion`, antes de llegar acá."""
+    if aprobado is None:
+        return jobs
+    entran = []
+    for j in jobs:
+        numero = j.pr if tipo == "pr" else j.issue
+        if plan_mod.cubre(aprobado, ctx.name, j.repo, tipo, numero, j.kind,
+                          j.model):
+            entran.append(j)
+            continue
+        ref = "{}/{}".format("pr" if tipo == "pr" else "ticket", numero)
+        motivo = ("no está en el plan aprobado y gasta plata ({} {}): "
+                  "harness run --plan + harness aprobar para sumarlo"
+                  .format(j.kind, j.model))
+        log.write("fuera", ref, motivo, ticket="{}#{}".format(j.repo, numero))
+        sys.stdout.write("  FUERA  #{}/{} {}\n".format(numero, j.repo, motivo))
+    return entran
+
+
+def run_main(args, contexts, solo=None, aprobado=None):
     """`harness run`: la frontera desbloqueada, en worktrees y panes aislados,
     con tope de paralelismo, todo anotado en el log JSONL de eventos.
 
@@ -1032,11 +1363,14 @@ def run_main(args, contexts, solo=None):
     omite en silencio.
 
     Con `--loop`, el bucle de la noche (#88): repite la pasada hasta que corta
-    algo; sin la bandera, una sola pasada, como siempre."""
+    algo; sin la bandera, una sola pasada, como siempre.
+
+    `aprobado` (#176): el plan aprobado con que `main` dejó arrancar la
+    corrida; lo pagado que no cubre no sale, y su tope es el techo."""
     log_path = (Path(args.log).expanduser() if args.log
                 else _estado_dir() / "harness" / "events.jsonl")
     if args.loop:
-        return _run_loop(args, contexts, log_path)
+        return _run_loop(args, contexts, log_path, aprobado=aprobado)
     for ctx in contexts:
         # Un contexto manual no delega: este comando no toma nada solo.
         if ctx.autonomy == "manual":
@@ -1076,6 +1410,7 @@ def run_main(args, contexts, solo=None):
         # `permitir_claude`), no para los de Qwen, que no la gastan.
         cuota = _cuota_de(args, ctx, log)
         corrida = _corrida_de(args, ctx, log)
+        _techo_aprobado(aprobado, ctx)
         spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
                             kind=corrida.kind, model=args.model,
                             revisor_pi=corrida.usa_pi(),
@@ -1097,6 +1432,7 @@ def run_main(args, contexts, solo=None):
             credits=_creditos_usado
             if ctx.budget.provider == "openrouter" else None,
             costo_real=costo_de_pi, salida_real=salida_de_pi, corrida=corrida)
+        mant_jobs = _filtrar_por_plan(aprobado, ctx, mant_jobs, log, tipo="pr")
         if mant_jobs:
             _imprimir_mantenimiento(main_t.dispatch(mant_jobs))
         if mant_parkeados:
@@ -1167,6 +1503,7 @@ def run_main(args, contexts, solo=None):
         # créditos que quedan contra el costo medio del historial, más el
         # margen, más los topes manuales. Lo que se queda fuera se anota
         # en el log, no se omite en silencio.
+        candidatos = _filtrar_por_plan(aprobado, ctx, candidatos, log)
         candidatos = _filtrar_por_cuota(args, cuota, candidatos, log)
         if solo is not None:
             log.write("corrida", "corrida",
@@ -1232,7 +1569,7 @@ def run_main(args, contexts, solo=None):
     return 0
 
 
-def _una_pasada(args, ctx, log):
+def _una_pasada(args, ctx, log, aprobado=None):
     """Una pasada sobre un contexto (el cuerpo de `run`, en un contexto):
     recalcula la frontera desde el log y GitHub, parkea los que agotaron la
     escalera y despacha los libres. Devuelve la Pasada que el bucle (#88)
@@ -1272,6 +1609,7 @@ def _una_pasada(args, ctx, log):
     # #175: el freno y la hora límite se miran antes de cada job de la
     # pasada, no sólo entre pasadas.
     corrida = _corrida_de(args, ctx, log)
+    _techo_aprobado(aprobado, ctx)
     spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
                         kind=corrida.kind, model=args.model,
                         revisor_pi=corrida.usa_pi(),
@@ -1350,6 +1688,9 @@ def _una_pasada(args, ctx, log):
                             skills=skills_de(i.body), body=i.body,
                             gate_tail=gate_tail, wip=wip,
                             minutos_acumulado=minutos))
+    # #176: cada pasada re-planifica; lo pagado que el plan aprobado no
+    # cubre (un ticket pi que apareció a las 3am) no sale, Claude sí.
+    jobs = _filtrar_por_plan(aprobado, ctx, jobs, log)
     jobs = _filtrar_por_cuota(args, cuota, jobs, log)
     if not jobs:
         extra = " ({} parkeado(s))".format(parkeados) if parkeados else ""
@@ -1461,6 +1802,9 @@ def _tope_gasto(args, ctx, log, eventos):
                                 else None))
         TOPES_GASTO[ctx.name] = tope
     tope.max_usd = _max_usd(args, ctx)
+    if ctx.name in TECHOS_USD:
+        # #176: el tope que aprobó el plan es techo, aunque la config suba.
+        tope.max_usd = min(tope.max_usd, TECHOS_USD[ctx.name])
     tope.estimado = costo_promedio([e for e in eventos
                                     if e.get("contexto") == ctx.name])
     if log is not None:
@@ -1485,16 +1829,10 @@ def _imprimir_resultados(resultados):
                                                     detalle))
 
 
-def _run_loop(args, contexts, log_path):
-    """`harness run --loop` (#88): el modo bucle del CLI, en vez del
-    `scripts/noche.sh` que hace lo mismo sin tests.
-
-    El corte siempre queda en el log de eventos con su motivo. El freno y
-    la hora límite (`--hasta`) se miran entre pasadas y, adentro de la
-    pasada, antes de despachar cada job (#175). Un freno viejo que ya
-    estaba al arrancar no puede salir 0 (#91): se leería como éxito y se
-    comería la noche.
-    """
+def _no_arranca_el_bucle(args, contexts):
+    """Lo que frena `run --loop` antes de arrancar, sin efectos: 2 con el
+    motivo en stderr, o 0. `main` lo mira antes de pedir la aprobación
+    (#176): un freno viejo dice "freno", no "falta aprobar"."""
     if args.freno and Path(args.freno).expanduser().exists():
         sys.stderr.write("harness: freno puesto: {}\n"
                          "rm {} para sacarlo\n".format(
@@ -1510,10 +1848,32 @@ def _run_loop(args, contexts, log_path):
                          .format(hasta.astimezone(usage_mod.TZ)
                                  .strftime("%H:%M")))
         return 2
+    return _sin_herdr()
+
+
+def _sin_herdr():
     if OFFLINE or os.environ.get("HERDR_ENV") != "1":
         sys.stderr.write("harness: run necesita adaptadores y una sesión de "
                          "herdr (sin HARNESS_OFFLINE, con HERDR_ENV=1)\n")
         return 2
+    return 0
+
+
+def _run_loop(args, contexts, log_path, aprobado=None):
+    """`harness run --loop` (#88): el modo bucle del CLI, en vez del
+    `scripts/noche.sh` que hace lo mismo sin tests.
+
+    El corte siempre queda en el log de eventos con su motivo. El freno y
+    la hora límite (`--hasta`) se miran entre pasadas y, adentro de la
+    pasada, antes de despachar cada job (#175). Un freno viejo que ya
+    estaba al arrancar no puede salir 0 (#91): se leería como éxito y se
+    comería la noche.
+    """
+    rc = _no_arranca_el_bucle(args, contexts)
+    if rc:
+        return rc
+    hasta = (_hasta_de(args, contexts[0], INICIO_CORRIDA, noche=True)
+             if contexts else None)
     # La selección de contexto (nombre, --all) es del arranque; la config
     # SÍ se relee en cada pasada (#163, regla 5 de la auditoría #152): una
     # corrida que dura la noche no corre con la foto que tomó al arrancar.
@@ -1553,7 +1913,7 @@ def _run_loop(args, contexts, log_path):
                       "max_pasadas {}".format(piso_b, max_pasadas_b))
         trabajo, partes, corte = False, [], ""
         for ctx in contextos:
-            p = _una_pasada(args, ctx, log)
+            p = _una_pasada(args, ctx, log, aprobado=aprobado)
             trabajo = trabajo or p.trabajo
             partes.append(p.detalle)
             if p.corte and not corte:
