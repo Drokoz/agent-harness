@@ -804,11 +804,12 @@ class TestCicloDeVida(unittest.TestCase):
 
     def test_fallback_sin_peldano_no_finge_numero(self):
         """kind/modelo vacíos = el fallback de la corrida, no un peldaño de
-        la escalera: la etiqueta se escribe sin número."""
+        la escalera: la etiqueta se escribe sin número. El fallback de la
+        corrida es Claude por defecto (#174)."""
         m = Mundo()
         res, lineas = despachar(m, [job()])
         self.assertEqual([l["cuerpo"] for l in lineas if l["tipo"] == "peldano"],
-                         ["pi"])
+                         ["claude"])
 
     def test_aplazo_del_router_no_anota_peldano_despachado(self):
         """Un job que el router aplazó no se despachó: en el log queda el
@@ -1018,7 +1019,8 @@ class TestRevisorEnElDispatcher(unittest.TestCase):
         m = Mundo().responder(lambda a: a[0] == "gh" and "diff" in a,
                               (True, DIFF_FAKE))
         m.responder(lambda a: a[0] == "pi", (True, "[]"))
-        res, lineas = despachar(m, [job()])
+        # #174: el revisor pi sólo en una corrida que permite pi.
+        res, lineas = despachar(m, [job()], revisor_pi=True)
         self.assertEqual(res[0].estado, "hecho", res[0].motivo)
         pi = [c for c in m.llamadas if c[0][0] == "pi"]
         self.assertEqual(len(pi), 1)
@@ -2568,7 +2570,8 @@ class TestTopeDeGasto(unittest.TestCase):
         job sea de Claude. Con tope 0 no corre, y queda dicho."""
         m = Mundo(prs=[{"number": 32, "headRefName": "ticket/8"}])
         res, lineas = self._despachar(m, [job_de_peldano(2, issue=8)],
-                                      dispatch.TopeGasto(0.0))
+                                      dispatch.TopeGasto(0.0),
+                                      revisor_pi=True)
         self.assertEqual(res[0].estado, "hecho", res[0].motivo)
         self.assertEqual([c for c in m.llamadas if c[0][0] == "pi"], [])
         reviews = [l["cuerpo"] for l in lineas if l["tipo"] == "review"]
@@ -2586,7 +2589,7 @@ class TestTopeDeGasto(unittest.TestCase):
                        {"number": 32, "headRefName": "ticket/8"}])
         res, lineas = self._despachar(m, [job_de_peldano(2, issue=7),
                                           job_de_peldano(2, issue=8)],
-                                      tope, max_parallel=1)
+                                      tope, max_parallel=1, revisor_pi=True)
         self.assertEqual([j.estado for j in res], ["hecho", "hecho"])
         reviews = [l["cuerpo"] for l in lineas if l["tipo"] == "review"]
         self.assertEqual(len(reviews), 2, lineas)

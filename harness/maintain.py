@@ -188,6 +188,7 @@ class MantenJob:
     kind: str = ""
     model: str = ""
     extra_args: Tuple[str, ...] = ()
+    motivo_peldano: str = ""   # por qué este peldaño (#174)
     # Sesión mínima (#42): el mantenedor no declara skills en un ticket;
     # la base del implementador cubre su trabajo.
     skills: Tuple[str, ...] = SKILLS_IMPLEMENTADOR

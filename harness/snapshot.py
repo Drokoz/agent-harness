@@ -157,6 +157,8 @@ class Issue:
     # mergeado | parkeado. Sólo lo llevan los de la frontera; bloqueados y
     # triage lo dejan en None.
     estado: Optional[str] = None
+    # Las etiquetas del issue (#174): el dispatcher mira `runner:cheap`.
+    labels: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -327,7 +329,7 @@ def _issues(raw, prs, prs_merged, eventos, agentes, repo):
     for i in raw:
         labels = {l["name"] for l in i.get("labels", [])}
         issue = Issue(number=i["number"], title=i.get("title", ""),
-                      body=i.get("body") or "")
+                      body=i.get("body") or "", labels=sorted(labels))
         if TRIAGE_LABEL in labels:
             triage.append(issue)
         if AGENT_LABEL not in labels:

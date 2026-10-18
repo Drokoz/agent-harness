@@ -260,6 +260,9 @@ class Revisor:
     """
 
     TOOLS_LECTURA = "read,grep,find,ls"
+    # En Claude (#174, corrida sin pi): las tools de lectura del set
+    # built-in, modo plan (no edita) y sin servidores MCP.
+    TOOLS_LECTURA_CLAUDE = "Read,Grep,Glob"
 
     def __init__(self, run_cmd, kind="pi", model="qwen/qwen3.8-27b",
                  extra_args=(), timeout=600, diff_max=100_000):
@@ -276,6 +279,9 @@ class Revisor:
         cmd = [self.kind]
         if self.kind == "pi":
             cmd += ["--tools", self.TOOLS_LECTURA]
+        elif self.kind == "claude":
+            cmd += ["--tools", self.TOOLS_LECTURA_CLAUDE,
+                    "--permission-mode", "plan", "--strict-mcp-config"]
         if self.model:
             cmd += ["--model", self.model]
         cmd += list(self.extra_args)

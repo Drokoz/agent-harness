@@ -57,14 +57,52 @@ una config de arranque inventada por el código (`DEFAULT_CONFIG` en
 | `quota.umbral_sesion`, `quota.reserva_diaria`, `quota.costo_ticket`, `quota.hora_limite`, `quota.statusline_max_edad_min` | opcionales: la política de `harness run` sobre la cuota real (`harness usage`). Defaults 0.90, 0.08, 0.02, `"07:00"` y 10 min; qué hace cada uno en `docs/harness/quota.md` |
 | `topes.budget_minutos` | opcional: el presupuesto de reloj por ticket de `harness run` — minutos de agente acumulados en el historial de la noche. Default 180 (documentado en `RunTopes` en `harness/config.py`). Un ticket que llegó hasta acá se parkea con su motivo (#116) |
 | `topes.max_usd` | opcional: el tope de gasto de la corrida en US$ (#165) — un techo, no un piso. Default **0**: sin un monto explícito, la corrida no despacha ningún job que cueste plata (pi/OpenRouter); los peldaños de Claude (suscripción) no lo tocan. Lo gastado se mide desde que arrancó el proceso (delta de créditos usados de OpenRouter y costo de los jobs cerrados) y se consulta antes de despachar cada job pagado: no sale si gastado + costo medio (US$1.00 sin historial) supera el tope. El revisor de PRs (pi) también pasa por el tope. `--max-usd` puede bajarlo, nunca subirlo. El piso sigue cortando el bucle, pero nunca deja gastar más que esto |
+| `escalera` | opcional: con qué runner arranca `harness run`/`maintain` en este contexto si la CLI no dice `--kind` (#174). `"claude"` (el default sin declarar): la escalera de la corrida es solo Claude, sonnet → opus, y ningún job va a pi. `"pi"`: la escalera completa, pi → pi high → sonnet → opus (gasta OpenRouter). `--kind` gana sobre la config |
+| `repos.runner_min` | opcional: el runner mínimo por repo (#177). La clave es el **nombre de la carpeta del repo** (el último tramo de la ruta, el mismo nombre que muestra `harness status`), no la ruta: un repo que sale de `"F7League/*"` como `F7League/app-movil` se declara `"app-movil"`. Ejemplo: `{"F7League": "claude", "app-movil": "claude"}`. Un repo con `"claude"` nunca recibe un peldaño pi, ni con la etiqueta `runner:cheap` ni en una corrida `--kind pi`. `"pi"` es lo mismo que no declararlo |
 | `topes.piso`, `topes.max_pasadas` | opcionales: los topes del bucle de `harness run --loop` — piso de crédito restante en US$ (default 3.00) y tope duro de pasadas con trabajo (default 12). La CLI (`--piso`, `--max-pasadas`) puede acotarla más, pero no amplificarla por encima de la config (#166) |
 
-`vault`, `quota` y `topes` son opcionales; todo lo demás es obligatorio. Los topes se
+`vault`, `quota`, `topes`, `escalera` y `repos.runner_min` son opcionales; todo lo demás es obligatorio. Los topes se
 releen de la config en cada corrida/pasada: una corrida que dura la noche no corre con
 la foto que tomó al arranque, y si la config deja de poder leerse la corrida se detiene
 con el motivo (#163/#164/#166). Un campo de más o un valor que no
 existe son error: el harness sale con código 2 y una línea que dice qué contexto y
 qué campo hay que arreglar.
+
+## Con qué runner corre la noche
+
+La corrida dice con qué runner arranca, y eso manda sobre la escalera de reintentos
+(#174). La noche del 2026-10-18 `harness run --loop --kind claude` despachó los 49 jobs
+a pi/Qwen (US$17 de OpenRouter) porque el peldaño 1 de la escalera ganaba siempre.
+Ahora cada job pasa por `elegir_peldano` (`harness/dispatch.py`), en este orden:
+
+1. `repos.runner_min` del repo es `claude` → escalera solo Claude, pase lo que pase.
+2. La corrida es `pi` (`--kind pi` o `"escalera": "pi"`) → la escalera completa.
+3. La corrida es `claude`, el ticket trae `runner:cheap` **y** la corrida tiene
+   `--permitir-pi` → la escalera completa.
+4. Si no → escalera solo Claude (sonnet → opus). Una etiqueta `runner:cheap` sin
+   `--permitir-pi` se ignora, y se dice.
+
+En la escalera solo Claude los abandonos de pi de corridas viejas no gastan peldaño: un
+ticket que Qwen tumbó dos veces arranca en sonnet, no parkeado. La línea `corrida` del log
+anota el runner de la corrida y de dónde salió (`--kind`, `config escalera`, `por
+defecto`), y la línea `peldano` de cada job dice el peldaño y por qué.
+
+Lo que no es un peldaño de ticket sigue la misma regla: en una corrida sin pi (ni
+`--kind pi` ni `--permitir-pi`), el revisor de PRs corre en Claude sonnet con sólo tools
+de lectura (`--tools Read,Grep,Glob --permission-mode plan`), y el generador y el juez de
+`proponer` (también el del `--loop` con la frontera vacía) corren en Claude; `--juez-qwen`
+se ignora y se anota.
+
+El repo que se sabe que Qwen no cierra (F7League: 12 tickets, 0 PRs, US$9,40 la noche
+del 2026-10-18) se declara en la config del servidor. Las claves de `runner_min` son
+nombres de carpeta, no rutas: si F7League es un repo y además contiene subrepos
+(`"F7League/*"`), cada uno se declara por su nombre (`F7League/app-movil` → `app-movil`):
+
+```json
+"repos": {"root": "~/Documents/Github",
+          "paths": ["agent-harness", "F7League", "F7League/*"],
+          "runner_min": {"F7League": "claude", "app-movil": "claude"}}
+```
 
 ## La vault y las decisiones
 

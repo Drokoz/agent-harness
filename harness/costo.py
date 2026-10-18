@@ -29,6 +29,7 @@ Puro: sesiones y eventos entran como las listas de dicts que dan
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 from typing import Dict, List
 
@@ -97,6 +98,29 @@ def _sesiones_del_paso(p, ses, pos, usadas) -> List[dict]:
     return match
 
 
+# La línea `peldano` del dispatcher (#81, #174): "peldaño N · <runner ...>"
+# y, desde #174, " · por qué: ..." al final.
+PELDANO_RE = re.compile(r"^peldaño (\d+) · (.*?)(?: · por qué: .*)?$")
+
+
+def _peldano_usado(paso, escalados):
+    """(número, etiqueta) del peldaño que de verdad corrió este intento
+    (#174): el de su línea `peldano`; sin ella (log viejo), el que tocaba
+    en la escalera completa, salvo que el agente haya corrido en otro
+    runner — ahí no se le inventa un peldaño que no fue."""
+    if paso.peldano:
+        m = PELDANO_RE.match(paso.peldano)
+        if m:
+            return int(m.group(1)), "peldaño {} · {}".format(m.group(1),
+                                                             m.group(2))
+    peldano = peldano_de(escalados)
+    if peldano is None or (paso.runner and paso.runner != peldano["kind"]):
+        return None, paso.runner
+    return (ESCALERA.index(peldano) + 1,
+            peldano_etiqueta(peldano["kind"], peldano.get("model", ""),
+                             peldano.get("extra_args", ())))
+
+
 def ticket_de(sesiones, eventos, repo, issue) -> dict:
     """El historial de un ticket, con el costo real pegado a cada intento.
 
@@ -114,7 +138,7 @@ def ticket_de(sesiones, eventos, repo, issue) -> dict:
     usadas: set = set()
     intentos = []
     for pos, p in enumerate(pasos):
-        peldano = peldano_de(escalados)
+        numero, etiqueta = _peldano_usado(p, escalados)
         match = _sesiones_del_paso(p, ses, pos, usadas)
         for s in match:
             usadas.add(id(s))
@@ -136,11 +160,8 @@ def ticket_de(sesiones, eventos, repo, issue) -> dict:
             "attempt": p.attempt,
             "run_id": p.run_id,
             "runner": p.runner,
-            "peldano": (ESCALERA.index(peldano) + 1) if peldano else None,
-            "peldano_etiqueta": (
-                peldano_etiqueta(peldano["kind"], peldano.get("model", ""),
-                                 peldano.get("extra_args", ()))
-                if peldano else None),
+            "peldano": numero,
+            "peldano_etiqueta": etiqueta,
             "costo": sum(costos) if costos else None,
             "tokens": tokens,
             "resultado": resultado,

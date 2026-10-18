@@ -64,8 +64,9 @@
 
     harness run                     lanza la frontera del contexto por defecto;
                                     cada ticket corre en el peldaño de la escalera
-                                    de reintentos que le toca (#38): --kind/--model
-                                    son sólo el fallback de un ticket sin peldaño
+                                    de reintentos que le toca (#38), dentro de la
+                                    escalera de la corrida (#174): por defecto
+                                    solo Claude (sonnet → opus), ningún job a pi
     harness run --max 2             tope de tickets en paralelo (24 GB: dos)
     harness run --max-tickets 4     tope de tickets en la tanda, sin tocar
                                     etiquetas (#68); el presupuesto ya da el
@@ -75,7 +76,16 @@
     harness run --margen 0.10       colchón en USD: no se arranca un ticket si
                                     lo que queda no cubre el costo medio más
                                     el margen (#68)
-    harness run --kind pi           fallback: pi | claude | codex | ...
+    harness run --kind claude       la corrida arranca en Claude (el default, o
+                                    `escalera` del contexto): escalera solo
+                                    Claude; la línea `peldano` dice por qué
+    harness run --kind pi           la escalera completa: pi → pi high → sonnet
+                                    → opus (gasta OpenRouter)
+    harness run --permitir-pi       en una corrida claude, los tickets con la
+                                    etiqueta runner:cheap sí arrancan en pi;
+                                    sin el flag la etiqueta se ignora. Un repo
+                                    con `repos.runner_min` claude nunca va a pi
+                                    (#177, docs/harness/config.md)
     harness run --model xai/grok    fallback: modelo nativo del agente (opcional)
     harness run --log PATH          dónde va el log JSONL de eventos
     harness run -q                  sin la salida en vivo de eventos (#81):
@@ -201,11 +211,13 @@ from harness import costo_pi  # noqa: E402
 from harness import doctor as doctor_mod  # noqa: E402
 from harness import routing as routing_mod  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
-from harness.dispatch import (BucleSpec, DispatchSpec, Dispatcher, EventLog,  # noqa: E402
-                              Job, Pasada, TopeGasto, bucle, cosechar,
-                              decidir_tanda,
-                              motivo_presupuesto_reloj, peldano_de,
-                              skills_de, transcripcion_path)
+from harness.dispatch import (BucleSpec, Corrida, DispatchSpec,  # noqa: E402
+                              Dispatcher, EventLog, Job, Pasada,
+                              ESCALERA_CLAUDE, RUNNER_POR_DEFECTO,
+                              RUNNERS_CORRIDA, TopeGasto,
+                              bucle, cosechar, decidir_tanda, elegir_peldano,
+                              motivo_presupuesto_reloj, skills_de,
+                              transcripcion_path)
 from harness.dispatch import resolver_hasta  # noqa: E402
 from harness.ideas import (IDEAS_CLAUDE, IDEAS_OPUS, Ideas,  # noqa: E402
                            MAX_IDEAS_DEFAULT, debe_correr,
@@ -227,7 +239,6 @@ from harness import usage as usage_mod  # noqa: E402
 from harness.usage import (Cuota, EstadoCuota, UsageIlegible,  # noqa: E402
                            aplicar_cuota)
 from harness.state import (ceremonia, costo_promedio, de_ticket, intentos, intentos_pr,  # noqa: E402
-                           intentos_pr_que_escalan, intentos_que_escalan,
                            minutos_de_ticket, motivos_de_abandono,
                            motivos_de_abandono_pr, pasos, ultimo_gate_rojo,
                            ultimo_wip)
@@ -329,9 +340,16 @@ def build_parser():
                    help="run: colchón en USD: no se arranca un ticket si lo que "
                         "queda no cubre el costo medio más este margen "
                         "(por defecto 0.10; #68)")
-    p.add_argument("--kind", default="pi",
-                   help="run: fallback de kind de agente (por defecto pi); la "
-                        "escalera de reintentos (#38) lo fija por ticket")
+    p.add_argument("--kind", default=None, choices=RUNNERS_CORRIDA,
+                   help="run/maintain: con qué runner arranca la corrida "
+                        "(#174). claude (por defecto, o `escalera` del "
+                        "contexto): escalera solo Claude, sonnet → opus, "
+                        "ningún job va a pi. pi: la escalera completa "
+                        "(pi → pi high → sonnet → opus)")
+    p.add_argument("--permitir-pi", action="store_true", dest="permitir_pi",
+                   help="run/maintain: en una corrida claude, los tickets con "
+                        "la etiqueta runner:cheap sí usan la escalera completa "
+                        "(pi primero). Sin esto, la etiqueta se ignora (#174)")
     p.add_argument("--model", default="",
                    help="run: fallback de modelo nativo (opcional); ídem --kind")
     p.add_argument("--log", default="",
@@ -907,13 +925,44 @@ def _creditos_restantes():
         return None
 
 
+def _corrida_de(args, ctx, log=None):
+    """Con qué runner arranca la corrida y qué le deja a pi (#174): el
+    `--kind` de la CLI manda; sin él, `escalera` del contexto; sin nada,
+    Claude. `--permitir-pi` y `repos.runner_min` (#177) viajan acá para
+    que `elegir_peldano` decida cada job. Con `log`, se anota."""
+    kind = getattr(args, "kind", None)
+    if kind:
+        fuente = "--kind"
+    elif ctx.escalera:
+        kind, fuente = ctx.escalera, "config escalera"
+    else:
+        kind, fuente = RUNNER_POR_DEFECTO, "por defecto"
+    corrida = Corrida(kind=kind, fuente=fuente,
+                      permitir_pi=bool(getattr(args, "permitir_pi", False)),
+                      runner_min=dict(ctx.repos.runner_min))
+    if log is not None:
+        partes = ["runner de la corrida: {} ({})".format(kind, fuente),
+                  "escalera completa" if kind == "pi"
+                  else "escalera solo Claude",
+                  "runner:cheap {}".format("permitido (--permitir-pi)"
+                                           if corrida.permitir_pi
+                                           else "ignorado (sin --permitir-pi)")]
+        if corrida.runner_min:
+            partes.append("runner_min: " + ", ".join(
+                "{}={}".format(r, m)
+                for r, m in sorted(corrida.runner_min.items())))
+        log.write("corrida", "corrida", " · ".join(partes))
+    return corrida
+
+
 def _jobs_mantenimiento(crudo, eventos_previos, spec, log, credits,
-                        costo_real, salida_real):
+                        costo_real, salida_real, corrida):
     """Los PRs abiertos del contexto que no son mergeables, en el peldaño
-    de la escalera que le toca a cada uno (#56): `runner:cheap` con
-    escalada, igual que los tickets, leyendo el historial del log. Un
-    repo sin gate no se mantiene: sin gate no hay forma de verificar la
-    rama resuelta. Devuelve (mantenedor, jobs, parkeados)."""
+    que les toca por `elegir_peldano` (#56, #174): la escalera de la
+    corrida, leyendo el historial del log. Un PR no trae etiquetas de
+    ticket: en una corrida claude va por la escalera Claude. Un repo sin
+    gate no se mantiene: sin gate no hay forma de verificar la rama
+    resuelta. Devuelve (mantenedor, jobs, parkeados)."""
     main_t = Mantener(spec, log, run_cmd=adapters.run, credits=credits,
                       costo_real=costo_real, salida_real=salida_real)
     jobs, parkeados = [], 0
@@ -927,8 +976,8 @@ def _jobs_mantenimiento(crudo, eventos_previos, spec, log, credits,
                 continue
             if mergeable_de(r["slug"], numero, adapters.run) != CONFLICTING:
                 continue
-            escalados = intentos_pr_que_escalan(eventos_previos, r["name"], numero)
-            peldano = peldano_de(escalados)
+            peldano, motivo_peldano = elegir_peldano(
+                eventos_previos, corrida, r["name"], numero, pr=True)
             job = MantenJob(repo=r["name"], repo_path=r.get("path", ""),
                             slug=r["slug"], pr=numero, branch=branch,
                             base=r.get("default_branch") or "main",
@@ -945,6 +994,7 @@ def _jobs_mantenimiento(crudo, eventos_previos, spec, log, credits,
             job.kind = peldano["kind"]
             job.model = peldano["model"]
             job.extra_args = tuple(peldano["extra_args"])
+            job.motivo_peldano = motivo_peldano
             jobs.append(job)
     return main_t, jobs, parkeados
 
@@ -1025,8 +1075,10 @@ def run_main(args, contexts, solo=None):
         # tanda con Claude y antes de cada ticket de Claude (la costura
         # `permitir_claude`), no para los de Qwen, que no la gastan.
         cuota = _cuota_de(args, ctx, log)
+        corrida = _corrida_de(args, ctx, log)
         spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
-                            kind=args.kind, model=args.model,
+                            kind=corrida.kind, model=args.model,
+                            revisor_pi=corrida.usa_pi(),
                             permitir_claude=cuota.permitir_claude,
                             budget_minutos=ctx.topes.budget_minutos,
                             hasta=_hasta_de(args, ctx, INICIO_CORRIDA),
@@ -1044,7 +1096,7 @@ def run_main(args, contexts, solo=None):
             crudo, eventos_previos, spec, log,
             credits=_creditos_usado
             if ctx.budget.provider == "openrouter" else None,
-            costo_real=costo_de_pi, salida_real=salida_de_pi)
+            costo_real=costo_de_pi, salida_real=salida_de_pi, corrida=corrida)
         if mant_jobs:
             _imprimir_mantenimiento(main_t.dispatch(mant_jobs))
         if mant_parkeados:
@@ -1067,8 +1119,9 @@ def run_main(args, contexts, solo=None):
                 # El peldaño se deriva del historial del log, no de un
                 # estado en memoria (#38): sobrevive reiniciar el
                 # dispatcher porque se recalcula acá, de `eventos_previos`.
-                escalados = intentos_que_escalan(eventos_previos, r.name, i.number)
-                peldano = peldano_de(escalados)
+                peldano, motivo_peldano = elegir_peldano(
+                    eventos_previos, corrida, r.name, i.number,
+                    etiquetas=i.labels)
                 attempt = intentos(eventos_previos, r.name, i.number) + 1
                 if peldano is None:
                     # Escalera agotada: se parkea acá mismo, sin worktree
@@ -1102,6 +1155,7 @@ def run_main(args, contexts, solo=None):
                                       issue=i.number, attempt=attempt,
                                       kind=peldano["kind"], model=peldano["model"],
                                       extra_args=tuple(peldano["extra_args"]),
+                                      motivo_peldano=motivo_peldano,
                                       # #42: las skills del ticket salen de
                                       # su body, no de la corrida. #142: el
                                       # body también lleva `## Parent`, la
@@ -1217,8 +1271,10 @@ def _una_pasada(args, ctx, log):
     cuota = _cuota_de(args, ctx, log)
     # #175: el freno y la hora límite se miran antes de cada job de la
     # pasada, no sólo entre pasadas.
+    corrida = _corrida_de(args, ctx, log)
     spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
-                        kind=args.kind, model=args.model,
+                        kind=corrida.kind, model=args.model,
+                        revisor_pi=corrida.usa_pi(),
                         permitir_claude=cuota.permitir_claude,
                         budget_minutos=ctx.topes.budget_minutos,
                         freno=getattr(args, "freno", "") or None,
@@ -1246,8 +1302,9 @@ def _una_pasada(args, ctx, log):
             # El peldaño se deriva del historial del log, no de un
             # estado en memoria (#38): sobrevive reiniciar el
             # dispatcher porque se recalcula acá, de `eventos_previos`.
-            escalados = intentos_que_escalan(eventos_previos, r.name, i.number)
-            peldano = peldano_de(escalados)
+            peldano, motivo_peldano = elegir_peldano(
+                eventos_previos, corrida, r.name, i.number,
+                etiquetas=i.labels)
             attempt = intentos(eventos_previos, r.name, i.number) + 1
             if peldano is None:
                 # Escalera agotada: se parkea acá mismo, sin worktree
@@ -1287,6 +1344,7 @@ def _una_pasada(args, ctx, log):
                             issue=i.number, attempt=attempt,
                             kind=peldano["kind"], model=peldano["model"],
                             extra_args=tuple(peldano["extra_args"]),
+                            motivo_peldano=motivo_peldano,
                             # #42: las skills del ticket salen de su body.
                             # #142: el body también lleva `## Parent`.
                             skills=skills_de(i.body), body=i.body,
@@ -1643,14 +1701,19 @@ def _proponer_ctx(args, ctx, log, en_bucle=False):
         return 'contexto "{}": autonomía manual, no propone nada'.format(
             ctx.name)
     crudo = collect([ctx])
+    corrida = _corrida_de(args, ctx)
     partes = []
     for r in crudo["contexts"][0]["repos"]:
         if not r.get("slug") or not r.get("exists", {}).get("gate"):
             continue
         # #175: desde el bucle, el freno y la hora límite de la noche valen
         # también para el generador y el juez (y el corte a hasta + 30).
-        spec = DispatchSpec(contexto=ctx.name, kind=GENERADOR["kind"],
-                            model=GENERADOR["model"],
+        # #174: en una corrida sin pi (o en un repo con runner_min
+        # claude), generador y juez corren en Claude; nunca en Qwen.
+        pi_ok = corrida.usa_pi(r["name"])
+        generador = GENERADOR if pi_ok else ESCALERA_CLAUDE[0]
+        spec = DispatchSpec(contexto=ctx.name, kind=generador["kind"],
+                            model=generador["model"],
                             freno=(getattr(args, "freno", "") or None)
                             if en_bucle else None,
                             hasta=_hasta_de(args, ctx, INICIO_CORRIDA,
@@ -1660,9 +1723,17 @@ def _proponer_ctx(args, ctx, log, en_bucle=False):
                                 leer_eventos(log.path) if log is not None
                                 else []))
         prop = Proponer(spec, log, run_cmd=adapters.run)
-        peldano_juez = _peldano_juez_para(args, ctx, log, r["name"])
+        if pi_ok:
+            peldano_juez = _peldano_juez_para(args, ctx, log, r["name"])
+        else:
+            peldano_juez = _anotar_juez(
+                log, r["name"], JUEZ_CLAUDE,
+                "corrida {} ({}) sin pi: juez Claude, nunca Qwen{}".format(
+                    corrida.kind, corrida.fuente,
+                    " (--juez-qwen ignorado)" if args.juez_qwen else ""))
         res = prop.proponer_repo(r["name"], r["slug"], r.get("path", ""),
-                                 args.max_propuestas, peldano_juez)
+                                 args.max_propuestas, peldano_juez,
+                                 generador=generador)
         for d in res["detalle"]:
             sys.stdout.write("  {} {}\n".format(r["name"], d))
         partes.append("{}: {} abierta(s), {} promovida(s), {} rechazada(s), "
@@ -1789,8 +1860,10 @@ def maintain_main(args, contexts):
         log = EventLog(log_path, ctx.name)
         crudo = collect([ctx])
         crudo["eventos"] = eventos_previos
+        corrida = _corrida_de(args, ctx, log)
         spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
-                            kind=args.kind, model=args.model,
+                            kind=corrida.kind, model=args.model,
+                            revisor_pi=corrida.usa_pi(),
                             tope_gasto=_tope_gasto(args, ctx, log,
                                                    eventos_previos))
         costo_de_pi, salida_de_pi = _sesiones_de_pi()
@@ -1798,7 +1871,7 @@ def maintain_main(args, contexts):
             crudo, eventos_previos, spec, log,
             credits=_creditos_usado
             if ctx.budget.provider == "openrouter" else None,
-            costo_real=costo_de_pi, salida_real=salida_de_pi)
+            costo_real=costo_de_pi, salida_real=salida_de_pi, corrida=corrida)
         if not jobs and not parkeados:
             sys.stdout.write('harness: "{}": nada que mantener (todos los '
                              'PRs abiertos son mergeables)\n'.format(ctx.name))

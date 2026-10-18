@@ -33,7 +33,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 CONFIG_ENV = "HARNESS_CONFIG_DIR"
 CONFIG_NAME = "config.json"
@@ -43,9 +43,13 @@ AUTONOMIES = ("frontier", "manual")
 POLARITIES = ("remaining", "spent")
 PROVIDERS = ("openrouter", "manual", "none")
 RUNNERS = ("local", "ssh")
+# Los runners de agente con que arranca una corrida de `harness run` (#174):
+# `escalera` del contexto y `repos.runner_min` (#177). El mismo par que
+# `harness.dispatch.RUNNERS_CORRIDA` (acá no se importa dispatch).
+RUNNERS_AGENTE = ("claude", "pi")
 
 CONTEXT_KEYS = ("tracker", "repos", "autonomy", "budget", "vault", "run",
-                "quota", "topes")
+                "quota", "topes", "escalera")
 
 
 class ConfigError(Exception):
@@ -66,6 +70,10 @@ class Tracker:
 class Repos:
     root: str
     paths: List[str] = field(default_factory=list)
+    # El runner mínimo por repo (#177), por nombre de repo (el de la
+    # carpeta): {"F7League": "claude"} = ese repo nunca recibe un peldaño
+    # pi, ni con `runner:cheap` ni en una corrida `--kind pi`.
+    runner_min: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -180,6 +188,9 @@ class Context:
     vault: Optional[str] = None
     quota: QuotaSpec = field(default_factory=QuotaSpec)
     topes: RunTopes = field(default_factory=RunTopes)
+    # Con qué runner arranca `harness run` en este contexto si la CLI no
+    # dice `--kind` (#174): "claude" | "pi"; "" = sin preferencia (Claude).
+    escalera: str = ""
 
 
 @dataclass
@@ -286,13 +297,26 @@ def _tracker(raw, donde):
 def _repos(raw, donde):
     raw = _obj(raw, donde + ' → "repos"')
     donde = donde + ' → "repos"'
-    _keys(raw, ("root", "paths"), donde)
+    _keys(raw, ("root", "paths", "runner_min"), donde)
     paths = raw.get("paths", [])
     if not isinstance(paths, list):
         raise ConfigError('{}: "paths" tiene que ser una lista'.format(donde))
     for p in paths:
         _str(p, "cada path", donde)
-    return Repos(root=_str(raw.get("root", "~"), '"root"', donde), paths=list(paths))
+    runner_min = raw.get("runner_min", {})
+    if not isinstance(runner_min, dict):
+        raise ConfigError('{}: "runner_min" tiene que ser un objeto '
+                          '{{"repo": "claude"}}'.format(donde))
+    for repo, runner in runner_min.items():
+        _str(repo, 'cada repo de "runner_min"', donde)
+        if not isinstance(runner, str):
+            raise ConfigError('{}: "runner_min" de "{}" tiene que ser un '
+                              'texto ({})'.format(donde, repo,
+                                                  ", ".join(RUNNERS_AGENTE)))
+        _choice(runner, RUNNERS_AGENTE, '"runner_min" de "{}"'.format(repo),
+                donde)
+    return Repos(root=_str(raw.get("root", "~"), '"root"', donde), paths=list(paths),
+                 runner_min=dict(runner_min))
 
 
 def _budget(raw, donde):
@@ -441,6 +465,12 @@ def _context(name, raw):
     vault = raw.get("vault")
     if vault is not None:
         _str(vault, '"vault"', donde)
+    escalera = raw.get("escalera", "")
+    if escalera != "":
+        if not isinstance(escalera, str):
+            raise ConfigError('{}: "escalera" tiene que ser un texto ({})'.format(
+                donde, ", ".join(RUNNERS_AGENTE)))
+        _choice(escalera, RUNNERS_AGENTE, '"escalera"', donde)
     return Context(
         name=name,
         tracker=_tracker(_required(raw, "tracker", donde), donde),
@@ -451,6 +481,7 @@ def _context(name, raw):
         vault=vault,
         quota=_quota(raw.get("quota"), donde),
         topes=_topes(raw.get("topes"), donde),
+        escalera=escalera,
     )
 
 
