@@ -32,7 +32,11 @@ from unittest import mock
 
 import support
 
+from harness import costo
 from harness import dispatch as dispatch_mod
+from harness.dispatch import DispatchSpec, Dispatcher
+from harness.proposal import GENERADOR, JUEZ_CLAUDE, JUEZ_QWEN
+from harness.review import Revisor
 from harness.config import ConfigError, parse_config
 from harness.dispatch import (ESCALERA, ESCALERA_CLAUDE, Corrida, EventLog,
                               elegir_peldano, peldano_de)
@@ -269,12 +273,10 @@ class LaLineaPeldanoDiceElPorQue(unittest.TestCase):
                          "peldaño 1 · pi qwen/qwen3.8-27b --thinking medium")
 
 
-class LosTresSitiosDelCli(unittest.TestCase):
-    """`run` (una pasada), `run --loop` (cada pasada) y el mantenedor arman
-    sus jobs con `elegir_peldano`: se corre el CLI real con el mundo de
-    mentira y se miran los jobs que llegan a `Dispatcher.dispatch`."""
+class _CliBase(unittest.TestCase):
+    """El CLI real (`bin/harness`) con el mundo de mentira."""
 
-    def _cfg(self, escalera=None, runner_min=None):
+    def _cfg(self, escalera=None, runner_min=None, topes=None):
         repos = {"root": str(self.d / "repos"), "paths": ["F7League"]}
         if runner_min is not None:
             repos["runner_min"] = runner_min
@@ -284,6 +286,8 @@ class LosTresSitiosDelCli(unittest.TestCase):
                    "run": {"kind": "local"}}
         if escalera is not None:
             context["escalera"] = escalera
+        if topes is not None:
+            context["topes"] = topes
         self.d.joinpath("config.json").write_text(
             json.dumps({"default_context": "h", "contexts": {"h": context}}))
 
@@ -329,11 +333,14 @@ class LosTresSitiosDelCli(unittest.TestCase):
 
     def _correr(self, argv, issues, prs=None, conflicto=False, loop=False):
         """Corre `run` (o una pasada del loop) y devuelve
-        `(jobs despachados, eventos del log)`."""
+        `(jobs despachados, eventos del log)`. Las specs con que se
+        despachó quedan en `self.specs`."""
         despachados = []
+        self.specs = []
 
         def fake_dispatch(disp, jobs):
             despachados.extend(jobs)
+            self.specs.append(disp.spec)
             return jobs
 
         args = self.cli.build_parser().parse_args(
@@ -375,6 +382,12 @@ class LosTresSitiosDelCli(unittest.TestCase):
 
     def _tickets(self, jobs):
         return [j for j in jobs if hasattr(j, "issue") and not hasattr(j, "pr")]
+
+
+class LosTresSitiosDelCli(_CliBase):
+    """`run` (una pasada), `run --loop` (cada pasada) y el mantenedor arman
+    sus jobs con `elegir_peldano`: se corre el CLI real con el mundo de
+    mentira y se miran los jobs que llegan a `Dispatcher.dispatch`."""
 
     def test_noche_2026_10_18_run_kind_claude(self):
         self._cfg()
@@ -456,6 +469,214 @@ class LosTresSitiosDelCli(unittest.TestCase):
         lineas = [e["cuerpo"] for e in eventos if e["tipo"] == "corrida"]
         self.assertTrue(any("runner de la corrida: claude" in l
                             and "--kind" in l for l in lineas), lineas)
+
+
+class ElRevisorDeLaCorrida(unittest.TestCase):
+    """El revisor de PRs (#46) tampoco es pi en una corrida Claude: con
+    `--kind claude` sin `--permitir-pi`, la review corre en Claude, sonnet,
+    sólo con tools de lectura."""
+
+    def test_revisor_claude_lee_solo(self):
+        llamadas = []
+
+        def run_cmd(args, cwd=None, timeout=30):
+            llamadas.append(list(args))
+            if args[:3] == ["gh", "pr", "diff"]:
+                return True, "diff --git a/x b/x"
+            return True, "[]"
+
+        Revisor(run_cmd, kind="claude", model="sonnet").revisar_pr("a/b", 1)
+        (args,) = [a for a in llamadas if a[0] != "gh"]
+        self.assertEqual(args[0], "claude")
+        self.assertEqual(args[args.index("--tools") + 1], "Read,Grep,Glob")
+        self.assertEqual(args[args.index("--permission-mode") + 1], "plan")
+        self.assertIn("--strict-mcp-config", args)
+        self.assertEqual(args[args.index("--model") + 1], "sonnet")
+        for escribe in ("Bash", "Edit", "Write"):
+            self.assertNotIn(escribe, args[args.index("--tools") + 1])
+
+    def test_spec_por_defecto_es_claude_y_revisor_claude(self):
+        spec = DispatchSpec(contexto="t")
+        self.assertEqual(spec.kind, "claude")
+        self.assertFalse(spec.revisor_pi)
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Dispatcher(spec, EventLog(Path(tmp) / "e.jsonl", "t"),
+                           Mundo().cmd)
+            self.assertEqual(d._revisor().kind, "claude")
+            self.assertEqual(d._revisor().model, "sonnet")
+
+    def test_revisor_pi_solo_si_la_corrida_lo_permite(self):
+        spec = DispatchSpec(contexto="t", revisor_pi=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Dispatcher(spec, EventLog(Path(tmp) / "e.jsonl", "t"),
+                           Mundo().cmd)
+            self.assertEqual(d._revisor().kind, "pi")
+
+
+class LaSpecDeLaCorrida(_CliBase):
+    """run, run --loop y maintain arman la spec con el runner de la
+    corrida y `revisor_pi` según la corrida."""
+
+    def test_spec_kind_y_revisor_en_run_y_loop(self):
+        self._cfg()
+        for loop in (False, True):
+            argv = ["--loop"] if loop else []
+            self._correr(argv + ["--kind", "claude"], [self._issue(7)],
+                         loop=loop)
+            self.assertEqual([(s.kind, s.revisor_pi) for s in self.specs],
+                             [("claude", False)], loop)
+            self._correr(argv + ["--kind", "claude", "--permitir-pi"],
+                         [self._issue(7)], loop=loop)
+            self.assertEqual([(s.kind, s.revisor_pi) for s in self.specs],
+                             [("claude", True)], loop)
+            self._correr(argv + ["--kind", "pi"], [self._issue(7)], loop=loop)
+            self.assertEqual([(s.kind, s.revisor_pi) for s in self.specs],
+                             [("pi", True)], loop)
+
+
+class ElProponerDeLaCorrida(_CliBase):
+    """El generador y el juez de `proponer` (#115) siguen la corrida: en
+    una corrida Claude sin `--permitir-pi`, generador Claude (sonnet) y
+    juez Claude, aunque se pida `--juez-qwen`."""
+
+    def _proponer(self, argv, en_bucle=True):
+        visto = []
+
+        def fake(prop, repo, slug, repo_path, maximo, peldano_juez,
+                 generador=GENERADOR):
+            visto.append((prop.spec.kind, generador, peldano_juez))
+            return {"abiertas": 0, "promovidas": 0, "rechazadas": 0,
+                    "descartadas": 0, "detalle": []}
+
+        args = self.cli.build_parser().parse_args(
+            ["proponer", "--context", "h", "--log", str(self.log_path)] + argv)
+        with mock.patch.object(self.cli, "collect",
+                               return_value=self._raw([])), \
+             mock.patch.object(self.cli.Proponer, "proponer_repo",
+                               autospec=True, side_effect=fake), \
+             mock.patch.object(self.cli, "_creditos_usado",
+                               return_value=None), \
+             mock.patch.dict(os.environ, {"HOME": str(self.d),
+                                          "HARNESS_CONFIG_DIR": str(self.d)}), \
+             mock.patch("sys.stdout", new=io.StringIO()):
+            ctx = self.cli.load_config().select("h")[0]
+            self.cli._proponer_ctx(args, ctx, EventLog(self.log_path, "h"),
+                                   en_bucle=en_bucle)
+        return visto
+
+    def test_corrida_claude_generador_y_juez_claude(self):
+        self._cfg()
+        for en_bucle in (True, False):
+            (v,) = self._proponer(["--kind", "claude", "--juez-qwen"],
+                                  en_bucle=en_bucle)
+            self.assertEqual(v[1], ESCALERA_CLAUDE[0])
+            self.assertEqual(v[2], JUEZ_CLAUDE)
+            self.assertEqual(v[0], "claude")
+
+    def test_sin_kind_tambien_claude(self):
+        self._cfg()
+        (v,) = self._proponer(["--juez-qwen"])
+        self.assertEqual((v[1], v[2]), (ESCALERA_CLAUDE[0], JUEZ_CLAUDE))
+
+    def test_corrida_pi_comportamiento_de_siempre(self):
+        self._cfg()
+        (v,) = self._proponer(["--kind", "pi", "--juez-qwen"])
+        self.assertEqual((v[1], v[2]), (GENERADOR, JUEZ_QWEN))
+
+    def test_runner_min_del_repo_fuerza_claude_en_proponer(self):
+        self._cfg(runner_min={"F7League": "claude"})
+        (v,) = self._proponer(["--kind", "pi", "--juez-qwen"])
+        self.assertEqual((v[1], v[2]), (ESCALERA_CLAUDE[0], JUEZ_CLAUDE))
+
+
+class NingunComandoAPi(_CliBase):
+    """Regresión de la noche del 2026-10-18, de punta a punta: una corrida
+    `kind=claude` entera (ticket, PR abierto y su review) más una pasada de
+    proponer del `--loop` con la frontera vacía. Ningún comando registrado
+    en el mundo arranca pi: ni `pi ...` ni `herdr agent start --kind pi`."""
+
+    def _sin_pi(self, mundo):
+        for args, _, _ in mundo.llamadas:
+            self.assertNotEqual(args[0], "pi", args)
+            for i, a in enumerate(args[:-1]):
+                if a == "--kind":
+                    self.assertNotEqual(args[i + 1], "pi", args)
+
+    def test_corrida_claude_entera_sin_pi(self):
+        # Con plata de sobra (#165): que el tope de gasto no tape a pi.
+        self._cfg(topes={"max_usd": 100})
+        mundo = Mundo(prs=[{"number": 31, "headRefName": "ticket/7"}])
+        args = self.cli.build_parser().parse_args(
+            ["run", "--context", "h", "--log", str(self.log_path), "-q",
+             "--kind", "claude", "--sin-proponer"])
+        with mock.patch.object(self.cli, "OFFLINE", False), \
+             mock.patch.object(self.cli, "collect",
+                               return_value=self._raw([self._issue(7)])), \
+             mock.patch.object(self.cli.adapters, "run", mundo.cmd), \
+             mock.patch.object(self.cli, "_cuota_de",
+                               return_value=SimpleNamespace(
+                                   permitir_claude=None)), \
+             mock.patch.object(self.cli, "_filtrar_por_cuota",
+                               side_effect=lambda a, c, cands, l: cands), \
+             mock.patch.object(self.cli, "_creditos_usado",
+                               return_value=None), \
+             mock.patch.object(self.cli, "_sesiones_de_pi",
+                               return_value=(lambda *a: None,
+                                             lambda *a: None)), \
+             mock.patch.dict(os.environ, {"HERDR_ENV": "1",
+                                          "HOME": str(self.d),
+                                          "HARNESS_CONFIG_DIR": str(self.d)}), \
+             mock.patch("time.sleep"), \
+             mock.patch("sys.stdout", new=io.StringIO()):
+            ctxs = self.cli.load_config().select("h")
+            self.assertEqual(self.cli.run_main(args, ctxs), 0)
+            # La pasada del --loop con la frontera vacía: proponer.
+            self.cli._proponer_ctx(args, ctxs[0],
+                                   EventLog(self.log_path, "h"),
+                                   en_bucle=True)
+        eventos = [json.loads(l) for l in
+                   self.log_path.read_text().splitlines() if l]
+        self.assertTrue(any(e["tipo"] == "pr" for e in eventos),
+                        "la corrida abrió el PR")
+        self.assertTrue(any(e["tipo"] == "review" for e in eventos),
+                        "el PR pasó por el revisor")
+        self.assertTrue(mundo.llamo("herdr", "agent", "start"),
+                        "arrancó algún agente")
+        self._sin_pi(mundo)
+        self.assertTrue(any(a[0] == "claude" for a, _, _ in mundo.llamadas),
+                        "el revisor corrió en Claude")
+
+
+class ElCostoDiceElPeldanoUsado(unittest.TestCase):
+    """`harness costo` etiqueta cada intento con el peldaño que de verdad
+    corrió (la línea `peldano`, o el runner del agente), no con el que
+    habría tocado en la escalera completa."""
+
+    def test_peldano_de_la_linea_del_log(self):
+        evs = [ev("peldano", "peldaño 3 · claude sonnet --effort medium · "
+                  "por qué: corrida claude (--kind): escalera solo Claude",
+                  "r1")] + abandono_en("claude", "r1")
+        evs += [ev("peldano", "peldaño 4 · claude opus --effort medium · "
+                   "por qué: corrida claude (--kind): escalera solo Claude",
+                   "r2")] + abandono_en("claude", "r2")
+        t = costo.ticket_de([], evs, "F7League", 7)
+        self.assertEqual([i["peldano"] for i in t["intentos"]], [3, 4])
+        self.assertEqual([i["peldano_etiqueta"] for i in t["intentos"]],
+                         ["peldaño 3 · claude sonnet --effort medium",
+                          "peldaño 4 · claude opus --effort medium"])
+
+    def test_sin_linea_peldano_el_runner_del_agente_manda(self):
+        """Log sin línea `peldano` y agente en claude: no se lo etiqueta
+        como el peldaño 1 de pi."""
+        t = costo.ticket_de([], abandono_en("claude", "r1"), "F7League", 7)
+        (i,) = t["intentos"]
+        self.assertNotEqual(i["peldano"], 1)
+        self.assertNotIn("pi", i["peldano_etiqueta"] or "")
+
+    def test_log_viejo_de_pi_sigue_igual(self):
+        evs = abandono_en("pi", "r1") + abandono_en("pi", "r2")
+        t = costo.ticket_de([], evs, "F7League", 7)
+        self.assertEqual([i["peldano"] for i in t["intentos"]], [1, 2])
 
 
 if __name__ == "__main__":
