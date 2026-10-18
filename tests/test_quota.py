@@ -20,12 +20,15 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import support  # noqa: F401  (pone la raíz en sys.path)
 
-from harness.quota import (PESOS, agregar, as_dict, atribuir, codificar_path,
-                           cuota_por_ventana, decodificar_uso, fuentes_desde_spec,
-                           leer_fuentes, leer_sesiones, parsear_linea, pico_5h,
+from harness.quota import (PESOS, REMOTA_TIMEOUT_S, agregar, as_dict,
+                           atribuir, clave_semana, codificar_path,
+                           cuota_por_ventana, decodificar_uso,
+                           fuentes_desde_spec, leer_fuentes, leer_remota,
+                           leer_sesiones, parsear_linea, pico_5h,
                            ponderar, puntos_de_ticket, render_quota,
                            resumen_evento, semana_de, semana_inicio,
                            semana_reset)
@@ -833,5 +836,390 @@ class TestCliFuentes(unittest.TestCase):
         self.assertEqual([f["ruta"] for f in data["fuentes"]], [str(SESIONES)])
 
 
+class TestRemota(unittest.TestCase):
+    """La fuente remota por SSH (#144): el `run_cmd` se inyecta — sin red
+    en los tests. El JSON que trae es el de `quota_remota.py --json`:
+    tokens PONDERADOS por día, por modelo y por semana."""
+
+    REMOTA_OK = {
+        "por_semana": {"2026-10-16": 3000.0, "2026-10-09": 900.0},
+        "por_dia": {"2026-10-17": 1200.0, "2026-10-16": 1800.0},
+        "por_modelo": {"claude-opus-5": 2000.0, "fable": 1000.0},
+    }
+
+    def _proc(self, data=REMOTA_OK, code=0, stderr=b""):
+        return type("P", (), {"returncode": code,
+                              "stdout": json.dumps(data).encode(),
+                              "stderr": stderr})()
+
+    def _run(self, *procs, code=None):
+        """Un `run_cmd` inyectado que devuelve `procs` en orden (o lanza)."""
+        cola = list(procs)
+
+        def run_cmd(ssh, script, timeout):
+            self.apelaciones.append((ssh, script, timeout))
+            if code is not None:
+                raise code
+            return cola.pop(0)
+        self.apelaciones = []
+        return run_cmd
+
+    def test_lee_el_json_y_trae_los_cortes(self):
+        run_cmd = self._run(self._proc())
+        f = leer_remota("tomasherceg@localhost", run_cmd=run_cmd)
+        self.assertTrue(f["ok"])
+        self.assertIsNone(f["error"])
+        self.assertTrue(f["remota"])
+        self.assertEqual(f["ruta"], "ssh: tomasherceg@localhost")
+        self.assertEqual(f["ponderado"], 3000.0)
+        self.assertEqual(f["por_dia"], self.REMOTA_OK["por_dia"])
+        self.assertEqual(f["por_modelo"], self.REMOTA_OK["por_modelo"])
+        self.assertEqual(f["por_semana"], self.REMOTA_OK["por_semana"])
+        ssh, script, timeout = self.apelaciones[0]
+        self.assertEqual(ssh, "tomasherceg@localhost")
+        self.assertIn("quota_remota", script)  # el script del repo va por stdin
+        self.assertEqual(timeout, REMOTA_TIMEOUT_S)
+
+    def test_timeout_es_illegible_con_la_razon(self):
+        run_cmd = self._run(code=subprocess.TimeoutExpired("ssh", 30))
+        f = leer_remota("h@x", run_cmd=run_cmd, timeout=30)
+        self.assertFalse(f["ok"])
+        self.assertIn("timeout", f["error"])
+        self.assertIn("30 s", f["error"])
+        # Corta, no congele: los cortes quedan vacíos.
+        self.assertEqual(f["ponderado"], 0.0)
+
+    def test_salida_no_cero_es_illegible(self):
+        run_cmd = self._run(self._proc(code=255,
+                                       stderr=b"ssh: connect failed"))
+        f = leer_remota("h@x", run_cmd=run_cmd)
+        self.assertFalse(f["ok"])
+        self.assertIn("255", f["error"])
+        self.assertIn("connect failed", f["error"])
+
+    def test_json_roto_es_illegible(self):
+        class P:
+            returncode, stdout, stderr = 0, b"no es json", b""
+        f = leer_remota("h@x", run_cmd=lambda *a: P())
+        self.assertFalse(f["ok"])
+        self.assertTrue(f["error"])
+
+    def test_json_sin_cortes_es_illegible(self):
+        run_cmd = self._run(self._proc({"por_dia": {}}))
+        f = leer_remota("h@x", run_cmd=run_cmd)
+        self.assertFalse(f["ok"])
+
+    def test_valores_no_numericos_es_illegible(self):
+        run_cmd = self._run(self._proc({
+            "por_semana": {}, "por_dia": {"2026-10-17": "mucho"},
+            "por_modelo": {}}))
+        f = leer_remota("h@x", run_cmd=run_cmd)
+        self.assertFalse(f["ok"])
+
+    def test_offline_no_intenta_red(self):
+        f = leer_remota("h@x", run_cmd=self._run(self._proc()), offline=True)
+        self.assertFalse(f["ok"])
+        self.assertIn("offline", f["error"])
+        self.assertEqual(self.apelaciones, [])  # ni una llamada
+
+    def test_leer_fuentes_suma_locales_y_remotas(self):
+        run_cmd = self._run(self._proc())
+        regs, fuentes = leer_fuentes([SESIONES], remotas=["a@h", "b@h"],
+                                     run_cmd=self._run(self._proc(),
+                                                       self._proc()))
+        self.assertEqual(len(regs), 7)  # los locales se leen igual
+        self.assertEqual([f["ruta"] for f in fuentes],
+                         [str(SESIONES), "ssh: a@h", "ssh: b@h"])
+        self.assertEqual([f["ok"] for f in fuentes], [True, True, True])
+        # Dos remotas, dos llamadas SSH.
+        self.assertEqual([a[0] for a in self.apelaciones], ["a@h", "b@h"])
+
+    def test_remota_fallida_no_rompe_y_marca_piso(self):
+        regs, fuentes = leer_fuentes([SESIONES], remotas=["a@h"],
+                                     run_cmd=self._run(
+                                         self._proc(code=127,
+                                                    stderr=b"ssh: not found")))
+        self.assertEqual(len(regs), 7)
+        self.assertEqual(fuentes[1]["ok"], False)
+        self.assertIn("127", fuentes[1]["error"])
+        agg = agregar(regs, RAIZ, fuentes=fuentes)
+        self.assertFalse(agg["completa"])
+        # El total ponderado es el local: la remota fallida no suma.
+        self.assertEqual(agg["ponderado"], 20350.0)
+
+
+class TestAgregarRemota(unittest.TestCase):
+    """`agregar` con una remota legible (#144): entra en las vistas
+    ponderadas, no en el crudo."""
+
+    REMOTA_OK = {
+        "por_semana": {"2026-08-21": 9520.0},
+        "por_dia": {"2026-08-28": 4760.0, "2026-08-29": 4760.0},
+        "por_modelo": {"claude-opus-5": 9520.0},
+    }
+    FUENTES = [{
+        "ruta": "ssh: tomasherceg@localhost", "remota": True, "ok": True,
+        "error": None, "ponderado": 9520.0, "por_dia": REMOTA_OK["por_dia"],
+        "por_modelo": REMOTA_OK["por_modelo"],
+        "por_semana": REMOTA_OK["por_semana"],
+    }]
+
+    def setUp(self):
+        self.regs = leer_sesiones(SESIONES)
+        self.agg_local = agregar(self.regs, RAIZ)
+        self.agg = agregar(self.regs, RAIZ, fuentes=self.FUENTES)
+
+    def test_el_total_ponderado_soma_la_remota(self):
+        # El crudo no cambia (la remota no trae mensajes).
+        self.assertEqual(self.agg["total"]["total"], 8000)
+        self.assertEqual(self.agg["ponderado"], 20350.0 + 9520.0)
+
+    def test_por_modelo_por_el_modelo_real(self):
+        # El opus local (16,780) + el opus remoto (9,520).
+        self.assertEqual(self.agg["por_modelo"]["claude-opus-5"]["ponderado"],
+                         16780.0 + 9520.0)
+
+    def test_por_dia_en_resto(self):
+        # 08-28: local (harness+resto) + remota en `resto`.
+        d = self.agg["por_dia"]["2026-08-28"]
+        local = self.agg_local["por_dia"]["2026-08-28"]
+        self.assertEqual(d["resto"], local["resto"] + 4760.0)
+        self.assertEqual(d["harness"], local["harness"])
+        # Un día que no tiene local entra solo con la remota.
+        self.assertEqual(self.agg["por_dia"]["2026-08-29"],
+                         {"harness": 0.0, "resto": 4760.0})
+
+    def test_por_semana_bajo_la_clave_remoto(self):
+        wk = self.agg["por_semana_ponderado"]["2026-08-21T17:00:00-04:00"]
+        self.assertEqual(wk["remoto"], 9520.0)
+        # El total de la fila (local + remota) es lo que mide la semana.
+        total = sum(wk.values())
+        self.assertEqual(total,
+                         sum(self.agg_local["por_semana_ponderado"]
+                             ["2026-08-21T17:00:00-04:00"].values()) + 9520.0)
+
+    def test_por_semana_cuota_en_resto(self):
+        wk = self.agg["por_semana_cuota"]["2026-08-21T17:00:00-04:00"]
+        local = self.agg_local["por_semana_cuota"]["2026-08-21T17:00:00-04:00"]
+        self.assertEqual(wk["resto"], local["resto"] + 9520.0)
+        self.assertEqual(wk["harness"], local["harness"])
+        # `semana_de` (la que usa `harness run`) lo ve: la bolsa compartida.
+        h, r = semana_de(self.agg, dt("2026-08-25T10:00:00"))
+        self.assertEqual(r, local["resto"] + 9520.0)
+
+    def test_remota_fallida_no_suma(self):
+        fuentes = [dict(self.FUENTES[0], ok=False, error="timeout SSH a los 30 s")]
+        agg = agregar(self.regs, RAIZ, fuentes=fuentes)
+        self.assertEqual(agg["ponderado"], 20350.0)
+        self.assertFalse(agg["completa"])
+        self.assertEqual(agg["por_dia"], self.agg_local["por_dia"])
+
+    def test_clave_semana_es_el_vieunes_21_utc(self):
+        from datetime import date
+        self.assertEqual(clave_semana(date(2026, 8, 21)),
+                         "2026-08-21T17:00:00-04:00")
+        # En hora de verano (UTC-3) es 18:00 locales, misma semana.
+        self.assertEqual(clave_semana(date(2026, 10, 16)),
+                         "2026-10-16T18:00:00-03:00")
+
+
+class TestRenderRemota(unittest.TestCase):
+    """La tabla con una remota: se muestra como fuente aparte, y si otra
+    falla el total se marca piso (#144 sobre #75)."""
+
+    REMOTA_OK = {
+        "por_semana": {"2026-08-21": 9520.0},
+        "por_dia": {"2026-08-28": 9520.0},
+        "por_modelo": {"claude-opus-5": 9520.0},
+    }
+
+    def _fuentes(self, ok=True):
+        return [
+            {"ruta": str(SESIONES), "ok": True, "error": None},
+            {"ruta": "ssh: tomasherceg@localhost", "remota": True, "ok": ok,
+             "error": None if ok else "timeout SSH a los 30 s",
+             "ponderado": 9520.0 if ok else 0.0,
+             "por_dia": self.REMOTA_OK["por_dia"] if ok else {},
+             "por_modelo": self.REMOTA_OK["por_modelo"] if ok else {},
+             "por_semana": self.REMOTA_OK["por_semana"] if ok else {}},
+        ]
+
+    def setUp(self):
+        self.regs = leer_sesiones(SESIONES)
+
+    def test_remota_lecta_muestra_la_fuente_y_el_total_sumado(self):
+        texto = render_quota(agregar(self.regs, RAIZ,
+                                     fuentes=self._fuentes(ok=True)))
+        self.assertIn("fuentes: 2/2 leídas", texto)
+        self.assertIn("total ponderado 29,870", texto)
+        self.assertNotIn("≥", texto)
+        # La remota se suma a la fila de la semana (9,520 + 9,520).
+        self.assertIn("19,040", texto)
+        self.assertIn("remota", texto)
+        self.assertIn("35 días", texto)
+
+    def test_remota_fallida_marca_piso_y_lo_dice(self):
+        texto = render_quota(agregar(self.regs, RAIZ,
+                                     fuentes=self._fuentes(ok=False)))
+        self.assertIn("fuentes: 1/2 leídas", texto)
+        self.assertIn("falta ssh: tomasherceg@localhost: timeout SSH a los 30 s",
+                      texto)
+        self.assertIn("total ponderado ≥ 20,350", texto)
+        self.assertIn("piso", texto)
+
+    def test_resumen_evento_muestra_la_remota(self):
+        linea = resumen_evento(agregar(self.regs, RAIZ,
+                                       fuentes=self._fuentes(ok=True)))
+        self.assertIn("remota: tomasherceg@localhost 9520 tokens (35 días)",
+                      linea)
+
+    def test_json_lleva_la_remota_en_fuentes(self):
+        data = json.loads(json.dumps(as_dict(
+            agregar(self.regs, RAIZ, fuentes=self._fuentes(ok=True))),
+            sort_keys=True))
+        self.assertTrue(data["completa"])
+        rem = [f for f in data["fuentes"] if f.get("remota")]
+        self.assertEqual(len(rem), 1)
+        self.assertEqual(rem[0]["ponderado"], 9520.0)
+        self.assertEqual(rem[0]["por_dia"], self.REMOTA_OK["por_dia"])
+        self.assertEqual(data["ponderado"], 29870.0)
+
+
+class TestCliRemotas(unittest.TestCase):
+    """El CLI con remotas: la config las declara; offline marca la remota
+    ilegible con la razón y no se cae (sin red en los tests)."""
+
+    def test_config_declara_remotas_offline_marca_piso(self):
+        config = json.loads(CONFIG_QUOTA)
+        config["contexts"]["personal"]["quota"] = {"remotas": [
+            "tomasherceg@localhost"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ)
+            env["HOME"] = tmp
+            env["HARNESS_CONFIG_DIR"] = tmp
+            env["XDG_STATE_HOME"] = tmp
+            env["HARNESS_OFFLINE"] = "1"
+            (Path(tmp) / "config.json").write_text(json.dumps(config))
+            p = subprocess.run([str(HARNESS), "quota",
+                                "--projects", str(SESIONES)], env=env,
+                               capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("fuentes: 1/2 leídas", p.stdout)
+        self.assertIn("falta ssh: tomasherceg@localhost: modo offline (sin red)",
+                      p.stdout)
+        self.assertIn("total ponderado ≥ 20,350", p.stdout)
+
+    def test_remtas_por_coma_gana_sobre_config(self):
+        config = json.loads(CONFIG_QUOTA)
+        config["contexts"]["personal"]["quota"] = {"remotas": [
+            "otro@host"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ)
+            env["HOME"] = tmp
+            env["HARNESS_CONFIG_DIR"] = tmp
+            env["XDG_STATE_HOME"] = tmp
+            env["HARNESS_OFFLINE"] = "1"
+            (Path(tmp) / "config.json").write_text(json.dumps(config))
+            p = subprocess.run([str(HARNESS), "quota",
+                                "--projects", str(SESIONES),
+                                "--remotas", "a@h, b@h"], env=env,
+                               capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("fuentes: 1/3 leídas", p.stdout)
+        self.assertIn("falta ssh: a@h: modo offline (sin red)", p.stdout)
+        self.assertIn("falta ssh: b@h: modo offline (sin red)", p.stdout)
+        self.assertNotIn("otro@host", p.stdout)
+
+    def test_help_documenta_las_remotas(self):
+        p = subprocess.run([str(HARNESS), "--help"], capture_output=True,
+                           text=True, timeout=120)
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("--remotas", p.stdout)
+        self.assertIn("quota.remotas", p.stdout)
+
+
+
+class TestRunSsh(unittest.TestCase):
+    """Sin llave que sirva, ssh no puede caer a pedir password en la tty:
+    la corrida nocturna no tiene a nadie que la escriba y se colgaría
+    hasta el timeout (revisión de #162)."""
+
+    def test_ssh_no_interactivo(self):
+        from unittest import mock
+        from harness import quota
+        with mock.patch.object(quota.subprocess, "run") as run:
+            quota._run_ssh("u@h", "print(1)", 5)
+        args = run.call_args[0][0]
+        self.assertIn("BatchMode=yes", args)
+        self.assertLess(args.index("BatchMode=yes"), args.index("u@h"))
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestScriptRemota(unittest.TestCase):
+    """`scripts/quota_remota.py --json` (el que corre en el host, #144):
+    por día y por modelo en JSON, sin prompts ni rutas."""
+
+    SCRIPT = support.ROOT / "scripts" / "quota_remota.py"
+
+    def _fixture(self, tmp):
+        """Un `~/.claude/projects` con un mensaje de hoy, ponderado 735."""
+        base = Path(tmp)
+        dirp = base / ".claude" / "projects" / "-u-docs-koku"
+        dirp.mkdir(parents=True)
+        ahora = datetime.now(timezone.utc)
+        (dirp / "s.jsonl").write_text(json.dumps({
+            "type": "assistant", "timestamp": ahora.isoformat(),
+            "message": {"model": "claude-opus-5", "usage": {
+                "input_tokens": 100, "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 100, "output_tokens": 100}}})
+            + "\n")
+        return ahora
+
+    def _correr(self, *args, home=None):
+        env = dict(os.environ)
+        if home:
+            env["HOME"] = str(home)
+        p = subprocess.run(["python3", str(self.SCRIPT)] + list(args),
+                           env=env, capture_output=True, text=True,
+                           timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p
+
+    def test_json_sin_sesiones_da_cortes_vacios(self):
+        # HOME a una carpeta vacía: sin sesiones, el JSON tiene las tres
+        # claves vacías (la forma que lee `harness quota` por SSH).
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._correr("--json", home=Path(tmp))
+        data = json.loads(p.stdout)
+        self.assertEqual(set(data), {"por_dia", "por_modelo", "por_semana"})
+        self.assertEqual(data, {"por_dia": {}, "por_modelo": {}, "por_semana": {}})
+
+    def test_json_con_sesiones_pondera(self):
+        # El script lee `~/.claude/projects`: HOME a tmp lo apunta al fixture.
+        with tempfile.TemporaryDirectory() as tmp:
+            ahora = self._fixture(tmp)
+            env = dict(os.environ, HOME=tmp)
+            p = subprocess.run(["python3", str(self.SCRIPT), "--json"],
+                               env=env, capture_output=True, text=True,
+                               timeout=60)
+            self.assertEqual(p.returncode, 0, p.stderr)
+        data = json.loads(p.stdout)
+        dia = ahora.astimezone(ZoneInfo("America/Santiago")).date().isoformat()
+        self.assertEqual(data["por_dia"], {dia: 735.0})
+        self.assertEqual(data["por_modelo"], {"claude-opus-5": 735.0})
+        self.assertTrue(data["por_semana"])
+        # Sin prompts ni rutas en la salida.
+        self.assertNotIn("koku", p.stdout)
+
+    def test_texto_sigue_saliendo_sin_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._fixture(tmp)
+            env = dict(os.environ, HOME=tmp)
+            p = subprocess.run(["python3", str(self.SCRIPT)], env=env,
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("por semana", p.stdout)
+        self.assertIn("por dia", p.stdout)
+        self.assertNotIn("{", p.stdout)

@@ -128,6 +128,56 @@ class TestQuota(unittest.TestCase):
         with self.assertRaises(ConfigError):
             parse_config(conf(personal=ctx(quota={"projects": [1]})))
 
+    def test_remotas_opcional(self):
+        """`quota.remotas` (#144): sin declarar, la cuota no mira otro host."""
+        c = parse_config(conf(personal=ctx())).contexts[0]
+        self.assertIsNone(c.quota.remotas)
+
+    def test_remotas_lista(self):
+        c = parse_config(conf(personal=ctx(quota={"remotas": [
+            "tomasherceg@localhost"]}))).contexts[0]
+        self.assertEqual(c.quota.remotas, ["tomasherceg@localhost"])
+
+    def test_remotas_objeto_ssh(self):
+        """La forma del ticket #144: `{"ssh": "user@host"}`."""
+        c = parse_config(conf(personal=ctx(quota={"remotas": [
+            {"ssh": "tomasherceg@localhost"}]}))).contexts[0]
+        self.assertEqual(c.quota.remotas, ["tomasherceg@localhost"])
+
+    def test_remotas_objeto_sin_ssh(self):
+        with self.assertRaises(ConfigError):
+            parse_config(conf(personal=ctx(quota={"remotas": [
+                {"host": "tomasherceg@localhost"}]})))
+
+    def test_remotas_objeto_sin_arroba(self):
+        with self.assertRaises(ConfigError):
+            parse_config(conf(personal=ctx(quota={"remotas": [
+                {"ssh": "localhost"}]})))
+
+    def test_remotas_y_tope_juntos(self):
+        c = parse_config(conf(personal=ctx(quota={
+            "tope_semanal": 900000000,
+            "remotas": ["tomasherceg@localhost"]}))).contexts[0]
+        self.assertEqual(c.quota.tope_semanal, 900000000.0)
+        self.assertEqual(c.quota.remotas, ["tomasherceg@localhost"])
+
+    def test_remotas_no_lista(self):
+        with self.assertRaises(ConfigError):
+            parse_config(conf(personal=ctx(quota={"remotas": "tomasherceg@localhost"})))
+
+    def test_remotas_vacia(self):
+        with self.assertRaises(ConfigError):
+            parse_config(conf(personal=ctx(quota={"remotas": []})))
+
+    def test_remotas_sin_arroba(self):
+        """Una remota es `user@host`: sin `@` no es un destino SSH."""
+        with self.assertRaises(ConfigError):
+            parse_config(conf(personal=ctx(quota={"remotas": ["localhost"]})))
+
+    def test_remotas_elemento_no_texto(self):
+        with self.assertRaises(ConfigError):
+            parse_config(conf(personal=ctx(quota={"remotas": [1]})))
+
     def test_default_config_es_valida(self):
         c = default_config()
         self.assertIsInstance(c, Config)

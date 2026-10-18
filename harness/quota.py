@@ -27,6 +27,13 @@ los usuarios declarados, y una fuente que no se puede leer se salta y se
 dice cuál y por qué — el total queda marcado como piso (`≥`), no como
 medición. Está documentado en el `--help` del CLI y en `docs/harness/quota.md`.
 
+Además de los directorios locales, una fuente puede ser **remota** por SSH
+(#144): el usuario del 9-5 comparte la misma bolsa semanal de la cuenta.
+`leer_fuentes` la corre con `scripts/quota_remota.py --json` en el host
+remoto (el `run_cmd` es inyectable para los tests: sin red), con un timeout
+corto (30 s por defecto) para que un host colgado no congele el bucle; si
+falla, cuenta como ilegible (#75) y el total queda marcado como piso.
+
 Acá vive la lógica pura (parsear, atribuir, agregar, dibujar). El que toca el
 disco es `leer_sesiones`/`leer_fuentes`; el que escribe el evento lo hace el
 CLI.
@@ -37,8 +44,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from stat import S_ISDIR
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict
 from zoneinfo import ZoneInfo
@@ -74,6 +82,12 @@ PESOS = {"input": 1.0, "cache_creation": 1.25, "cache_read": 0.1, "output": 5.0}
 # Patrón de ticket en el nombre del worktree: `...-ticket-<n>` o `...-t<n>`.
 TICKET_RE = re.compile(r"[-_.]?ticket[-_.]?(\d+)$")
 TICKET_CORTO_RE = re.compile(r"[-_.]t(\d+)$")
+
+# La fuente remota por SSH (#144): el timeout corto es la línea contra un
+# host colgado (un bucle de la noche no puede congelarse en un ssh muerto),
+# y el script vive en el repo, no en el host remoto (autocontenido, stdlib).
+REMOTA_TIMEOUT_S = 30.0
+SCRIPT_REMOTA = Path(__file__).resolve().parent.parent / "scripts" / "quota_remota.py"
 
 
 def vacio():
@@ -187,15 +201,25 @@ def leer_sesiones(projects):
     return out
 
 
-def leer_fuentes(rutas):
-    """`(registros, fuentes)` de una lista de directorios de sesiones (#75).
+def leer_fuentes(rutas, remotas=None, run_cmd=None, timeout=REMOTA_TIMEOUT_S,
+                 script=None, offline=False):
+    """`(registros, fuentes)` de las fuentes declaradas (#75, #144).
 
-    `rutas` es una lista de str/Path (o una sola). `fuentes` trae una entrada
-    por fuente declarada, en orden: `{"ruta", "ok", "error"}`. La fuente que
-    no se puede leer no rompe el comando: se salta y su razón queda en
-    `error` — es lo que hace del total un piso y no una medición. Las rutas
-    repetidas se leen una vez; los registros salen en el orden de las
-    fuentes.
+    `rutas` son los directorios de sesiones locales (una lista de str/Path,
+    o una sola); `remotas` son las fuentes por SSH (`user@host`). `fuentes`
+    trae una entrada por fuente declarada, en orden: `{"ruta", "ok",
+    "error"}` —la remota además `remota: True` y los cortes ponderados
+    (`ponderado`, `por_dia`, `por_modelo`, `por_semana`), porque por SSH no
+    llegan mensajes crudos, sino el resumen de `quota_remota.py --json`.
+    La fuente que no se puede leer no rompe el comando: se salta y su razón
+    queda en `error` — es lo que hace del total un piso y no una medición.
+    Las rutas/ssh repetidas se leen una vez; los registros salen en el
+    orden de las fuentes (los locales; los remotos no traen registros).
+
+    `run_cmd` es inyectable para los tests (sin red): recibe
+    `(ssh, script, timeout)` y devuelve algo con `returncode`/`stdout`/
+    `stderr` (por defecto, `_run_ssh`). `offline` no intenta nada por red:
+    cada remota queda marcada ilegible con la razón.
     """
     rutas = [rutas] if isinstance(rutas, (str, Path)) else list(rutas or [])
     registros, fuentes, vistos = [], [], set()
@@ -211,8 +235,87 @@ def leer_fuentes(rutas):
             continue
         registros.extend(leer_sesiones(p))
         fuentes.append({"ruta": clave, "ok": True, "error": None})
+    for ssh in list(remotas or []):
+        if ssh in vistos:
+            continue
+        vistos.add(ssh)
+        fuentes.append(leer_remota(ssh, run_cmd=run_cmd, timeout=timeout,
+                                   script=script, offline=offline))
     return registros, fuentes
 
+
+def _run_ssh(ssh, script, timeout):
+    """`ssh <ssh> 'python3 - --json'` con el script por stdin: la corrida real
+    de la fuente remota (la que los tests reemplazan con su `run_cmd`).
+    `python3 - --json` corre el script de stdin con `sys.argv = ['-',
+    '--json']` — la variante JSON de `quota_remota.py`. El
+    `ConnectTimeout=10` es la línea de red corta; el timeout del
+    `subprocess` (corto, 30 s por defecto) cubre el host que conecta y se
+    cuelga."""
+    return subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o",
+         "ConnectTimeout=10", ssh, "python3", "-", "--json"],
+        input=script.encode("utf-8"), capture_output=True, timeout=timeout)
+
+
+def leer_remota(ssh, run_cmd=None, timeout=REMOTA_TIMEOUT_S, script=None,
+                offline=False):
+    """Una fuente remota por SSH (#144): una entrada de `fuentes` con
+    `remota: True`.
+
+    Corre `quota_remota.py --json` en el host (autocontenido, stdlib: no
+    necesita el harness instalado allá) y trae los tokens **ponderados** por
+    día, por modelo y por semana —la misma unidad que el total local; por
+    SSH no llegan mensajes crudos. `run_cmd` es inyectable (tests, sin red);
+    `offline` ni lo intenta. Nunca lanza: cualquier falla (timeout, salida
+    no cero, JSON roto) es `ok: False` con la razón legible, que es lo que
+    marca el total como piso (#75).
+    """
+    entrada = {"ruta": "ssh: " + ssh, "remota": True, "ok": False, "error": None,
+               "ponderado": 0.0, "por_dia": {}, "por_modelo": {}, "por_semana": {}}
+    if offline:
+        entrada["error"] = "modo offline (sin red)"
+        return entrada
+    try:
+        texto = (Path(script) if script else SCRIPT_REMOTA).read_text()
+    except OSError as e:
+        entrada["error"] = "no se pudo leer el script ({})".format(e.strerror or e)
+        return entrada
+    run_cmd = run_cmd or _run_ssh
+    try:
+        proc = run_cmd(ssh, texto, timeout)
+    except subprocess.TimeoutExpired:
+        entrada["error"] = "timeout SSH a los {} s".format(
+            int(timeout) if float(timeout).is_integer() else timeout)
+        return entrada
+    except OSError as e:
+        entrada["error"] = "SSH no se pudo correr ({})".format(e.strerror or e)
+        return entrada
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        ultima = stderr.splitlines()[-1] if stderr else "sin detalle"
+        entrada["error"] = "SSH salió con {}: {}".format(proc.returncode, ultima)
+        return entrada
+    try:
+        data = json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        entrada["error"] = "salida no es JSON"
+        return entrada
+    if not isinstance(data, dict) or not all(
+            isinstance(data.get(k), dict) for k in ("por_dia", "por_modelo",
+                                                    "por_semana")):
+        entrada["error"] = "salida sin por_dia/por_modelo/por_semana"
+        return entrada
+    try:
+        por_dia = {str(k): float(v) for k, v in data["por_dia"].items()}
+        por_modelo = {str(k): float(v) for k, v in data["por_modelo"].items()}
+        por_semana = {str(k): float(v) for k, v in data["por_semana"].items()}
+    except (AttributeError, TypeError, ValueError):
+        entrada["error"] = "salida con valores que no son números"
+        return entrada
+    entrada.update(ok=True, ponderado=sum(por_dia.values()), por_dia=por_dia,
+                   por_modelo=por_modelo, por_semana=por_semana)
+    return entrada
 
 # ----------------------------------------------------------------------- fuentes
 def fuentes_desde_spec(spec):
@@ -342,6 +445,21 @@ def pico_5h(puntos, ventana=VENTANA_5H):
 
 
 # ----------------------------------------------------------------------- agregar
+def clave_semana(fecha):
+    """El inicio de semana de cuota en ISO (la clave de `por_semana_*`)
+    correspondiente a la fecha de viernes `fecha` (date o datetime): el
+    viernes 21:00 UTC expresado en `SEMANA_TZ`. Alinea la semana remota
+    (que llega como fecha simple, #144) con las claves locales de `agregar`."""
+    if isinstance(fecha, str):
+        d = date.fromisoformat(fecha)
+    elif isinstance(fecha, datetime):
+        d = fecha.date()
+    else:
+        d = fecha
+    return datetime(d.year, d.month, d.day, RESET_HORA_UTC, tzinfo=timezone.utc) \
+        .astimezone(SEMANA_TZ).isoformat()
+
+
 def agregar(registros, raices, fuentes=None):
     """El agregado crudo (la forma de `--json`, con los timestamps como
     datetime, que `as_dict` convierte a ISO).
@@ -359,7 +477,18 @@ def agregar(registros, raices, fuentes=None):
     faltante, `completa` es False y el total es un piso (`≥`), no una
     medición — es la marca que un consumidor (p.ej. el piso de cuota del
     router, #45) tiene que respetar. Sin `fuentes` no hay marca: es el
-    agregado de antes, y `completa` queda sin información para negar."""
+    agregado de antes, y `completa` queda sin información para negar.
+
+    Las fuentes **remotas legibles** (#144) se suman a las vistas ponderadas:
+    al total (`ponderado`), a `por_modelo` (por modelo real), a `por_dia`
+    (en `resto`: las sesiones de otro usuario no son del harness) y a
+    `por_semana_ponderado`/`por_semana_cuota` (bajo la clave de modelo
+    `remoto`, para que el total de la fila sea local + remota y la
+    estimación de `harness run` respete la bolsa compartida). Sus cifras son
+    de los últimos 35 días (ventana de `quota_remota.py`), no del histórico
+    completo: la tabla lo dice al pie. El crudo (`total`, `por_semana`)
+    sigue local.
+    """
     total = vacio()
     por_modelo: Dict[str, dict] = {}
     puntos: Dict[str, list] = {}
@@ -400,13 +529,27 @@ def agregar(registros, raices, fuentes=None):
             p["tickets_ponderado"][str(ticket)] = (
                 p["tickets_ponderado"].get(str(ticket), 0.0) + peso)
         sumar_en(harness if es_h else resto, t)
+    remoto_peso = 0.0
+    for f in [x for x in (fuentes or []) if x.get("remota") and x["ok"]]:
+        remoto_peso += f["ponderado"]
+        for m, w in f["por_modelo"].items():
+            por_modelo.setdefault(m, {**vacio(), "ponderado": 0.0})["ponderado"] += w
+        for dia, w in f["por_dia"].items():
+            pd = por_dia.setdefault(dia, {"harness": 0.0, "resto": 0.0})
+            pd["resto"] += w
+        for fecha, w in f["por_semana"].items():
+            iso = clave_semana(fecha)
+            wkp = por_semana_ponderado.setdefault(iso, {})
+            wkp["remoto"] = wkp.get("remoto", 0.0) + w
+            wkc = por_semana_cuota.setdefault(iso, {"harness": 0.0, "resto": 0.0})
+            wkc["resto"] += w
     return {
         "fuentes": fuentes,
         "completa": fuentes is None or all(f["ok"] for f in fuentes),
         "archivos": len({r["archivo"] for r in registros}),
         "mensajes": len(registros),
         "total": total,
-        "ponderado": ponderar(total),
+        "ponderado": ponderar(total) + remoto_peso,
         "por_modelo": por_modelo,
         "pico_5h": {m: pico_5h(pts) for m, pts in puntos.items()},
         "por_semana": semanas,
@@ -498,6 +641,7 @@ def render_quota(agg, tope_semanal=None):
     # (≥) y se dice cuál falta y por qué (#75).
     fuentes = agg.get("fuentes") or []
     faltan = [f for f in fuentes if not f["ok"]]
+    remotos_ok = [f for f in fuentes if f.get("remota") and f["ok"]]
     piso = bool(faltan)
     a(f"Cuota · sesiones locales ({agg['archivos']} archivo(s), "
       f"{agg['mensajes']} mensaje(s))")
@@ -540,6 +684,8 @@ def render_quota(agg, tope_semanal=None):
     for iso in sorted(agg["por_semana_ponderado"], reverse=True):
         n = sum(agg["por_semana_ponderado"][iso].values())
         a(f"    {iso[:10]} {iso[11:16]}   {_fmt(round(n)):>12}{del_tope(n)}")
+    if any("remoto" in v for v in agg["por_semana_ponderado"].values()):
+        a("    (las filas con fuente remota suman local + remota)")
     a("")
     a("  por día (ponderado, últimos 10, America/Santiago):")
     dias = sorted(agg["por_dia"], reverse=True)[:10]
@@ -571,7 +717,11 @@ def render_quota(agg, tope_semanal=None):
     else:
         a("  (sin calibración: fijar \"quota\": {\"tope_semanal\": N} en la "
           "config para estimar el tope semanal)")
-    a("  (aproximado: solo las sesiones locales de esta máquina)")
+    if remotos_ok:
+        a("  (aproximado: las sesiones locales de esta máquina + la remota "
+          "por SSH, de los últimos 35 días)")
+    else:
+        a("  (aproximado: solo las sesiones locales de esta máquina)")
     return "\n".join(out) + "\n"
 
 
@@ -592,4 +742,10 @@ def resumen_evento(agg):
     if faltan:
         partes.append("piso: faltan {} de {} fuente(s)".format(
             len(faltan), len(fuentes)))
+    remotos = [f for f in fuentes if f.get("remota") and f["ok"]]
+    if remotos:
+        partes.append("remota: " + ", ".join(
+            "{} {} tokens (35 días)".format(f["ruta"][len("ssh: "):],
+                                            int(f["ponderado"]))
+            for f in remotos))
     return "; ".join(partes)

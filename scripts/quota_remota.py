@@ -9,10 +9,13 @@ instalar el harness:
 Lee `~/.claude/projects/**/*.jsonl` y no imprime prompts, rutas ni
 contenido: sólo tokens ponderados por semana (reset vie 17:00
 America/Santiago), por día y por modelo. Pondera igual que
-`harness/quota.py` (`PESOS`).
+`harness/quota.py` (`PESOS`). Con `--json` (o leída por stdin) imprime los
+mismos cortes en JSON —la variante que lee `harness quota` (#144): nada de
+prompts ni rutas, números únicamente.
 """
 
 import json
+import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -33,7 +36,9 @@ def semana_de(t):
     return inicio.date()
 
 
-def main():
+def medir():
+    """(por_semana, por_dia, por_modelo) ponderados de los últimos DIAS días,
+    o `franja` en hora local: lo que se imprime, sea texto o JSON."""
     desde = datetime.now(TZ) - timedelta(days=DIAS)
     semana, dia, modelo, franja = (defaultdict(float) for _ in range(4))
     for f in Path("~/.claude/projects").expanduser().rglob("*.jsonl"):
@@ -61,7 +66,22 @@ def main():
                 modelo[msg.get("model", "?")] += p
                 habil = t.weekday() < 5 and 9 <= t.hour < 18
                 franja["habil 9-18" if habil else "resto"] += p
+    return semana, dia, modelo, franja
 
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    semana, dia, modelo, franja = medir()
+    if "--json" in argv:
+        # La variante que lee `harness quota` por SSH (#144): por día y por
+        # modelo en JSON, más la semana (la misma unidad que el total
+        # local). Sin prompts ni rutas: números únicamente.
+        print(json.dumps({
+            "por_semana": {str(k): v for k, v in semana.items()},
+            "por_dia": {str(k): v for k, v in dia.items()},
+            "por_modelo": dict(modelo),
+        }, ensure_ascii=False, sort_keys=True))
+        return
     print("por semana (ponderado, reset vie 17:00):")
     for k in sorted(semana, reverse=True):
         print("  {}  {:>15,.0f}".format(k, semana[k]))
