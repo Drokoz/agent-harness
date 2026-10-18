@@ -568,11 +568,20 @@ def proxima_hora_limite(ahora, hora_limite):
     return dt
 
 
+def limite_de_corrida(inicio, hora_limite):
+    """La hora límite de una corrida que arrancó en `inicio`: la primera
+    `hora_limite` después del arranque. Una corrida que arrancó a las 23:00
+    termina a las 07:00 de mañana; una que arrancó a las 08:00 (pasada la
+    de hoy), a las 07:00 del día siguiente. Pasada esa hora no se espera
+    más: no hay "la de mañana" para una corrida que ya cruzó la suya."""
+    return proxima_hora_limite(inicio, hora_limite)
+
+
 def _hhmm(dt):
     return dt.astimezone(TZ).strftime("%H:%M") if dt else "?"
 
 
-def decidir(estado, ahora, politica):
+def decidir(estado, ahora, politica, limite=None):
     """Qué Claude se lanza con este estado de cuota. Puro.
 
     1. Sesión de 5h >= umbral: nada de Claude. Si resetea antes de la hora
@@ -584,15 +593,22 @@ def decidir(estado, ahora, politica):
     3. Sin dato de la semana: sin tope (lo de antes de leer /usage).
 
     Una sesión cuyo reset ya pasó no cuenta: ese % es de la ventana
-    anterior (revisión de #159)."""
+    anterior (revisión de #159). `limite` es la hora límite de la corrida
+    (`limite_de_corrida`); sin ella, la próxima `hora_limite` desde ahora."""
     sesion_vigente = (estado.sesion_reset is None
                       or estado.sesion_reset > ahora)
     if (estado.sesion_pct is not None and sesion_vigente
             and estado.sesion_pct >= politica.umbral_sesion * 100):
         base = "sesión de 5h al {}% (umbral {:.0f}%)".format(
             estado.sesion_pct, politica.umbral_sesion * 100)
-        limite = proxima_hora_limite(ahora, politica.hora_limite)
+        if limite is None:
+            limite = proxima_hora_limite(ahora, politica.hora_limite)
         reset = estado.sesion_reset
+        if ahora >= limite:
+            return DecisionCuota(
+                False, 0, None,
+                "{}: pasada la hora límite de la corrida ({}): no se "
+                "espera más".format(base, _hhmm(limite)))
         if reset is None:
             return DecisionCuota(False, 0, None,
                                  base + ", sin hora de reset: no se espera")
@@ -700,8 +716,12 @@ class Cuota:
     EstadoCuota | None`, `ahora() -> datetime`, `anotar(str)` (el log)."""
 
     def __init__(self, leer_usage, estimar, politica, ahora, anotar,
-                 ttl=timedelta(minutes=2)):
+                 ttl=timedelta(minutes=2), inicio=None):
         self.leer_usage = leer_usage
+        # La hora límite se mide desde el arranque de la corrida, no desde
+        # cada consulta (revisión de #159).
+        self.limite = (limite_de_corrida(inicio, politica.hora_limite)
+                       if inicio is not None else None)
         self.estimar = estimar
         self.politica = politica
         self.ahora = ahora
@@ -758,7 +778,7 @@ class Cuota:
                            semana_reset=u.semana.reset)
 
     def decidir(self):
-        d = decidir(self.estado(), self.ahora(), self.politica)
+        d = decidir(self.estado(), self.ahora(), self.politica, self.limite)
         self.anotar("decisión: " + d.motivo)
         return d
 

@@ -592,7 +592,8 @@ def _cuota_de(args, ctx, log):
                  estimar=lambda: _estimar_cuota(args, ctx),
                  politica=ctx.quota.politica(),
                  ahora=lambda: datetime.now(usage_mod.TZ),
-                 anotar=lambda s: log.write("cuota", "cuota", s))
+                 anotar=lambda s: log.write("cuota", "cuota", s),
+                 inicio=INICIO_CORRIDA)
 
 
 def _filtrar_por_cuota(args, cuota, candidatos, log):
@@ -616,6 +617,9 @@ def _filtrar_por_cuota(args, cuota, candidatos, log):
 # fuera con 1130 min contra un tope de 180 y una noche gastada en 60
 # vueltas vacías).
 INICIO_NOCHE = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+# El mismo arranque, para la hora límite de la cuota (`quota.hora_limite`):
+# se mide desde que arrancó la corrida, no desde cada consulta.
+INICIO_CORRIDA = datetime.now(usage_mod.TZ)
 
 
 def _ahora_str():
