@@ -18,6 +18,11 @@
     harness quota --projects RUTAS  otra(s) carpeta(s) de sesiones, separadas
                                     por coma (p.ej. una fixture, otro usuario
                                     de la máquina)
+    harness quota --remotas SSH     otra(s) fuente(s) remota(s) por SSH,
+                                    separadas por coma (p.ej.
+                                    tomasherceg@localhost), o
+                                    quota.remotas en config: la misma bolsa
+                                    semanal de otra cuenta de la máquina
     harness quota --json            el agregado (crudo + ponderado), parseable
                                     Limitaciones (también en docs/harness/quota.md):
                                     es aproximado, y por defecto sólo ve las
@@ -314,6 +319,11 @@ def build_parser():
                    help="quota: carpeta(s) de sesiones separadas por coma "
                         "(por defecto ~/.claude/projects de este usuario, o la "
                         "lista que declare quota.projects en config)")
+    p.add_argument("--remotas", default="",
+                   help="quota: fuente(s) remota(s) por SSH separadas por "
+                        "coma (p.ej. tomasherceg@localhost), o la lista que "
+                        "declara quota.remotas en config; un host ilegible "
+                        "se salta y marca el total como piso (≥)")
     p.add_argument("--pane", default="",
                    help="usage: el pane de herdr desde el cual abrir el "
                         "temporal de /usage (por defecto HERDR_PANE_ID, o el "
@@ -430,7 +440,7 @@ def main(argv=None):
         # `harness quota`, pero con las fuentes de la config (sin `--projects`:
         # esa bandera es de `quota`, acá no hace falta exponerla).
         raices = [Path(c.repos.root).expanduser() for c in contexts]
-        quota_registros, fuentes = leer_fuentes(_rutas_sesiones(args, contexts))
+        quota_registros, fuentes = _leer_fuentes_cuota(args, contexts)
         quota_agg = agregar(quota_registros, raices, fuentes=fuentes)
     snap = snapshot(raw)
     if args.since and parse_fecha(args.since) is None:
@@ -475,6 +485,27 @@ def _cuota_dict(quota_agg):
     return {"estado": "ok", "por_dia": quota_agg["por_dia"]}
 
 
+def _remotas_sesiones(args, contexts):
+    """Las fuentes remotas por SSH (#144): `--remotas` por coma gana; si no,
+    `quota.remotas` de la config (con `--all`, la primera que haya).
+    `None` = sin fuentes remotas declaradas."""
+    if args.remotas:
+        return [r.strip() for r in args.remotas.split(",") if r.strip()]
+    for c in contexts:
+        if c.quota.remotas:
+            return list(c.quota.remotas)
+    return None
+
+
+def _leer_fuentes_cuota(args, contexts):
+    """Las fuentes de cuota, locales y remotas (#75, #144). Con remotas y
+    modo offline, la remota queda marcada ilegible con la razón (no se
+    intenta nada por red: el gate no tiene efectos de lado)."""
+    return leer_fuentes(_rutas_sesiones(args, contexts),
+                        remotas=_remotas_sesiones(args, contexts),
+                        offline=OFFLINE)
+
+
 def _rutas_sesiones(args, contexts):
     """Los directorios de sesiones a leer (#75): `--projects` (separadas por
     coma) gana; si no, `quota.projects` de la config (con `--all`, la primera
@@ -493,7 +524,7 @@ def quota_main(args, contexts):
     que el histórico quede junto a todo lo demás; offline, sin efectos de
     lado, como el resto del CLI."""
     raices = [Path(c.repos.root).expanduser() for c in contexts]
-    registros, fuentes = leer_fuentes(_rutas_sesiones(args, contexts))
+    registros, fuentes = _leer_fuentes_cuota(args, contexts)
     agg = agregar(registros, raices, fuentes=fuentes)
     # La constante de calibración vive en config (#74), no en el código;
     # con `--all` gana la primera que haya.
@@ -575,7 +606,7 @@ def _estimar_cuota(args, ctx):
     hay porcentaje que dar, y se devuelve None."""
     if not ctx.quota.tope_semanal:
         return None
-    registros, fuentes = leer_fuentes(_rutas_sesiones(args, [ctx]))
+    registros, fuentes = _leer_fuentes_cuota(args, [ctx])
     agg = agregar(registros, [Path(ctx.repos.root).expanduser()],
                   fuentes=fuentes)
     ahora = datetime.now(timezone.utc)
@@ -1359,7 +1390,7 @@ def _peldano_juez_para(args, ctx, log, repo):
             return _anotar_juez(log, repo, peldano, motivo)
     usado = 0.0
     if ctx.quota.tope_semanal:
-        registros, fuentes = leer_fuentes(_rutas_sesiones(args, [ctx]))
+        registros, fuentes = _leer_fuentes_cuota(args, [ctx])
         agg = agregar(registros, [Path(ctx.repos.root).expanduser()],
                       fuentes=fuentes)
         harness_sem, resto_sem = semana_de(agg, datetime.now(timezone.utc))

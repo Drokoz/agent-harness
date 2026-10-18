@@ -95,6 +95,12 @@ class QuotaSpec:
     lista, suma los declarados, y una fuente ilegible se salta y marca el
     total como piso.
 
+    `remotas` (#144) son las fuentes por SSH (`"user@host"`): el usuario del
+    9-5 comparte la bolsa semanal de la cuenta. El consumo se lee corriendo
+    `scripts/quota_remota.py --json` en el host (sin red en los tests: el
+    `run_cmd` se inyecta); si el SSH falla, la fuente cuenta como ilegible
+    y el total se marca como piso, como con `projects`.
+
     `umbral_sesion`, `reserva_diaria`, `costo_ticket` y `hora_limite` son
     la política de `harness run` sobre la cuota real de `/usage`
     (`harness.usage.PoliticaCuota`, docs/harness/quota.md); sin declarar,
@@ -103,6 +109,7 @@ class QuotaSpec:
 
     tope_semanal: Optional[float] = None
     projects: Optional[List[str]] = None
+    remotas: Optional[List[str]] = None
     umbral_sesion: float = 0.90
     reserva_diaria: float = 0.08
     costo_ticket: float = 0.02
@@ -282,7 +289,7 @@ def _quota(raw, donde):
         return QuotaSpec()
     raw = _obj(raw, donde + ' → "quota"')
     donde = donde + ' → "quota"'
-    _keys(raw, ("tope_semanal", "projects", "umbral_sesion",
+    _keys(raw, ("tope_semanal", "projects", "remotas", "umbral_sesion",
                 "reserva_diaria", "costo_ticket", "hora_limite",
                 "statusline_max_edad_min"), donde)
     tope = None
@@ -301,6 +308,20 @@ def _quota(raw, donde):
         for p in raw_p:
             _str(p, "cada ruta de projects", donde)
         projects = list(raw_p)
+    remotas = None
+    if "remotas" in raw:
+        raw_r = raw["remotas"]
+        if not isinstance(raw_r, list) or not raw_r:
+            raise ConfigError(
+                '{}: "remotas" tiene que ser una lista no vacía'.format(donde))
+        for r in raw_r:
+            if not isinstance(r, str) or not r.strip() or "@" not in r:
+                raise ConfigError('{}: cada remota tiene que ser "user@host" '
+                                  '(texto no vacío)'.format(donde))
+            if r != r.strip():
+                raise ConfigError('{}: la remota "{}" trae espacios de más'
+                                  .format(donde, r))
+        remotas = list(raw_r)
     politica = {}
     for campo, minimo, abierto in (("umbral_sesion", 0.0, True),
                                    ("reserva_diaria", 0.0, False),
@@ -327,7 +348,8 @@ def _quota(raw, donde):
             raise ConfigError('{}: "statusline_max_edad_min" tiene que ser '
                               'mayor que cero (minutos)'.format(donde))
         politica["statusline_max_edad_min"] = v
-    return QuotaSpec(tope_semanal=tope, projects=projects, **politica)
+    return QuotaSpec(tope_semanal=tope, projects=projects, remotas=remotas,
+                     **politica)
 
 
 def _context(name, raw):
