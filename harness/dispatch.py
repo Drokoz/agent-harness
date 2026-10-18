@@ -779,10 +779,15 @@ class TopeGasto:
             return motivo
 
     def liberar(self, token):
-        """Suelta una reserva sin pasarla a gasto cerrado (el revisor: su
-        costo real lo trae el delta de créditos cuando se puede medir)."""
+        """Cierra la reserva del revisor. Con crédito medible se suelta: su
+        costo real ya lo trae el delta. Sin medir, el estimado pasa a gasto
+        cerrado: si no, cada review volvería a caber y el tope dejaría de
+        ser techo."""
         with self._lock:
-            self._reservas.pop(id(token), None)
+            est = self._reservas.pop(id(token), None)
+            if est is not None and (self._inicio is None
+                                    or self._leer() is None):
+                self._cerrado += est
 
     def cerrar(self, jobs):
         """Al final de la tanda: las reservas pasan a gasto cerrado, con el
