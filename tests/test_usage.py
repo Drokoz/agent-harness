@@ -39,6 +39,7 @@ from harness.usage import (Bucket, Cuota, DecisionCuota, EstadoCuota,
 
 SCL = ZoneInfo("America/Santiago")
 HARNESS = support.ROOT / "bin" / "harness"
+HEADER_SEMANA_T = "Current week (all models)"
 
 # El sábado 17 de octubre de 2026 a las 20:00 en Santiago: el momento de la
 # captura del homeserver (el reset de la sesión, 1:10am, es de mañana).
@@ -961,6 +962,88 @@ class TestRunConCuota(unittest.TestCase):
         cuotas = [e["cuerpo"] for e in eventos if e["tipo"] == "cuota"]
         self.assertTrue(any("no encuentro 'Current session'" in c
                             and "estimación" in c for c in cuotas), cuotas)
+
+
+# ------------------------------------- #159 revisión 1: reset ya pasado
+def statusline_en(ruta, capturado, sesion_pct, sesion_reset, semana_pct=10,
+                  semana_reset=None):
+    """Un archivo de statusline capturado a `capturado` con esos datos."""
+    semana_reset = semana_reset or capturado + timedelta(days=5)
+    usage.escribir_rate_limits(
+        {"session_id": "s", "rate_limits": {
+            "five_hour": {"used_percentage": sesion_pct,
+                          "resets_at": int(sesion_reset.timestamp())},
+            "seven_day": {"used_percentage": semana_pct,
+                          "resets_at": int(semana_reset.timestamp())}}},
+        ruta, capturado)
+
+
+class TestResetPasado(unittest.TestCase):
+    """Revisión de #159 (ALTA): después del reset de la sesión de 5h, la
+    statusline seguía "fresca" con el % de antes del reset, y Claude
+    quedaba fuera toda la noche."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ruta = Path(self.tmp.name) / "harness" / "rate_limits.json"
+        self.reloj = [scl(2026, 10, 18, 2, 0)]
+        self.dormidas = []
+        self.capturas = 0
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def ahora(self):
+        return self.reloj[0]
+
+    def dormir(self, s):
+        self.dormidas.append(s)
+        self.reloj[0] += timedelta(seconds=s)
+
+    def capturar(self):
+        # /usage de verdad, después del reset: la sesión volvió a empezar.
+        self.capturas += 1
+        ahora = self.ahora()
+        return Usage(Bucket("Current session", 3, scl(2026, 10, 18, 7, 5),
+                            "usage", ahora),
+                     Bucket(HEADER_SEMANA_T, 11, scl(2026, 10, 23, 18, 0),
+                            "usage", ahora))
+
+    def cuota(self):
+        return Cuota(
+            leer_usage=lambda: usage.leer_cuota(
+                lambda: usage.leer_rate_limits(self.ruta, self.ahora(),
+                                               timedelta(minutes=10)),
+                self.capturar),
+            estimar=lambda: None, politica=POL, ahora=self.ahora,
+            anotar=lambda s: None)
+
+    def test_la_statusline_con_el_reset_pasado_no_vale(self):
+        statusline_en(self.ruta, scl(2026, 10, 18, 2, 0), 95,
+                      scl(2026, 10, 18, 2, 5))
+        u, motivo = usage.leer_rate_limits(self.ruta, scl(2026, 10, 18, 2, 6),
+                                           timedelta(minutes=10))
+        self.assertIsNone(u)
+        self.assertIn("ya pasó", motivo)
+
+    def test_decidir_ignora_una_sesion_cuyo_reset_ya_paso(self):
+        e = estado(sesion=95, sesion_reset=AHORA - timedelta(minutes=1))
+        self.assertTrue(decidir(e, AHORA, POL).claude)
+
+    def test_espera_el_reset_y_relanza_con_una_fuente_valida(self):
+        statusline_en(self.ruta, scl(2026, 10, 18, 2, 0), 95,
+                      scl(2026, 10, 18, 2, 5))
+        cuota = self.cuota()
+        entran, fuera = aplicar_cuota([job(1, "claude"), job(2, "claude")],
+                                      cuota, ahora=self.ahora,
+                                      dormir=self.dormir, anotar=lambda s: None)
+        self.assertEqual([j.issue for j in entran], [1, 2])
+        self.assertEqual(fuera, [])
+        # Esperó el reset más un margen, y la nueva lectura fue /usage.
+        self.assertGreaterEqual(self.reloj[0], scl(2026, 10, 18, 2, 6))
+        self.assertEqual(self.capturas, 1)
+        # Y el chequeo por ticket ve lo mismo.
+        self.assertTrue(cuota.permitir_claude()[0])
 
 
 if __name__ == "__main__":
