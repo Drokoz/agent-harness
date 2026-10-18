@@ -20,8 +20,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from harness.config import (CONFIG_ENV, CONFIG_NAME, ConfigError, default_config,
-                            parse_config)
+from harness.config import (CONFIG_ENV, CONFIG_NAME, ConfigError, parse_config)
 from harness import routing as routing_mod
 from harness.snapshot import READINESS
 
@@ -91,12 +90,14 @@ def config_path():
 
 
 def load_config(path=None):
-    """La config del usuario, o la de arranque si todavía no escribió ninguna."""
+    """La config del usuario. No arranca con defaults (#164, regla 5):
+    si no se puede leer, se detiene diciendo qué no leyó."""
     path = Path(path) if path else config_path()
     try:
         texto = path.read_text()
     except FileNotFoundError:
-        return default_config()
+        raise ConfigError("{}: no existe esa config — escribila o apunta a la "
+                          "buena (sin ella no hay contextos que seguir)".format(path))
     except OSError as e:
         raise ConfigError("{}: no se pudo leer ({})".format(path, e.strerror))
     try:

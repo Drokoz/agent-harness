@@ -253,8 +253,20 @@ class Cli(unittest.TestCase):
     contra el CLI real."""
 
     def _correr(self, args, tmp):
+        # #164: sin config en el disco el CLI se detiene; `costo` no la usa
+        # (todo disco local), pero tiene que existir.
+        (Path(tmp) / ".config" / "harness").mkdir(parents=True)
+        (Path(tmp) / ".config" / "harness" / "config.json").write_text(
+            json.dumps({"default_context": "h", "contexts": {"h": {
+                "tracker": {"kind": "github"},
+                "repos": {"root": str(Path(tmp) / "repos"), "paths": []},
+                "autonomy": "frontier",
+                "budget": {"polarity": "remaining", "provider": "none"},
+                "run": {"kind": "local"}}}}))
         env = dict(os.environ)
         env.update(HOME=tmp, XDG_STATE_HOME=tmp, HARNESS_OFFLINE="1")
+        # CI (ubuntu) trae XDG_CONFIG_HOME y le gana a HOME: la config del test no se veía.
+        env.pop("XDG_CONFIG_HOME", None)
         return subprocess.run([str(HARNESS), *args], env=env, capture_output=True,
                               text=True, timeout=120)
 

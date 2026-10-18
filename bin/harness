@@ -164,7 +164,8 @@ es cómo trabajar con Tomás, no lo que aprende él.
 
 Los contextos —repos, tracker, autonomía, presupuesto, vault— se declaran en
 ~/.config/harness/config.json, fuera del repo porque ahí van las credenciales. Sin
-ese archivo corre con la config de arranque (ver `harness/config.py`). `status`
+ese archivo (o ilegible) el harness se detiene con la razón (#164, regla 5):
+no arranca con contextos inventados por el código. `status`
 escribe una sola cosa: la marca de "última vez que miré" junto al log de
 eventos (~/.local/state/harness/, o XDG_STATE_HOME), que abre el resumen de
 la mañana (ticket #7). `run` además deja el log JSONL de eventos.

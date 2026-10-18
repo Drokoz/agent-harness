@@ -108,13 +108,16 @@ class TestSmoke(unittest.TestCase):
             return False, ""
 
         buf = io.StringIO()
-        with mock.patch.object(adapters, "run", fake_run), \
-                mock.patch("urllib.request.urlopen",
-                           side_effect=AssertionError("llamada de red en modo offline")), \
-                mock.patch.dict(os.environ, {"HERDR_ENV": "1"}), \
-                mock.patch.object(sys, "argv", ["harness", "status"]), \
-                contextlib.redirect_stdout(buf):
-            mod.main()
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "config.json").write_text(DOS_CONTEXTOS)
+            with mock.patch.object(adapters, "run", fake_run), \
+                    mock.patch("urllib.request.urlopen",
+                               side_effect=AssertionError("llamada de red en modo offline")), \
+                    mock.patch.dict(os.environ, {"HERDR_ENV": "1",
+                                                 "HARNESS_CONFIG_DIR": tmp}), \
+                    mock.patch.object(sys, "argv", ["harness", "status"]), \
+                    contextlib.redirect_stdout(buf):
+                mod.main()
         self.assertTrue(all(c == "git" for c in calls),
                         f"adaptador externo en modo offline: {sorted(set(calls))}")
         self.assertIn("sin adaptadores", buf.getvalue())
@@ -125,6 +128,8 @@ class TestSmoke(unittest.TestCase):
         env["HARNESS_OFFLINE"] = "1"
         with tempfile.TemporaryDirectory() as tmp:
             env["HOME"] = tmp
+            env["HARNESS_CONFIG_DIR"] = tmp
+            (Path(tmp) / "config.json").write_text(DOS_CONTEXTOS)
             p = subprocess.run([str(HARNESS), "status"], env=env,
                                capture_output=True, text=True, timeout=120)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
@@ -136,6 +141,8 @@ class TestSmoke(unittest.TestCase):
         env["HARNESS_OFFLINE"] = "1"
         with tempfile.TemporaryDirectory() as tmp:
             env["HOME"] = tmp
+            env["HARNESS_CONFIG_DIR"] = tmp
+            (Path(tmp) / "config.json").write_text(DOS_CONTEXTOS)
             p = subprocess.run([str(HARNESS), "status"], env=env,
                                capture_output=True, text=True, timeout=120)
         self.assertNotIn("\033", p.stdout)
@@ -160,11 +167,46 @@ class TestContextos(unittest.TestCase):
             self.assertIn("▸ personal", p.stdout)
             self.assertIn("▸ trabajo", p.stdout)
 
-    def test_sin_config_arranca_igual(self):
-        """Sin ~/.config/harness/config.json el harness sigue saliendo 0."""
+    def test_sin_config_se_detiene(self):
+        """#164 (regla 5): sin config.json no arranca con defaults; sale
+        ≠ 0 con la razón en una sola línea, sin stack trace ni output."""
         with correr("status") as p:
-            self.assertEqual(p.returncode, 0, p.stderr)
-            self.assertIn("▸ personal", p.stdout)
+            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            self.assertEqual(p.stdout, "")
+            err = p.stderr.strip().splitlines()
+            self.assertEqual(len(err), 1, p.stderr)
+            self.assertIn("config.json", err[0])
+            self.assertIn("no existe", err[0])
+
+    def test_config_sin_permisos_se_detiene(self):
+        """#164 (regla 5): una config que no se puede leer (OSError) también
+        detiene con motivo, no arranca con defaults."""
+        # El owner no puede leer su propio archivo que está en 0o000.
+        # En root no se puede simular (todo se lee), así que el chequeo
+        # queda a cargo del test de OSError de unit (no root).
+        if os.getuid() == 0:
+            self.skipTest("root lee todo: no se puede simular un OSError de lectura")
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "config.json"
+            conf.write_text("{}")
+            conf.chmod(0o000)
+            try:
+                if os.access(conf, os.R_OK):
+                    self.skipTest("este usuario puede leer un archivo 0o000")
+                env = dict(os.environ)
+                env["HOME"] = tmp
+                env["HARNESS_OFFLINE"] = "1"
+                env["HARNESS_CONFIG_DIR"] = tmp
+                p = subprocess.run([str(HARNESS), "status"], env=env,
+                                   capture_output=True, text=True, timeout=120)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(p.stdout, "")
+                self.assertIn("no se pudo leer", p.stderr)
+                self.assertIn("config.json", p.stderr)
+            finally:
+                conf.chmod(0o644)
 
 
 class TestJson(unittest.TestCase):

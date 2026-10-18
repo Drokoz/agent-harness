@@ -821,6 +821,17 @@ class TestCli(_ResetsFrescos, unittest.TestCase):
         loader.exec_module(self.cli)
         self.env = {"HOME": str(self.d), "HARNESS_CONFIG_DIR": str(self.d),
                     "XDG_STATE_HOME": str(self.d / "state")}
+        # #164: sin config el CLI se detiene; `usage` no depende de los
+        # contextos, pero la config tiene que estar en el disco.
+        # `provider: openrouter` es el de la config de arranque que
+        # heredaban estos tests: trae el `max_edad` default de la statusline.
+        (self.d / "config.json").write_text(json.dumps(
+            {"default_context": "h", "contexts": {"h": {
+                "tracker": {"kind": "github"},
+                "repos": {"root": str(self.d / "repos"), "paths": []},
+                "autonomy": "frontier",
+                "budget": {"polarity": "remaining", "provider": "openrouter"},
+                "run": {"kind": "local"}}}}))
 
     def tearDown(self):
         self.tmp.cleanup()

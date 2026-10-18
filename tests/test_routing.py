@@ -253,6 +253,8 @@ class TestStatus(unittest.TestCase):
 def _run_cli(*args, home):
     env = dict(os.environ)
     env["HOME"] = home
+    # CI (ubuntu) trae XDG_CONFIG_HOME y le gana a HOME: la config del test no se veía.
+    env.pop("XDG_CONFIG_HOME", None)
     env.pop("HARNESS_OFFLINE", None)
     return subprocess.run([str(HARNESS), *args], env=env, capture_output=True,
                           text=True, timeout=120)
@@ -266,6 +268,15 @@ class TestDoctorCli(unittest.TestCase):
         home = Path(tmp.name)
         self.addCleanup(tmp.cleanup)
         (home / ".pi" / "agent").mkdir(parents=True)
+        # #164: sin config en el disco el CLI se detiene antes de doctor.
+        (home / ".config" / "harness").mkdir(parents=True)
+        (home / ".config" / "harness" / "config.json").write_text(
+            json.dumps({"default_context": "h", "contexts": {"h": {
+                "tracker": {"kind": "github"},
+                "repos": {"root": str(home / "repos"), "paths": []},
+                "autonomy": "frontier",
+                "budget": {"polarity": "remaining", "provider": "none"},
+                "run": {"kind": "local"}}}}))
         return home
 
     def test_sin_models_json_salida_1(self):

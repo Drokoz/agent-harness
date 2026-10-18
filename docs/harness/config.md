@@ -1,9 +1,10 @@
 # La config del harness
 
 Vive en `~/.config/harness/config.json`, **fuera del repo**: ahí van los tokens de
-los trackers. El harness la lee y no la escribe nunca. Si el archivo no existe corre
-con la config de arranque (`DEFAULT_CONFIG` en `harness/config.py`), que es lo que
-seguía el viejo `repos.conf`.
+los trackers. El harness la lee y no la escribe nunca. Si el archivo no existe o no
+se puede leer, el harness se detiene con la razón (regla 5, #164): no arranca con
+una config de arranque inventada por el código (`DEFAULT_CONFIG` en
+`harness/config.py` queda como plantilla de lo que seguía el viejo `repos.conf`).
 
 `HARNESS_CONFIG_DIR` la mueve a otra carpeta; `XDG_CONFIG_HOME` también se respeta.
 
