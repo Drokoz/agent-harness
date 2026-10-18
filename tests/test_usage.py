@@ -1135,5 +1135,20 @@ class TestCapturadoEnElFuturo(unittest.TestCase):
         self.assertIsNotNone(u)
 
 
+# ------------------- #159 revisión 5: una sesión vieja no pisa a una nueva
+class TestNoPisarConDatosViejos(unittest.TestCase):
+    def test_un_reset_anterior_al_guardado_no_reemplaza(self):
+        with tempfile.TemporaryDirectory() as d:
+            ruta = Path(d) / "harness" / "rate_limits.json"
+            nuevo = dict(STDIN_STATUSLINE)
+            self.assertTrue(usage.escribir_rate_limits(nuevo, ruta, AHORA))
+            antes = ruta.read_text()
+            viejo = json.loads(json.dumps(STDIN_STATUSLINE))
+            viejo["rate_limits"]["five_hour"]["resets_at"] -= 5 * 3600
+            self.assertFalse(usage.escribir_rate_limits(
+                viejo, ruta, AHORA + timedelta(minutes=1)))
+            self.assertEqual(ruta.read_text(), antes)
+
+
 if __name__ == "__main__":
     unittest.main()
