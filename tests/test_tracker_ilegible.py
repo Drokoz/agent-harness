@@ -109,6 +109,10 @@ def mundo(buenos=()):
                     [{"number": 9, "title": "ticket 9", "labels": [],
                       "body": ""}]))
             return GH_AUTH_ERR
+        if args[0] == "herdr" and "agent" in args and "list" in args:
+            # herdr sano y sin agentes: lo ilegible acá es el tracker, no
+            # la lista de agentes (esa es #178, test_agentes_ilegibles).
+            return (True, json.dumps({"result": {"agents": []}}))
         return (True, "")
     return run_cmd
 

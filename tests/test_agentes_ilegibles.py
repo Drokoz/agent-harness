@@ -205,6 +205,9 @@ class RunConAgentesIlegibles(BaseCli):
              mock.patch("sys.stderr", new_callable=io.StringIO):
             self.cli.run_main(args, self.cli.load_config().select("h"))
         nuevos = leer_log(self.log_path)[len(previos):]
+        # El motivo queda en el log, para la mañana: no es "nada que hacer".
+        self.assertTrue(any("agentes ilegibles" in e.get("cuerpo", "")
+                            for e in nuevos), nuevos)
         self.assertEqual([e for e in nuevos
                           if e["tipo"] in ("worktree", "pane", "agente",
                                             "prompt", "gate")], [], nuevos)

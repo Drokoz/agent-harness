@@ -26,7 +26,8 @@ que entró antes y cuenta dos veces lo que entró dos veces — no aparece en ni
 
 ## Regla 2 — Una fuente que no se pudo leer se reporta como ilegible, nunca como "no había nada"
 
-**Parcial** (issue #178). La distinción `None` (no se pudo leer) vs `[]` (leído, y no hay nada) se hace
+**Cumple** (la última fuente que se leía como vacía, los agentes de herdr, se cerró en #178).
+La distinción `None` (no se pudo leer) vs `[]` (leído, y no hay nada) se hace
 en los adaptadores y sobrevive hasta la pantalla y el exit code. Casos:
 
 - **El tracker**: `issues: None` degrada el repo (`harness/snapshot.py:381-382`);
@@ -35,13 +36,16 @@ en los adaptadores y sobrevive hasta la pantalla y el exit code. Casos:
   vacía por él (`bin/harness:903-914`); `run --loop` corta la primera pasada con el
   motivo (`bin/harness:1089-1099`, `harness/dispatch.py:774-779`) y `main` devuelve 1
   (`bin/harness:1296`) — "no se pudo leer" no sale 0 (familia de #91, #130).
-- **Los agentes de herdr**: `herdr agent list` que falla devuelve `[]` y la pantalla
-  dice "ninguno trabajando" (`harness/adapters.py:70-71`, `harness/snapshot.py:264-266`,
-  `harness/render.py:243-244`). Sin `HERDR_ENV` es `None` → "fuera de herdr", otro
-  estado. **Matiz honesto:** un binario de herdr caído en el medio de la sesión se lee
-  como "ninguno trabajando", no como "ilegible". Consecuencia contenida: `estado_frontier`
-  (`harness/state.py:525`) marca el ticket `libre` y se re-despacha — gasto de un
-  intento, no un dato falso duradero —, pero la pantalla sí miente — por eso la regla queda **Parcial**: #178.
+- **Los agentes de herdr** (#178): dentro de herdr, `herdr agent list` que falla (exit
+  distinto de cero, binario ausente, salida que no se entiende) devuelve `None`, no `[]`
+  (`harness/adapters.py:67-89`); `collect` trae `herdr: bool` para distinguirlo de
+  "fuera de herdr" (sin `HERDR_ENV`), que sigue siendo otro estado
+  (`harness/snapshot.py:267-272`). La pantalla dice "Agentes ilegible"
+  (`harness/render.py:253-257`, también el reporte HTML), `harness status` **sale 1**
+  (`bin/harness:464`), y `estado_frontier` recibe `vivo=None` (desconocido): un ticket
+  despachado no se da por muerto sin verlo muerto, así que `run` no lo re-despacha
+  (`harness/snapshot.py:347,422-426`, `harness/state.py:638`); `run` y cada pasada de
+  `--loop` lo anotan en el log (`bin/harness:908-919`).
 - **El PR/estado en vivo**: `pr_state` devuelve `None` si no se pudo consultar
   (`harness/adapters.py:218-229`); el ticket se queda con lo que dice el log, sin
   corregirse a ciegas (`harness/summary.py:309-322`).

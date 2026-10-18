@@ -59,23 +59,34 @@ def openrouter_credits(offline=False):
 
 
 # -------------------------------------------------------------------------- herdr
+def en_herdr():
+    """¿Corremos dentro de una sesión de herdr?"""
+    return os.environ.get("HERDR_ENV") == "1"
+
+
 def herdr_agents(offline=False):
-    """Los agentes crudos de `herdr agent list`. None = no hay sesión que inspeccionar."""
-    if offline:
+    """Los agentes crudos de `herdr agent list`.
+
+    None = no hay lista: o no estamos en herdr (`en_herdr()` lo distingue) o
+    estamos y `herdr agent list` no se pudo leer (exit != 0, binario ausente,
+    salida que no se entiende). Ilegible no es `[]` — `[]` es leído y nadie
+    trabajando (#178, regla 2 de #152).
+    """
+    if offline or not en_herdr():
         return None
-    if os.environ.get("HERDR_ENV") != "1":
-        return None  # no estamos dentro de herdr: no hay sesión que inspeccionar
     ok, out = run(["herdr", "agent", "list"])
     if not ok:
-        return []
+        return None
     try:
         data = json.loads(out)
     except ValueError:
-        return []
-    agents = data.get("result", data)
+        return None
+    agents = data.get("result", data) if isinstance(data, dict) else data
     if isinstance(agents, dict):
-        agents = agents.get("agents", [])
-    return agents if isinstance(agents, list) else []
+        agents = agents.get("agents")
+    if not isinstance(agents, list) or not all(isinstance(a, dict) for a in agents):
+        return None  # una forma que no se entiende tampoco es "nadie"
+    return agents
 
 
 # -------------------------------------------------------------------------- config
@@ -420,5 +431,7 @@ def collect(contexts, offline=False, workers=8):
             for c, futs in pendientes
         ]
         agents = fut_agents.result()
+    # `herdr`: con `agents: None`, distingue "fuera de herdr" de "ilegible".
     return {"offline": offline, "agents": agents,
+            "herdr": not offline and en_herdr(),
             "routing": pi_routing(), "contexts": crudos}

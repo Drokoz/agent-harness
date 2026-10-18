@@ -250,6 +250,11 @@ def _agents(a, c, out):
         out(f" {c.bold}Agentes{c.off}     "
             f"{c.dim}fuera de herdr — corré esto dentro de una sesión{c.off}")
         return
+    if a.state == "ilegible":
+        # #178: en herdr, pero `herdr agent list` no contestó: no es "nadie".
+        out(f" {c.bold}Agentes{c.off}     {c.red}ilegible{c.off}  "
+            f"{c.dim}herdr agent list no contestó{c.off}")
+        return
     if a.state == "empty":
         out(f" {c.bold}Agentes{c.off}     {c.dim}ninguno trabajando{c.off}")
         return

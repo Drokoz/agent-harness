@@ -624,13 +624,17 @@ def estado_frontier(labels, despachado_en_log, vivo, pr_abierto, pr_merged):
     `parkeado` es definitivo (un humano lo tiene); `pr-abierto` y `mergeado`
     salen de los PRs sobre `ticket/<n>`; `despachado` sale del log de eventos
     y de un agente vivo — despachado en una corrida muerta (sin PR y sin
-    agente) no queda colgado: vuelve a `libre`."""
+    agente) no queda colgado: vuelve a `libre`.
+
+    `vivo` None = no se sabe (la lista de agentes de herdr fue ilegible,
+    #178): un despachado no se da por muerto sin verlo muerto — re-despachar
+    a ciegas gasta un intento sobre un ticket que quizá sigue en curso."""
     if set(labels or ()) & set(PARKEADOS):
         return PARKEADO
     if pr_abierto:
         return PR_ABIERTO
     if pr_merged:
         return MERGEADO
-    if despachado_en_log and vivo:
+    if despachado_en_log and (vivo or vivo is None):
         return DESPACHADO
     return LIBRE

@@ -209,6 +209,9 @@ def _agentes(a):
     items = (a or {}).get("items") or []
     if (a or {}).get("state") == "outside":
         return '<p class="muted">Fuera de herdr: no hay sesión que inspeccionar.</p>'
+    if (a or {}).get("state") == "ilegible":
+        return ('<p class="warn">Agentes ilegibles: <span class="mono">herdr agent '
+                'list</span> no contestó.</p>')
     if not items:
         return '<p class="muted">Ningún agente trabajando.</p>'
     orden = {"blocked": 0, "working": 1, "done": 2, "idle": 3}
