@@ -70,7 +70,21 @@ grep -Eq '^# pass [1-9][0-9]*' <<<"$out" \
 grep -E '^# (pass|fail)' <<<"$out"
 
 # 4) Corrida real del CLI, punta a punta y sin red: modo sin adaptadores.
+# Con una config minima en un XDG temporal: #164 detiene si no hay config
+# (regla 5), y el runner de CI no tiene ~/.config/harness/config.json.
 echo "== harness status (offline)"
-HARNESS_OFFLINE=1 ./bin/harness status >/dev/null || fail "harness status (offline) no sale 0"
+tmpconfig=$(mktemp -d)
+trap 'rm -rf "$tmpconfig"' EXIT
+mkdir -p "$tmpconfig/harness"
+cat > "$tmpconfig/harness/config.json" <<'EOF'
+{"default_context": "humo", "contexts": {"humo": {
+  "tracker": {"kind": "github"},
+  "repos": {"root": "/no/existe", "paths": []},
+  "autonomy": "frontier",
+  "budget": {"polarity": "remaining", "provider": "none"},
+  "run": {"kind": "local"}}}}
+EOF
+HARNESS_OFFLINE=1 XDG_CONFIG_HOME="$tmpconfig" ./bin/harness status >/dev/null \
+  || fail "harness status (offline) no sale 0"
 
 echo "VERDE"

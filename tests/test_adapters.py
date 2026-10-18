@@ -203,10 +203,35 @@ class TestGhGraphqlIssues(unittest.TestCase):
 
 
 class TestConfigEnDisco(unittest.TestCase):
-    def test_sin_archivo_es_la_config_de_arranque(self):
+    def test_sin_config_se_detiene_con_la_razon(self):
+        """#164 (regla 5): sin config no arranca con defaults; se detiene
+        diciendo qué no pudo leer, no con contextos inventados."""
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict("os.environ", {"HARNESS_CONFIG_DIR": tmp}):
-                self.assertEqual(adapters.load_config(), default_config())
+                with self.assertRaises(ConfigError) as e:
+                    adapters.load_config()
+            self.assertIn(str(Path(tmp) / "config.json"), str(e.exception))
+            self.assertIn("no existe", str(e.exception))
+
+    def test_config_sin_permisos_detiene_con_motivo(self):
+        """#164 (regla 5): un `OSError` de lectura detiene con el motivo,
+        no arranca con defaults."""
+        import os
+        if os.getuid() == 0:
+            self.skipTest("root lee todo: no se puede simular un OSError de lectura")
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "config.json"
+            conf.write_text("{}")
+            conf.chmod(0o000)
+            try:
+                if os.access(conf, os.R_OK):
+                    self.skipTest("este usuario puede leer un archivo 0o000")
+                with self.assertRaises(ConfigError) as e:
+                    adapters.load_config(conf)
+                self.assertIn(str(conf), str(e.exception))
+                self.assertIn("no se pudo leer", str(e.exception))
+            finally:
+                conf.chmod(0o644)
 
     def test_config_path_respeta_la_variable(self):
         with mock.patch.dict("os.environ", {"HARNESS_CONFIG_DIR": "/x/y"}):

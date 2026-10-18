@@ -191,6 +191,8 @@ class Config:
 
 
 # La config de arranque: lo que seguía `repos.conf`, ya como contexto.
+# Queda como plantilla documentada: `load_config` no la usa más (#164) —
+# una config que no se puede leer detiene, no arranca con esto.
 DEFAULT_CONFIG = {
     "default_context": "personal",
     "contexts": {
