@@ -287,6 +287,13 @@ def ruta_rate_limits(env=None):
     return base / "harness" / "rate_limits.json"
 
 
+def _reset_5h(rl):
+    """El `resets_at` (epoch) de la ventana de 5h, o None."""
+    v = ((rl or {}).get("five_hour") or {}).get("resets_at") \
+        if isinstance(rl, dict) else None
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
 def escribir_rate_limits(entrada, ruta, ahora):
     """Anota `rate_limits` del JSON de statusline, con la hora de captura y
     el `session_id`. Atómico (temporal + `os.replace`): un lector nunca ve
@@ -297,6 +304,17 @@ def escribir_rate_limits(entrada, ruta, ahora):
     if not isinstance(rl, dict) or not (rl.get("five_hour") or rl.get("seven_day")):
         return False
     ruta = Path(ruta)
+    # `capturado` es la hora de escritura, no la del dato: una sesión que
+    # quedó con números viejos podría pisar a una más nueva. Si el reset de
+    # 5h que llega es anterior al guardado, es de una ventana más vieja y no
+    # reemplaza (revisión de #159). Con el mismo reset sí: el % es más nuevo.
+    nuevo = _reset_5h(rl)
+    try:
+        guardado = _reset_5h(json.loads(ruta.read_text()).get("rate_limits"))
+    except (OSError, ValueError, AttributeError):
+        guardado = None
+    if nuevo is not None and guardado is not None and nuevo < guardado:
+        return False
     ruta.parent.mkdir(parents=True, exist_ok=True)
     tmp = ruta.with_name(".{}.{}.tmp".format(ruta.name, os.getpid()))
     tmp.write_text(json.dumps({"rate_limits": rl,
