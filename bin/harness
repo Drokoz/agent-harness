@@ -204,6 +204,7 @@ from harness.dispatch import (BucleSpec, DispatchSpec, Dispatcher, EventLog,  # 
                               Job, Pasada, bucle, cosechar, decidir_tanda,
                               motivo_presupuesto_reloj, peldano_de,
                               skills_de, transcripcion_path)
+from harness.dispatch import resolver_hasta  # noqa: E402
 from harness.ideas import (IDEAS_CLAUDE, IDEAS_OPUS, Ideas,  # noqa: E402
                            MAX_IDEAS_DEFAULT, debe_correr,
                            guardar_ultima_corrida, leer_ideas_vault,
@@ -239,6 +240,36 @@ REF_ISSUE_RE = re.compile(r"^ticket/(\d+)$")
 
 # Modo sin adaptadores: sin red ni dependencias externas (OpenRouter, gh, herdr).
 OFFLINE = os.environ.get("HARNESS_OFFLINE") == "1"
+
+
+def _hhmm_arg(valor):
+    """`--hasta HH:MM`: se valida al parsear, para que un typo no deje la
+    noche sin hora límite."""
+    if valor:
+        try:
+            resolver_hasta(datetime.now(usage_mod.TZ), valor)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e))
+    return valor
+
+
+def _hasta_de(args, ctx, inicio, noche=False):
+    """La hora límite de la corrida (#175), como instante, resuelta contra
+    el arranque `inicio` (`resolver_hasta`: cruza la medianoche). None = sin
+    hora límite.
+
+    `topes.hasta` de la config es de la noche: sólo vale con `noche` (el
+    `--loop`, sus pasadas y su proposer); ahí gana la más temprana entre la
+    config y `--hasta`. Un `harness run` suelto usa sólo un `--hasta`
+    explícito: si no, con hasta 07:00 en la config, una corrida manual de
+    día no despacharía nada y sin forma de pasarlo por alto."""
+    horas = [getattr(args, "hasta", "")]
+    if noche:
+        horas.append(ctx.topes.hasta)
+    horas = [h for h in horas if h]
+    if not horas:
+        return None
+    return min(resolver_hasta(inicio, h) for h in horas)
 
 
 def build_parser():
@@ -308,8 +339,15 @@ def build_parser():
                         "créditos, tope de pasadas con trabajo, o el archivo "
                         "de freno); la frontera se recalcula entre pasadas (#88)")
     p.add_argument("--freno", default="",
-                   help="run --loop: archivo que, si aparece, frena el bucle; "
-                        "se atiende entre pasadas, nunca en medio de una")
+                   help="run --loop: archivo que, si aparece, frena el bucle: "
+                        "no se despacha ningún job nuevo (se mira antes de "
+                        "cada uno, #175); los que corren terminan")
+    p.add_argument("--hasta", default="", type=_hhmm_arg, metavar="HH:MM",
+                   help="run: hora límite dura (America/Santiago, #175): "
+                        "pasada, no se despacha nada nuevo, y 30 min después "
+                        "los agentes vivos se cortan con commit WIP. Por "
+                        "defecto topes.hasta en config; puede adelantarla, "
+                        "no atrasarla")
     p.add_argument("--piso", type=float, default=None,
                    help="run --loop: no arranca otra pasada con menos de este "
                         "crédito restante (US$, por defecto el de "
@@ -660,6 +698,11 @@ INICIO_NOCHE = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 INICIO_CORRIDA = datetime.now(usage_mod.TZ)
 
 
+def _ahora_tz():
+    """Ahora, en la zona del servidor (America/Santiago)."""
+    return datetime.now(usage_mod.TZ)
+
+
 def _ahora_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -975,7 +1018,8 @@ def run_main(args, contexts, solo=None):
         spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
                             kind=args.kind, model=args.model,
                             permitir_claude=cuota.permitir_claude,
-                            budget_minutos=ctx.topes.budget_minutos)
+                            budget_minutos=ctx.topes.budget_minutos,
+                            hasta=_hasta_de(args, ctx, INICIO_CORRIDA))
         costo_de_pi, salida_de_pi = _sesiones_de_pi()
         disp = Dispatcher(spec, log, run_cmd=adapters.run,
                           credits=_creditos_usado
@@ -1162,10 +1206,14 @@ def _una_pasada(args, ctx, log):
                  ", ".join(r.name for r in ilegibles))
              if ilegibles else "")
     cuota = _cuota_de(args, ctx, log)
+    # #175: el freno y la hora límite se miran antes de cada job de la
+    # pasada, no sólo entre pasadas.
     spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
                         kind=args.kind, model=args.model,
                         permitir_claude=cuota.permitir_claude,
-                        budget_minutos=ctx.topes.budget_minutos)
+                        budget_minutos=ctx.topes.budget_minutos,
+                        freno=getattr(args, "freno", "") or None,
+                        hasta=_hasta_de(args, ctx, INICIO_CORRIDA, noche=True))
     costo_de_pi, salida_de_pi = _sesiones_de_pi()
     disp = Dispatcher(spec, log, run_cmd=adapters.run,
                       credits=_creditos_usado
@@ -1308,8 +1356,9 @@ def _run_loop(args, contexts, log_path):
     """`harness run --loop` (#88): el modo bucle del CLI, en vez del
     `scripts/noche.sh` que hace lo mismo sin tests.
 
-    El corte siempre queda en el log de eventos con su motivo, y el freno
-    se atiende entre pasadas (nunca en medio de una). Un freno viejo que ya
+    El corte siempre queda en el log de eventos con su motivo. El freno y
+    la hora límite (`--hasta`) se miran entre pasadas y, adentro de la
+    pasada, antes de despachar cada job (#175). Un freno viejo que ya
     estaba al arrancar no puede salir 0 (#91): se leería como éxito y se
     comería la noche.
     """
@@ -1317,6 +1366,16 @@ def _run_loop(args, contexts, log_path):
         sys.stderr.write("harness: freno puesto: {}\n"
                          "rm {} para sacarlo\n".format(
                              args.freno, args.freno))
+        return 2
+    # #175: lo mismo con una hora límite ya pasada al arrancar: cortar en
+    # silencio con 0 se leería como una noche terminada.
+    hasta = (_hasta_de(args, contexts[0], INICIO_CORRIDA, noche=True)
+             if contexts else None)
+    if hasta is not None and _ahora_tz() >= hasta:
+        sys.stderr.write("harness: hora límite {} ya pasada al arrancar "
+                         "(--hasta o topes.hasta): no se despacha nada\n"
+                         .format(hasta.astimezone(usage_mod.TZ)
+                                 .strftime("%H:%M")))
         return 2
     if OFFLINE or os.environ.get("HERDR_ENV") != "1":
         sys.stderr.write("harness: run necesita adaptadores y una sesión de "
@@ -1394,14 +1453,16 @@ def _run_loop(args, contexts, log_path):
     proposer = None
     if not args.sin_propone:
         def proposer():
-            partes = [_proponer_ctx(args, ctx, log_corriente["log"])
+            partes = [_proponer_ctx(args, ctx, log_corriente["log"],
+                                    en_bucle=True)
                       for ctx in contexts]
             return "; ".join(partes)
     # El log de respaldo: las pasadas traen el suyo, pero el corte se tiene
     # que anotar aunque no haya corrido ninguna (piso bajo al arrancar).
     corte = bucle(ejecutar, spec, EventLog(log_path, nombre),
                   creditos=creditos, freno=args.freno or None,
-                  proposer_vacio=proposer, vigilar=vigilar)
+                  proposer_vacio=proposer, vigilar=vigilar,
+                  hasta=hasta)
     sys.stdout.write("harness: bucle: corte: {}\n".format(corte))
     # Un corte por una fuente que no se puede leer (el tracker, #130; la
     # config, #163) no es una noche terminada: es un mundo que se conoce a
@@ -1498,7 +1559,7 @@ def _anotar_juez(log, repo, peldano, motivo):
     return peldano
 
 
-def _proponer_ctx(args, ctx, log):
+def _proponer_ctx(args, ctx, log, en_bucle=False):
     """Una pasada de `proponer` sobre un contexto (#115): los repos con
     slug y gate —sin gate no hay frontera, y no hay contra qué proponer
     trabajo—. Devuelve el resumen en una línea, para que el bucle lo
@@ -1511,8 +1572,14 @@ def _proponer_ctx(args, ctx, log):
     for r in crudo["contexts"][0]["repos"]:
         if not r.get("slug") or not r.get("exists", {}).get("gate"):
             continue
+        # #175: desde el bucle, el freno y la hora límite de la noche valen
+        # también para el generador y el juez (y el corte a hasta + 30).
         spec = DispatchSpec(contexto=ctx.name, kind=GENERADOR["kind"],
-                            model=GENERADOR["model"])
+                            model=GENERADOR["model"],
+                            freno=(getattr(args, "freno", "") or None)
+                            if en_bucle else None,
+                            hasta=_hasta_de(args, ctx, INICIO_CORRIDA,
+                                            noche=True) if en_bucle else None)
         prop = Proponer(spec, log, run_cmd=adapters.run)
         peldano_juez = _peldano_juez_para(args, ctx, log, r["name"])
         res = prop.proponer_repo(r["name"], r["slug"], r.get("path", ""),

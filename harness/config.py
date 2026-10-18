@@ -147,11 +147,17 @@ class RunTopes:
     US$3.00, 12 pasadas con trabajo. `harness run`/`run --loop` los lee de
     acá en cada corrida; un flag de CLI puede acotarla más, pero no
     amplificarla por encima de la config.
+
+    `hasta` (#175): hora límite dura, "HH:MM" en America/Santiago; pasada,
+    no se despacha nada nuevo y a `hasta + 30 min` los agentes vivos se
+    cortan con commit WIP. None = sin hora límite. `--hasta` puede
+    adelantarla, no atrasarla.
     """
 
     budget_minutos: float = 180.0
     piso: float = 3.0
     max_pasadas: int = 12
+    hasta: Optional[str] = None
 
 
 @dataclass
@@ -311,7 +317,7 @@ def _topes(raw, donde):
         return RunTopes()
     raw = _obj(raw, donde + ' → "topes"')
     donde = donde + ' → "topes"'
-    _keys(raw, ("budget_minutos", "piso", "max_pasadas"), donde)
+    _keys(raw, ("budget_minutos", "piso", "max_pasadas", "hasta"), donde)
     kw = {}
     for campo in ("budget_minutos", "piso"):
         if campo in raw:
@@ -328,6 +334,12 @@ def _topes(raw, donde):
                 '{}: "max_pasadas" tiene que ser un entero mayor que '
                 'cero'.format(donde))
         kw["max_pasadas"] = v
+    if "hasta" in raw:
+        h = _str(raw["hasta"], '"hasta"', donde)
+        if not re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", h):
+            raise ConfigError('{}: "hasta" tiene que ser HH:MM (24 h, '
+                              'America/Santiago), p.ej. "07:00"'.format(donde))
+        kw["hasta"] = h
     return RunTopes(**kw)
 
 
