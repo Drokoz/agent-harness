@@ -320,3 +320,27 @@ class TestDoctorCli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBucle(unittest.TestCase):
+    """El umbral de ceremonia del bucle (#141): K intentos sin progreso,
+    declarado en el repo junto al routing, con default razonable."""
+
+    def test_default_de_seis(self):
+        self.assertEqual(routing.bucle_de({"provider": "openrouter"}), 6)
+
+    def test_declarado_en_el_repo(self):
+        decl = {"provider": "openrouter", "bucle": {"intentos_sin_progreso": 4}}
+        self.assertEqual(routing.bucle_de(decl), 4)
+
+    def test_el_repo_real_declara_un_k(self):
+        decl = routing.cargar_declaracion()
+        self.assertIsNotNone(decl, "el repo trae routing.json")
+        self.assertGreaterEqual(routing.bucle_de(decl), 1)
+
+    def test_un_k_no_valido_ca_al_default(self):
+        for mal in ({"bucle": {"intentos_sin_progreso": 0}},
+                    {"bucle": {"intentos_sin_progreso": "seis"}},
+                    {"bucle": "seis"}):
+            with self.subTest(mal=mal):
+                self.assertEqual(routing.bucle_de({"bucle": mal}), 6)
