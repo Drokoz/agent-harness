@@ -1100,5 +1100,17 @@ class TestCacheDeCuota(unittest.TestCase):
         self.assertEqual(self.lecturas, 2)
 
 
+# ------------------------------- #159 revisión 3: la fuente real en el log
+class TestFuenteEnElEstado(unittest.TestCase):
+    def test_un_dato_de_la_statusline_no_se_anota_como_usage(self):
+        sl = Usage(Bucket("Current session", 22, AHORA, "statusline", AHORA),
+                   Bucket(HEADER_SEMANA_T, 6, AHORA, "statusline", AHORA))
+        notas = []
+        c = Cuota(leer_usage=lambda: sl, estimar=lambda: None, politica=POL,
+                  ahora=lambda: AHORA, anotar=notas.append)
+        self.assertEqual(c.estado().fuente, "statusline")
+        self.assertTrue(notas[0].startswith("statusline:"), notas)
+
+
 if __name__ == "__main__":
     unittest.main()
