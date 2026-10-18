@@ -90,7 +90,7 @@ def _resumen(r, c, out):
         out(f"   ceremonia de la corrida: {intentos} intento(s) / "
             f"{prog} progreso(s) (ratio {ratio:.1f}) · "
             f"{round(cer.get('minutos') or 0)} min · "
-            f"US${cer.get('usd') or 0:.2f} desde el último progreso")
+            f"US${cer.get('usd') or 0:.2f} en la corrida")
     if not r.paso_algo:
         out(f"   {c.dim}no pasó nada{c.off}")
         return

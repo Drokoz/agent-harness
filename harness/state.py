@@ -566,7 +566,16 @@ def _ceremonia_de(seccion, por_run):
             a, b = por_run.get(run, (dt, dt))
             por_run[run] = (min(a, dt), max(b, dt))
         if tipo == "agente":
-            runs.add(e.get("run_id") or _SIN_RUN)
+            # Un intento es (ticket, attempt), no la pasada: el run_id es de
+            # la pasada entera y lleva hasta --max tickets. El mantenedor
+            # (`repo#prN`) no escribe línea `pr` al destrabar un PR, así que
+            # no cuenta como ceremonia (revisión de #161).
+            ticket = str(e.get("ticket") or "")
+            if not re.search(r"#pr\d+$", ticket):
+                # Sin `attempt` (líneas viejas), la pasada lo distingue.
+                n = e.get("attempt")
+                runs.add((ticket, n if n is not None
+                          else (e.get("run_id") or _SIN_RUN)))
         elif tipo == "costo":
             m = COSTO_JOB_RE.match(str(e.get("cuerpo", "")).strip())
             if m:
@@ -586,8 +595,8 @@ def ceremonia(eventos, desde=None):
     adelante: la regla de #139, se mide sobre ESTA corrida (desde el
     arranque del proceso), nunca sobre el log entero. Un `desde` que no
     se puede parsear no filtra: sin dato no se puede afirmar que un
-    evento quedó afuera. Un intento es una corrida (`run_id`) con línea
-    `agente`; si el agente no arrancó cuenta igual. Puro.
+    evento quedó afuera. Un intento es un (ticket, attempt) con línea
+    `agente`, sin contar al mantenedor; si el agente no arrancó cuenta igual. Puro.
     """
     corte = parse_fecha(str(desde)) if desde else None
     ventana = []

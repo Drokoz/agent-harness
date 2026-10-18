@@ -733,9 +733,6 @@ class TestCostoPromedio(unittest.TestCase):
         self.assertAlmostEqual(state.costo_promedio(evs), 0.6)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 
 
@@ -756,9 +753,10 @@ class TestCeremonia(unittest.TestCase):
     def intento(self, h, run, ticket="koku#7", fallo=False):
         if fallo:
             return ev("agente", "ticket/7", "fallo: no arranco",
-                      self._ts(h, 0), run_id=run, ticket=ticket)
+                      self._ts(h, 0), run_id=run, ticket=ticket, attempt=h)
+        # Cada reintento sube `attempt`, como lo numera el dispatcher.
         return ev("agente", "ticket/7", "koku-7 (kind pi, pane w9:p1)",
-                  self._ts(h, 0), run_id=run, ticket=ticket)
+                  self._ts(h, 0), run_id=run, ticket=ticket, attempt=h)
 
     def bloque(self, h, run):
         """Un intento que termina en abandono: arranca, gate rojo, costo,
@@ -820,3 +818,22 @@ class TestCeremonia(unittest.TestCase):
         c = state.ceremonia(self.noche_6_7(), desde="2026-09-09T00:00:00Z")
         self.assertEqual((c.intentos, c.progresos), (0, 0))
         self.assertEqual(c.ratio, 0.0)
+
+    def test_un_intento_es_ticket_e_intento_no_la_pasada(self):
+        """En producción el run_id es de la pasada entera (hasta --max
+        tickets): dos agentes en la misma pasada son dos intentos."""
+        evs = [self.intento(1, "p1", ticket="koku#7"),
+               self.intento(1, "p1", ticket="koku#8")]
+        self.assertEqual(state.ceremonia(evs).intentos, 2)
+
+    def test_el_mantenedor_no_es_ceremonia(self):
+        """Resolver conflictos de un PR (ticket `repo#prN`) no escribe
+        línea `pr`: si contara como ceremonia, una noche que destraba PRs
+        se cortaría sola."""
+        evs = [self.intento(1, "p1", ticket="koku#pr5"),
+               self.intento(2, "p2", ticket="koku#pr6")]
+        self.assertEqual(state.ceremonia(evs).intentos, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
