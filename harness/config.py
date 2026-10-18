@@ -44,7 +44,7 @@ PROVIDERS = ("openrouter", "manual", "none")
 RUNNERS = ("local", "ssh")
 
 CONTEXT_KEYS = ("tracker", "repos", "autonomy", "budget", "vault", "run",
-                "quota")
+                "quota", "topes")
 
 
 class ConfigError(Exception):
@@ -135,6 +135,26 @@ class Run:
 
 
 @dataclass
+class RunTopes:
+    """Los topes de la corrida, declarados en la config (#166).
+
+    `budget_minutos` es el presupuesto de reloj por ticket (minutos de
+    agente acumulados en el historial de la noche); `piso` y `max_pasadas`
+    son los topes del bucle de `run --loop` (crédito restante y pasadas
+    con trabajo).
+
+    Sin declarar, los defaults documentados: 180 min por ticket, piso
+    US$3.00, 12 pasadas con trabajo. `harness run`/`run --loop` los lee de
+    acá en cada corrida; un flag de CLI puede acotarla más, pero no
+    amplificarla por encima de la config.
+    """
+
+    budget_minutos: float = 180.0
+    piso: float = 3.0
+    max_pasadas: int = 12
+
+
+@dataclass
 class Context:
     name: str
     tracker: Tracker
@@ -144,6 +164,7 @@ class Context:
     run: Run
     vault: Optional[str] = None
     quota: QuotaSpec = field(default_factory=QuotaSpec)
+    topes: RunTopes = field(default_factory=RunTopes)
 
 
 @dataclass
@@ -281,6 +302,33 @@ def _run(raw, donde):
     return Run(kind=kind, host=host)
 
 
+def _topes(raw, donde):
+    """Opcional: los topes de la corrida (#166). Sin la sección, los
+    defaults de `RunTopes`, documentados ahí."""
+    if raw is None:
+        return RunTopes()
+    raw = _obj(raw, donde + ' → "topes"')
+    donde = donde + ' → "topes"'
+    _keys(raw, ("budget_minutos", "piso", "max_pasadas"), donde)
+    kw = {}
+    for campo in ("budget_minutos", "piso"):
+        if campo in raw:
+            v = _num(raw[campo], '"{}"'.format(campo), donde)
+            if v < 0:
+                raise ConfigError(
+                    '{}: "{}" tiene que ser mayor o igual que cero'.format(
+                        donde, campo))
+            kw[campo] = v
+    if "max_pasadas" in raw:
+        v = raw["max_pasadas"]
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            raise ConfigError(
+                '{}: "max_pasadas" tiene que ser un entero mayor que '
+                'cero'.format(donde))
+        kw["max_pasadas"] = v
+    return RunTopes(**kw)
+
+
 def _quota(raw, donde):
     """Opcional: la calibración de `harness quota` (#74) y sus fuentes (#75).
     Sin la sección, sin `tope_semanal`, o `quota` vacío: sin tope — la tabla
@@ -378,6 +426,7 @@ def _context(name, raw):
         run=_run(_required(raw, "run", donde), donde),
         vault=vault,
         quota=_quota(raw.get("quota"), donde),
+        topes=_topes(raw.get("topes"), donde),
     )
 
 

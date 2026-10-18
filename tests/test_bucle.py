@@ -19,6 +19,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest import mock
@@ -910,6 +911,314 @@ class LaLineaViva(unittest.TestCase):
             self.assertTrue(parte.endswith("\n"),
                             "log redirigido: sin caracteres de control")
             self.assertNotIn("\r", parte)
+
+
+class LosTopesVienenDeLaConfig(unittest.TestCase):
+    """#166: los topes de la corrida (presupuesto de reloj por ticket, piso
+    de créditos, topes del bucle) se declaran en `topes` de la config y se
+    releen en cada corrida: la CLI puede acotarlos más, no amplificarlos.
+    Se corre la `run_main` real con el mundo de mentira."""
+
+    def _cfg(self, topes=None, provider="none"):
+        context = {"tracker": {"kind": "github"},
+                   "repos": {"root": "~/repos", "paths": ["agent-harness"]},
+                   "autonomy": "frontier",
+                   "budget": {"polarity": "remaining", "provider": provider},
+                   "run": {"kind": "local"}}
+        if topes is not None:
+            context["topes"] = topes
+        return json.dumps({"default_context": "h", "contexts": {"h": context}})
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        self.log_path = self.d / "events.jsonl"
+        self.freno = self.d / "freno"
+        self.d.joinpath("repos", "agent-harness").mkdir(parents=True)
+        loader = SourceFileLoader("harness_cli_topes", str(HARNESS))
+        spec = importlib.util.spec_from_loader("harness_cli_topes", loader)
+        self.cli = importlib.util.module_from_spec(spec)
+        loader.exec_module(self.cli)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _raw(self, issues):
+        return {
+            "offline": False,
+            "agents": [],
+            "contexts": [{
+                "name": "h", "tracker": "github", "autonomy": "frontier",
+                "vault": None, "run": "local",
+                "budget": {"polarity": "remaining", "provider": "openrouter",
+                           "credits": None, "total": 0.0, "used": 0.0},
+                "repos": [{
+                    "name": "agent-harness", "tracker": "github",
+                    "slug": "Drokoz/agent-harness", "branch": "main",
+                    "default_branch": "main",
+                    "readiness_source": "default-branch",
+                    "status_porcelain": "",
+                    "path": str(self.d / "repos" / "agent-harness"),
+                    "exists": {"gate": True, "skills": True, "context": True},
+                    "issues": issues, "prs": [], "prs_merged": [],
+                    "closed_count": 0,
+                }],
+            }],
+        }
+
+    def _sembrar_minutos(self, ticket="agent-harness#7", minutos=60.0):
+        """Una ventana de agente de `minutos` para el ticket en el log de
+        eventos, dentro de ESTA noche (recién despachado): el presupuesto
+        de reloj lo ve."""
+        fin = datetime.now(timezone.utc) + timedelta(hours=1)
+        ini = fin - timedelta(minutes=minutos)
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        lineas = []
+        for offset in (ini, ini + timedelta(seconds=1),
+                       fin - timedelta(seconds=1), fin):
+            lineas.append(json.dumps({
+                "timestamp": offset.strftime(fmt),
+                "contexto": "h", "origen": "harness", "run_id": "r1",
+                "ticket": ticket, "attempt": 1, "tipo": "worktree",
+                "ref": "ticket/7",
+                "cuerpo": "worktree creado"}))
+        self.log_path.write_text("\n".join(lineas) + "\n")
+
+    def test_run_solo_respeta_el_topes_de_la_config_sin_cli(self):
+        """Una corrida respeta `topes.budget_minutos` aunque el arranque no
+        lo pida en la CLI: un ticket que agotó los 60 min de la config se
+        queda fuera, con el tope de la config en el motivo."""
+        self.d.joinpath("config.json").write_text(
+            self._cfg(topes={"budget_minutos": 60}))
+        self._sembrar_minutos(minutos=60.0)
+        args = self.cli.build_parser().parse_args([
+            "run", "--context", "h", "--log", str(self.log_path)])
+        mundo = Mundo(prs=[])
+        with mock.patch.object(self.cli, "OFFLINE", False), \
+             mock.patch.object(self.cli, "collect",
+                               return_value=self._raw([
+                                   {"number": 7, "title": "ticket 7",
+                                    "labels": [{"name": "ready-for-agent"}],
+                                    "body": ""}])), \
+             mock.patch.object(self.cli.adapters, "run", mundo.cmd), \
+             mock.patch.object(self.cli, "_creditos_usado", return_value=None), \
+             mock.patch.object(self.cli, "_creditos_restantes",
+                               return_value=None), \
+             mock.patch.object(self.cli, "_sesiones_de_pi",
+                               return_value=(lambda *a: None,
+                                             lambda *a: None)), \
+             mock.patch.dict(os.environ, {"HERDR_ENV": "1",
+                                          "HOME": str(self.d),
+                                          "HARNESS_CONFIG_DIR": str(self.d)}), \
+             mock.patch("time.sleep"):
+            contextos = self.cli.load_config().select("h")
+            salida = io.StringIO()
+            with mock.patch("sys.stdout", new=salida):
+                code = self.cli.run_main(args, contextos)
+        texto = salida.getvalue()
+        eventos = leer_log(self.log_path)
+        self.assertEqual(code, 0)
+        self.assertIn("presupuesto de reloj", texto)
+        self.assertIn("tope 60 min", texto, "el tope es el de la config, no 180")
+        fuera = [e for e in eventos if e["tipo"] == "fuera"
+                 and e.get("ticket") == "agent-harness#7"]
+        self.assertEqual(len(fuera), 1)
+        self.assertIn("tope 60 min", fuera[0]["cuerpo"])
+        despachados = [e for e in eventos
+                       if e.get("ticket") == "agent-harness#7"
+                       and e.get("run_id") != "r1"
+                       and e["tipo"] in ("worktree", "pane", "agente",
+                                         "prompt")]
+        self.assertEqual(despachados, [],
+                         "un ticket fuera por presupuesto no se despacha")
+
+    def test_run_solo_sin_topes_en_config_usa_el_default(self):
+        """Sin `topes` en la config, el default documentado (180): un
+        ticket de 60 min entra."""
+        self.d.joinpath("config.json").write_text(self._cfg())
+        self._sembrar_minutos(minutos=60.0)
+        args = self.cli.build_parser().parse_args([
+            "run", "--context", "h", "--log", str(self.log_path)])
+        mundo = Mundo(prs=[])
+        with mock.patch.object(self.cli, "OFFLINE", False), \
+             mock.patch.object(self.cli, "collect",
+                               return_value=self._raw([
+                                   {"number": 7, "title": "ticket 7",
+                                    "labels": [{"name": "ready-for-agent"}],
+                                    "body": ""}])), \
+             mock.patch.object(self.cli.adapters, "run", mundo.cmd), \
+             mock.patch.object(self.cli, "_creditos_usado", return_value=None), \
+             mock.patch.object(self.cli, "_creditos_restantes",
+                               return_value=None), \
+             mock.patch.object(self.cli, "_sesiones_de_pi",
+                               return_value=(lambda *a: None,
+                                             lambda *a: None)), \
+             mock.patch.dict(os.environ, {"HERDR_ENV": "1",
+                                          "HOME": str(self.d),
+                                          "HARNESS_CONFIG_DIR": str(self.d)}), \
+             mock.patch("time.sleep"):
+            contextos = self.cli.load_config().select("h")
+            salida = io.StringIO()
+            with mock.patch("sys.stdout", new=salida):
+                code = self.cli.run_main(args, contextos)
+        eventos = leer_log(self.log_path)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [e for e in eventos if e["tipo"] == "fuera"],
+            [], "60 min de 180: el ticket entra")
+        self.assertTrue(any(e["tipo"] == "agente"
+                            and e.get("ticket") == "agent-harness#7"
+                            for e in eventos),
+                        "el ticket se despachó")
+
+    def test_bucle_respeta_el_topes_de_la_config_sin_cli(self):
+        """El bucle respeta `topes.max_pasadas` de la config aunque el
+        arranque no pida --max-pasadas: corta a la 2, no a la 12."""
+        self.d.joinpath("config.json").write_text(
+            self._cfg(topes={"max_pasadas": 2}))
+        args = self.cli.build_parser().parse_args([
+            "run", "--context", "h", "--loop", "--log", str(self.log_path),
+            "--freno", str(self.freno), "--sin-proponer"])
+        mundo = Mundo(prs=[])
+        vistas = []
+
+        def collect_mock(contextos):
+            vistas.append(contextos)
+            return self._raw([
+                {"number": 7, "title": "ticket 7",
+                 "labels": [{"name": "ready-for-agent"}], "body": ""}])
+
+        with mock.patch.object(self.cli, "OFFLINE", False), \
+             mock.patch.object(self.cli, "collect", side_effect=collect_mock), \
+             mock.patch.object(self.cli.adapters, "run", mundo.cmd), \
+             mock.patch.object(self.cli, "_creditos_usado", return_value=None), \
+             mock.patch.object(self.cli, "_creditos_restantes",
+                               return_value=99.0), \
+             mock.patch.object(self.cli, "_sesiones_de_pi",
+                               return_value=(lambda *a: None,
+                                             lambda *a: None)), \
+             mock.patch.dict(os.environ, {"HERDR_ENV": "1",
+                                          "HOME": str(self.d),
+                                          "HARNESS_CONFIG_DIR": str(self.d)}), \
+             mock.patch("time.sleep"):
+            contextos = self.cli.load_config().select("h")
+            salida = io.StringIO()
+            with mock.patch("sys.stdout", new=salida):
+                code = self.cli.run_main(args, contextos)
+        eventos = leer_log(self.log_path)
+        por_pasada = [e for e in eventos if e["tipo"] == "pasada"]
+        self.assertEqual(len(por_pasada), 2,
+                         "el tope de la config corta a la 2, no a la 12")
+        fin = [e for e in eventos if e["tipo"] == "bucle"][-1]
+        self.assertIn("corte: tope de 2 pasadas", fin["cuerpo"])
+        self.assertEqual(code, 0)
+
+    def test_el_piso_del_flag_solo_puede_subir(self):
+        """El piso corta cuando el crédito baja de él: uno MÁS BAJO es más
+        permisivo. `--piso 0` no puede apagar el piso de la config (sería
+        amplificar, lo que #166 prohíbe); `--piso 10` sí lo endurece."""
+        from types import SimpleNamespace as NS
+        ctx = NS(topes=NS(piso=3.0, max_pasadas=12))
+        for flag, esperado in ((None, 3.0), (0.0, 3.0), (10.0, 10.0)):
+            with self.subTest(flag=flag):
+                piso, _ = self.cli._topes_bucle(
+                    NS(piso=flag, max_pasadas=None), ctx)
+                self.assertEqual(piso, esperado)
+
+    def test_el_flag_puede_acotar_mas_no_amplificar(self):
+        """La CLI puede ACOTAR el tope de la config, no amplificarlo:
+        config 3, --max-pasadas 1 -> corta a la 1; --max-pasadas 9999 ->
+        corta a la 3 de la config, igual que sin flag."""
+        for flag, corte_esperado in ((["--max-pasadas", "1"],
+                                     "tope de 1 pasadas"),
+                                    (["--max-pasadas", "9999"],
+                                     "tope de 3 pasadas"),
+                                    ([], "tope de 3 pasadas")):
+            with self.subTest(flag=flag):
+                self.d.joinpath("config.json").write_text(
+                    self._cfg(topes={"max_pasadas": 3}))
+                self.log_path.write_text("")
+                args = self.cli.build_parser().parse_args([
+                    "run", "--context", "h", "--loop",
+                    "--log", str(self.log_path),
+                    "--freno", str(self.freno), "--sin-proponer", *flag])
+                mundo = Mundo(prs=[])
+
+                def collect_mock(contextos):
+                    return self._raw([
+                        {"number": 7, "title": "ticket 7",
+                         "labels": [{"name": "ready-for-agent"}],
+                         "body": ""}])
+
+                with mock.patch.object(self.cli, "OFFLINE", False), \
+                     mock.patch.object(self.cli, "collect",
+                                       side_effect=collect_mock), \
+                     mock.patch.object(self.cli.adapters, "run", mundo.cmd), \
+                     mock.patch.object(self.cli, "_creditos_usado",
+                                       return_value=None), \
+                     mock.patch.object(self.cli, "_creditos_restantes",
+                                       return_value=99.0), \
+                     mock.patch.object(self.cli, "_sesiones_de_pi",
+                                       return_value=(lambda *a: None,
+                                                     lambda *a: None)), \
+                     mock.patch.dict(os.environ, {"HERDR_ENV": "1",
+                                                  "HOME": str(self.d),
+                                                  "HARNESS_CONFIG_DIR":
+                                                      str(self.d)}), \
+                     mock.patch("time.sleep"):
+                    contextos = self.cli.load_config().select("h")
+                    salida = io.StringIO()
+                    with mock.patch("sys.stdout", new=salida):
+                        code = self.cli.run_main(args, contextos)
+                eventos = leer_log(self.log_path)
+                self.assertEqual(
+                    len([e for e in eventos if e["tipo"] == "pasada"]),
+                    int(corte_esperado.split()[2]),
+                    "{flag}: el tope rige el de la config".format(flag=flag))
+                fin = [e for e in eventos if e["tipo"] == "bucle"][-1]
+                self.assertIn(corte_esperado, fin["cuerpo"])
+                self.assertEqual(code, 0)
+
+    def test_el_piso_de_la_config_corta_el_bucle(self):
+        """`topes.piso` corta el bucle como antes cortaba --piso: el crédito
+        cae por debajo del piso de la config entre pasadas."""
+        self.d.joinpath("config.json").write_text(
+            self._cfg(topes={"piso": 5.0}, provider="openrouter"))
+        args = self.cli.build_parser().parse_args([
+            "run", "--context", "h", "--loop", "--log", str(self.log_path),
+            "--freno", str(self.freno), "--sin-proponer", "--max-pasadas",
+            "9"])
+        mundo = Mundo(prs=[])
+        creditos = iter([99.0, 4.5, 4.5])
+
+        def collect_mock(contextos):
+            return self._raw([
+                {"number": 7, "title": "ticket 7",
+                 "labels": [{"name": "ready-for-agent"}], "body": ""}])
+
+        with mock.patch.object(self.cli, "OFFLINE", False), \
+             mock.patch.object(self.cli, "collect", side_effect=collect_mock), \
+             mock.patch.object(self.cli.adapters, "run", mundo.cmd), \
+             mock.patch.object(self.cli, "_creditos_usado", return_value=None), \
+             mock.patch.object(self.cli, "_creditos_restantes",
+                               side_effect=lambda: next(creditos)), \
+             mock.patch.object(self.cli, "_sesiones_de_pi",
+                               return_value=(lambda *a: None,
+                                             lambda *a: None)), \
+             mock.patch.dict(os.environ, {"HERDR_ENV": "1",
+                                          "HOME": str(self.d),
+                                          "HARNESS_CONFIG_DIR": str(self.d)}), \
+             mock.patch("time.sleep"):
+            contextos = self.cli.load_config().select("h")
+            salida = io.StringIO()
+            with mock.patch("sys.stdout", new=salida):
+                code = self.cli.run_main(args, contextos)
+        eventos = leer_log(self.log_path)
+        self.assertEqual(
+            len([e for e in eventos if e["tipo"] == "pasada"]), 1)
+        fin = [e for e in eventos if e["tipo"] == "bucle"][-1]
+        self.assertIn("piso de US$5.00", fin["cuerpo"])
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":

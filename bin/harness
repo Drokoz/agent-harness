@@ -309,12 +309,16 @@ def build_parser():
     p.add_argument("--freno", default="",
                    help="run --loop: archivo que, si aparece, frena el bucle; "
                         "se atiende entre pasadas, nunca en medio de una")
-    p.add_argument("--piso", type=float, default=3.0,
+    p.add_argument("--piso", type=float, default=None,
                    help="run --loop: no arranca otra pasada con menos de este "
-                        "crédito restante (US$, por defecto 3.00)")
-    p.add_argument("--max-pasadas", type=int, default=12, dest="max_pasadas",
+                        "crédito restante (US$, por defecto el de "
+                        "topes.piso en config, 3.00 sin declarar); puede "
+                        "acotarlo más, no amplificarlo (#166)")
+    p.add_argument("--max-pasadas", type=int, default=None, dest="max_pasadas",
                    help="run --loop: tope duro de pasadas con trabajo "
-                        "(por defecto 12); nunca un bucle sin límite")
+                        "(por defecto el de topes.max_pasadas en config, 12 "
+                        "sin declarar); puede acotarlo más, no amplificarlo "
+                        "(#166); nunca un bucle sin límite")
     p.add_argument("--projects", default="",
                    help="quota: carpeta(s) de sesiones separadas por coma "
                         "(por defecto ~/.claude/projects de este usuario, o la "
@@ -945,7 +949,8 @@ def run_main(args, contexts, solo=None):
         cuota = _cuota_de(args, ctx, log)
         spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
                             kind=args.kind, model=args.model,
-                            permitir_claude=cuota.permitir_claude)
+                            permitir_claude=cuota.permitir_claude,
+                            budget_minutos=ctx.topes.budget_minutos)
         costo_de_pi, salida_de_pi = _sesiones_de_pi()
         disp = Dispatcher(spec, log, run_cmd=adapters.run,
                           credits=_creditos_usado
@@ -1133,7 +1138,8 @@ def _una_pasada(args, ctx, log):
     cuota = _cuota_de(args, ctx, log)
     spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
                         kind=args.kind, model=args.model,
-                        permitir_claude=cuota.permitir_claude)
+                        permitir_claude=cuota.permitir_claude,
+                        budget_minutos=ctx.topes.budget_minutos)
     costo_de_pi, salida_de_pi = _sesiones_de_pi()
     disp = Dispatcher(spec, log, run_cmd=adapters.run,
                       credits=_creditos_usado
@@ -1259,6 +1265,19 @@ def _armar_vigilar(contextos):
     return vigilar
 
 
+def _topes_bucle(args, ctx):
+    """Los topes del bucle que esta corrida respeta (#166).
+
+    La config (`topes.piso`/`topes.max_pasadas`) declara el tope; un flag de
+    CLI que SÍ se pasó lo puede ACOTAR más, no amplificarlo por encima.
+    Sin config, los defaults de `RunTopes`."""
+    t = ctx.topes
+    piso = t.piso if args.piso is None else max(t.piso, args.piso)
+    max_pasadas = (t.max_pasadas if args.max_pasadas is None
+                   else min(t.max_pasadas, args.max_pasadas))
+    return piso, max_pasadas
+
+
 def _run_loop(args, contexts, log_path):
     """`harness run --loop` (#88): el modo bucle del CLI, en vez del
     `scripts/noche.sh` que hace lo mismo sin tests.
@@ -1306,6 +1325,14 @@ def _run_loop(args, contexts, log_path):
             log.write("corrida", "corrida", corte)
             sys.stdout.write("harness: {}\n".format(corte))
             return Pasada(False, "config ilegible", log=log, corte=corte)
+        # Los topes del bucle también salen de la config relecta (#166).
+        piso_b, max_pasadas_b = _topes_bucle(args, contextos[0])
+        if (piso_b, max_pasadas_b) != (spec.piso, spec.max_pasadas):
+            spec.piso = piso_b
+            spec.max_pasadas = max_pasadas_b
+            log.write("corrida", "corrida",
+                      "topes del bucle relectos de la config: piso US${:.2f}, "
+                      "max_pasadas {}".format(piso_b, max_pasadas_b))
         trabajo, partes, corte = False, [], ""
         for ctx in contextos:
             p = _una_pasada(args, ctx, log)
@@ -1324,7 +1351,11 @@ def _run_loop(args, contexts, log_path):
         log_corriente["log"] = p.log
         return p
 
-    spec = BucleSpec(piso=args.piso, max_pasadas=args.max_pasadas)
+    # El tope del bucle lo declara la config (#166): el arranque toma la
+    # foto de ahora y cada pasada la relee (arriba) para ver el cambio. La
+    # CLI puede acotarlo más, no amplificarlo por encima de la config.
+    piso, max_pasadas = _topes_bucle(args, contexts[0])
+    spec = BucleSpec(piso=piso, max_pasadas=max_pasadas)
     # #114: preguntar barato antes de barrer completo. Sin slug resolvable
     # (o con --sin-vigilar) no existe: cada vuelta barra completo.
     vigilar = None if args.sin_vigila else _armar_vigilar(contexts)
