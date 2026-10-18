@@ -867,13 +867,24 @@ class TestCli(_ResetsFrescos, unittest.TestCase):
 
     def test_con_statusline_fresca_no_abre_pane(self):
         ruta = self.d / "state" / "harness" / "rate_limits.json"
-        ahora = datetime.now(SCL)
+        # El reloj de la corrida es el `AHORA` fijo, no el de la máquina:
+        # el reset de la sesión de la statusline (1:10am del 18 de octubre)
+        # es de mañana para `AHORA` (sábado 17, 20:00), así que el dato
+        # vale. Con el reloj real, pasados los 180 días del reset, el
+        # archivo era "de antes del reset" y el test moría solo.
         self.assertTrue(usage.escribir_rate_limits(
-            dict(STDIN_STATUSLINE), ruta, ahora - timedelta(minutes=2)))
+            dict(STDIN_STATUSLINE), ruta, AHORA - timedelta(minutes=2)))
+
+        class reloj_fijo(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return (AHORA.astimezone(tz) if tz
+                        else AHORA.replace(tzinfo=None))
 
         def no_capturar(*a, **k):
             raise AssertionError("con la statusline fresca no se abre pane")
-        code, out, _ = self.correr(["usage", "--json"], no_capturar)
+        with mock.patch.object(self.cli, "datetime", reloj_fijo):
+            code, out, _ = self.correr(["usage", "--json"], no_capturar)
         self.assertEqual(code, 0)
         data = json.loads(out)
         self.assertEqual(data["fuente"], "statusline")
