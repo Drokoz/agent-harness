@@ -2461,6 +2461,116 @@ class TestRouterSeam(unittest.TestCase):
         self.assertEqual(llamado, [])
 
 
+class TestTopeDeGasto(unittest.TestCase):
+    """#165: el tope de gasto por corrida, en US$. Es un techo, no un piso:
+    se mide lo gastado desde que arrancó el proceso y se consulta antes de
+    despachar cada job que cuesta plata (pi/OpenRouter). Con tope 0 (el
+    default) no sale ningún job pagado; los de Claude (suscripción) no
+    gastan plata y no se tocan."""
+
+    def _despachar(self, m, jobs, tope, **kw):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(dispatch, "CLAUDE_JSON",
+                                   Path(tmp) / "claude.json"):
+                log = log_en(tmp)
+                d = Dispatcher(spec(tope_gasto=tope, **kw), log, m.cmd,
+                               credits=m.credits, dormir=m.dormir)
+                res = d.dispatch(jobs)
+                lineas = [json.loads(l)
+                          for l in log.path.read_text().splitlines()]
+        return res, lineas
+
+    def test_tope_cero_no_despacha_pi_y_si_claude(self):
+        m = Mundo(prs=[{"number": 31, "headRefName": "ticket/7"},
+                       {"number": 32, "headRefName": "ticket/8"}])
+        tope = dispatch.TopeGasto(0.0)
+        pi = job_de_peldano(0, issue=7)
+        claude = job_de_peldano(2, issue=8)
+        res, lineas = self._despachar(m, [pi, claude], tope)
+        por_issue = {j.issue: j for j in res}
+        self.assertEqual(por_issue[7].estado, "pendiente")
+        self.assertIn("tope de gasto", por_issue[7].motivo)
+        self.assertEqual(por_issue[8].estado, "hecho", por_issue[8].motivo)
+        # El pi no prendió nada: ni worktree ni agente.
+        worktrees = [c for c in m.llamo("git", "worktree", "add")
+                     if "ticket/7" in c[0]]
+        self.assertEqual(worktrees, [])
+        (start,) = m.llamo("herdr", "agent", "start")
+        self.assertEqual(start[0][start[0].index("--kind") + 1], "claude")
+        fuera = [l for l in lineas if l["tipo"] == "fuera"]
+        self.assertEqual(len(fuera), 1)
+        self.assertEqual(fuera[0]["ticket"], "koku#7")
+        self.assertIn("tope de gasto", fuera[0]["cuerpo"])
+        # La corrida lo dice en una línea: gastado, tope y cuántos quedaron.
+        corte = [l for l in lineas if l["tipo"] == "corrida"
+                 and "tope de gasto" in l["cuerpo"]]
+        self.assertEqual(len(corte), 1, lineas)
+        self.assertIn("US$0.00", corte[0]["cuerpo"])
+        self.assertIn("1 job(s) pagado(s) sin despachar", corte[0]["cuerpo"])
+
+    def test_gastado_mas_estimado_sobre_el_tope_rechaza_el_job(self):
+        """Tope 5, gastado 4.5 en la corrida (crédito usado 10 -> 14.5),
+        costo medio 0.8: 4.5 + 0.8 > 5, el siguiente pi no sale."""
+        usado = iter([10.0, 14.5, 14.5, 14.5, 14.5])
+        tope = dispatch.TopeGasto(5.0, usado=lambda: next(usado),
+                                  estimado=0.8)
+        m = Mundo()
+        res, lineas = self._despachar(m, [job_de_peldano(0)], tope)
+        self.assertEqual(res[0].estado, "pendiente")
+        self.assertEqual(m.llamo("git", "worktree", "add"), [])
+        self.assertIn("4.50", res[0].motivo)
+        self.assertIn("5.00", res[0].motivo)
+        corte = [l for l in lineas if l["tipo"] == "corrida"
+                 and "tope de gasto" in l["cuerpo"]]
+        self.assertEqual(len(corte), 1)
+        self.assertIn("US$4.50", corte[0]["cuerpo"])
+        self.assertIn("US$5.00", corte[0]["cuerpo"])
+
+    def test_bajo_el_tope_el_job_sale(self):
+        usado = iter([10.0, 11.0, 11.0, 11.0, 11.0, 11.0])
+        tope = dispatch.TopeGasto(5.0, usado=lambda: next(usado),
+                                  estimado=0.8)
+        m = Mundo()
+        res, lineas = self._despachar(m, [job_de_peldano(0)], tope)
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        self.assertFalse(any("tope de gasto" in l["cuerpo"] for l in lineas))
+
+    def test_los_jobs_en_vuelo_cuentan_contra_el_tope(self):
+        """Dos pi en paralelo, tope 1.0, costo medio 0.8 y sin crédito
+        medible: el primero reserva su estimado, el segundo no cabe."""
+        tope = dispatch.TopeGasto(1.0, estimado=0.8)
+        m = Mundo(prs=[{"number": 31, "headRefName": "ticket/7"},
+                       {"number": 32, "headRefName": "ticket/8"}])
+        res, _ = self._despachar(m, [job_de_peldano(0, issue=7),
+                                     job_de_peldano(0, issue=8)], tope)
+        estados = sorted(j.estado for j in res)
+        self.assertEqual(estados, ["hecho", "pendiente"])
+
+    def test_el_gasto_sobrevive_entre_tandas(self):
+        """El tope es de la corrida (el proceso), no de la tanda: lo que
+        gastó una pasada cuenta para la siguiente."""
+        tope = dispatch.TopeGasto(1.0, estimado=0.8)
+        m = Mundo()
+        res1, _ = self._despachar(m, [job_de_peldano(0, issue=7)], tope)
+        self.assertEqual(res1[0].estado, "hecho", res1[0].motivo)
+        res2, _ = self._despachar(Mundo(), [job_de_peldano(0, issue=7)], tope)
+        self.assertEqual(res2[0].estado, "pendiente")
+
+    def test_sin_tope_inyectado_no_hay_regla(self):
+        """El tope lo cablea el CLI desde la config; un Dispatcher sin
+        tope (tests viejos, librería) se comporta como antes."""
+        res, _ = despachar(Mundo(), [job_de_peldano(0)])
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+
+    def test_motivo_puro(self):
+        f = dispatch.motivo_tope_gasto
+        self.assertIn("tope de gasto", f(0.0, 0.0, None))
+        self.assertIn("tope de gasto", f(5.0, 4.5, 0.8))
+        self.assertEqual(f(5.0, 4.0, 0.8), "")
+        self.assertEqual(f(5.0, 0.0, None), "")
+        self.assertIn("tope de gasto", f(5.0, 5.0, None))
+
+
 class TestParkear(unittest.TestCase):
     """Al agotar la escalera (#38): saca `ready-for-agent`, pone
     `ready-for-human` y comenta el motivo de cada intento."""

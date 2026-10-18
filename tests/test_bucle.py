@@ -1263,6 +1263,64 @@ class LosTopesVienenDeLaConfig(unittest.TestCase):
                     NS(piso=flag, max_pasadas=None), ctx)
                 self.assertEqual(piso, esperado)
 
+    def test_max_usd_del_flag_solo_puede_bajar(self):
+        """#165: `--max-usd` puede BAJAR el tope de gasto de la config,
+        nunca subirlo: config 5, --max-usd 2 -> 2; --max-usd 10 -> 5; sin
+        config (0) ningún flag abre la billetera."""
+        from types import SimpleNamespace as NS
+        for config, flag, esperado in ((5.0, None, 5.0), (5.0, 2.0, 2.0),
+                                       (5.0, 10.0, 5.0), (0.0, 3.0, 0.0),
+                                       (0.0, None, 0.0)):
+            with self.subTest(config=config, flag=flag):
+                self.assertEqual(
+                    self.cli._max_usd(NS(max_usd=flag),
+                                      NS(topes=NS(max_usd=config))),
+                    esperado)
+
+    def test_max_usd_parsea_del_cli(self):
+        args = self.cli.build_parser().parse_args(
+            ["run", "--max-usd", "2.5"])
+        self.assertEqual(args.max_usd, 2.5)
+        args = self.cli.build_parser().parse_args(["run"])
+        self.assertIsNone(args.max_usd)
+
+    def test_run_sin_max_usd_no_despacha_pi(self):
+        """Sin `topes.max_usd` (default 0) la corrida no gasta plata: el
+        ticket en el peldaño de pi queda fuera y no prende nada."""
+        self.d.joinpath("config.json").write_text(self._cfg())
+        args = self.cli.build_parser().parse_args([
+            "run", "--context", "h", "--log", str(self.log_path)])
+        mundo = Mundo(prs=[])
+        with mock.patch.object(self.cli, "OFFLINE", False), \
+             mock.patch.object(self.cli, "collect",
+                               return_value=self._raw([
+                                   {"number": 7, "title": "ticket 7",
+                                    "labels": [{"name": "ready-for-agent"}],
+                                    "body": ""}])), \
+             mock.patch.object(self.cli.adapters, "run", mundo.cmd), \
+             mock.patch.object(self.cli, "_creditos_usado", return_value=None), \
+             mock.patch.object(self.cli, "_creditos_restantes",
+                               return_value=None), \
+             mock.patch.object(self.cli, "_sesiones_de_pi",
+                               return_value=(lambda *a: None,
+                                             lambda *a: None)), \
+             mock.patch.dict(os.environ, {"HERDR_ENV": "1",
+                                          "HOME": str(self.d),
+                                          "HARNESS_CONFIG_DIR": str(self.d)}), \
+             mock.patch("time.sleep"):
+            contextos = self.cli.load_config().select("h")
+            salida = io.StringIO()
+            with mock.patch("sys.stdout", new=salida):
+                code = self.cli.run_main(args, contextos)
+        eventos = leer_log(self.log_path)
+        self.assertEqual(code, 0)
+        self.assertFalse(any(e["tipo"] in ("worktree", "agente")
+                             for e in eventos), "pi no se despacha con tope 0")
+        self.assertTrue(any(e["tipo"] == "corrida"
+                            and "tope de gasto" in e["cuerpo"]
+                            for e in eventos))
+        self.assertIn("tope de gasto", salida.getvalue())
+
     def test_el_flag_puede_acotar_mas_no_amplificar(self):
         """La CLI puede ACOTAR el tope de la config, no amplificarlo:
         config 3, --max-pasadas 1 -> corta a la 1; --max-pasadas 9999 ->
