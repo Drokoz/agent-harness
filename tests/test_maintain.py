@@ -506,7 +506,8 @@ class TestCliMaintain(unittest.TestCase):
                         "repos": {"root": "/repos", "paths": ["koku"]},
                         "autonomy": "frontier",
                         "budget": {"polarity": "remaining", "provider": "none"},
-                        "run": {"kind": "local"}},
+                        "run": {"kind": "local"},
+                        "topes": {"max_usd": 50}},  # #165: autoriza gasto
             "manual-ctx": {"tracker": {"kind": "github"},
                            "repos": {"root": "/no/existe", "paths": []},
                            "autonomy": "manual",

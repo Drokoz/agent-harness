@@ -323,6 +323,28 @@ class TestTopes(unittest.TestCase):
         with self.assertRaises(ConfigError):
             parse_config(conf(personal=ctx(topes=[1, 2])))
 
+    def test_max_usd_por_defecto_es_cero(self):
+        """#165: sin declarar, la corrida no autoriza gastar plata."""
+        t = parse_config(conf(personal=ctx())).contexts[0].topes
+        self.assertEqual(t.max_usd, 0.0)
+        self.assertEqual(RunTopes().max_usd, 0.0)
+
+    def test_max_usd_se_declara_en_config(self):
+        t = parse_config(conf(personal=ctx(topes={"max_usd": 5}))).contexts[0].topes
+        self.assertEqual(t.max_usd, 5.0)
+
+    def test_max_usd_no_finito_es_error(self):
+        for v in (float("nan"), float("inf")):
+            with self.subTest(v=v):
+                with self.assertRaises(ConfigError) as e:
+                    parse_config(conf(personal=ctx(topes={"max_usd": v})))
+                self.assertIn('"max_usd"', str(e.exception))
+
+    def test_max_usd_negativo_es_error(self):
+        with self.assertRaises(ConfigError) as e:
+            parse_config(conf(personal=ctx(topes={"max_usd": -1})))
+        self.assertIn('"max_usd"', str(e.exception))
+
     def test_piso_negativo_es_error(self):
         with self.assertRaises(ConfigError) as e:
             parse_config(conf(personal=ctx(topes={"piso": -1})))

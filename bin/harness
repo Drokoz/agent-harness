@@ -179,6 +179,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -201,7 +202,8 @@ from harness import doctor as doctor_mod  # noqa: E402
 from harness import routing as routing_mod  # noqa: E402
 from harness.decisions import (as_list, decisions_for, render_decisions)  # noqa: E402
 from harness.dispatch import (BucleSpec, DispatchSpec, Dispatcher, EventLog,  # noqa: E402
-                              Job, Pasada, bucle, cosechar, decidir_tanda,
+                              Job, Pasada, TopeGasto, bucle, cosechar,
+                              decidir_tanda,
                               motivo_presupuesto_reloj, peldano_de,
                               skills_de, transcripcion_path)
 from harness.dispatch import resolver_hasta  # noqa: E402
@@ -353,6 +355,12 @@ def build_parser():
                         "crédito restante (US$, por defecto el de "
                         "topes.piso en config, 3.00 sin declarar); puede "
                         "acotarlo más, no amplificarlo (#166)")
+    p.add_argument("--max-usd", type=float, default=None, dest="max_usd",
+                   help="run/maintain/proponer: tope de gasto de la corrida en "
+                        "US$ (jobs de pi/OpenRouter; Claude no gasta plata). "
+                        "Por defecto el de topes.max_usd en config, 0 sin "
+                        "declarar: sin monto explícito no se gasta plata. "
+                        "Puede bajarlo, nunca subirlo (#165)")
     p.add_argument("--max-pasadas", type=int, default=None, dest="max_pasadas",
                    help="run --loop: tope duro de pasadas con trabajo "
                         "(por defecto el de topes.max_pasadas en config, 12 "
@@ -446,6 +454,8 @@ def main(argv=None):
         return quota_main(args, contexts)
     if args.command == "usage":
         return usage_main(args, contexts)
+    if _validar_max_usd(args):
+        return 2
     if args.command == "run":
         try:
             solo = _solo_de(args.only)
@@ -1019,7 +1029,9 @@ def run_main(args, contexts, solo=None):
                             kind=args.kind, model=args.model,
                             permitir_claude=cuota.permitir_claude,
                             budget_minutos=ctx.topes.budget_minutos,
-                            hasta=_hasta_de(args, ctx, INICIO_CORRIDA))
+                            hasta=_hasta_de(args, ctx, INICIO_CORRIDA),
+                            tope_gasto=_tope_gasto(args, ctx, log,
+                                                   eventos_previos))
         costo_de_pi, salida_de_pi = _sesiones_de_pi()
         disp = Dispatcher(spec, log, run_cmd=adapters.run,
                           credits=_creditos_usado
@@ -1161,10 +1173,7 @@ def run_main(args, contexts, solo=None):
                 ctx.name, extra))
             continue
         resultados = disp.dispatch(jobs)
-        for j in resultados:
-            estado = "OK       " if j.estado == "hecho" else "ABANDONADO"
-            detalle = j.motivo if j.estado != "hecho" else "PR abierto (gate verde)"
-            sys.stdout.write("  {} #{}/{} {}\n".format(estado, j.issue, j.repo, detalle))
+        _imprimir_resultados(resultados)
         sys.stdout.write("harness: log de eventos {}\n".format(log.path))
     return 0
 
@@ -1213,7 +1222,9 @@ def _una_pasada(args, ctx, log):
                         permitir_claude=cuota.permitir_claude,
                         budget_minutos=ctx.topes.budget_minutos,
                         freno=getattr(args, "freno", "") or None,
-                        hasta=_hasta_de(args, ctx, INICIO_CORRIDA, noche=True))
+                        hasta=_hasta_de(args, ctx, INICIO_CORRIDA, noche=True),
+                        tope_gasto=_tope_gasto(args, ctx, log,
+                                               eventos_previos))
     costo_de_pi, salida_de_pi = _sesiones_de_pi()
     disp = Dispatcher(spec, log, run_cmd=adapters.run,
                       credits=_creditos_usado
@@ -1289,11 +1300,16 @@ def _una_pasada(args, ctx, log):
         return Pasada(False, "nada en la frontera{}".format(extra), log=log,
                       corte=corte)
     resultados = disp.dispatch(jobs)
-    for j in resultados:
-        estado = "OK       " if j.estado == "hecho" else "ABANDONADO"
-        detalle = j.motivo if j.estado != "hecho" else "PR abierto (gate verde)"
-        sys.stdout.write("  {} #{}/{} {}\n".format(estado, j.issue, j.repo, detalle))
+    _imprimir_resultados(resultados)
     sys.stdout.write("harness: log de eventos {}\n".format(log.path))
+    # #165: una pasada en que el tope de gasto no dejó salir nada no es
+    # trabajo: el bucle la cuenta como vacía y espera, no gasta pasadas.
+    salieron = [j for j in resultados
+                if not (j.estado == "pendiente"
+                        and j.motivo.startswith("tope de gasto"))]
+    if not salieron:
+        return Pasada(False, "tope de gasto: {} job(s) sin despachar".format(
+            len(jobs)), log=log, corte=corte)
     return Pasada(True, "{} job(s)".format(len(jobs)), log=log, corte=corte)
 
 
@@ -1350,6 +1366,65 @@ def _topes_bucle(args, ctx):
     max_pasadas = (t.max_pasadas if args.max_pasadas is None
                    else min(t.max_pasadas, args.max_pasadas))
     return piso, max_pasadas
+
+
+def _validar_max_usd(args):
+    """2 si `--max-usd` no es un número finito >= 0 (NaN cierra, #165)."""
+    v = getattr(args, "max_usd", None)
+    if v is not None and not (v >= 0 and math.isfinite(v)):
+        sys.stderr.write("harness: --max-usd tiene que ser un número finito "
+                         ">= 0\n")
+        return 2
+    return 0
+
+
+def _max_usd(args, ctx):
+    """El tope de gasto de la corrida (#165): el de `topes.max_usd` en la
+    config (0 sin declarar); `--max-usd` lo puede BAJAR, nunca subir."""
+    t = ctx.topes.max_usd
+    flag = getattr(args, "max_usd", None)
+    return t if flag is None else min(t, flag)
+
+
+# Un TopeGasto por contexto y por proceso (#165): lo gastado se mide desde
+# que arrancó la corrida, no desde cada tanda o pasada.
+TOPES_GASTO = {}
+
+
+def _tope_gasto(args, ctx, log, eventos):
+    """El `TopeGasto` de la corrida para `ctx`, con el tope y el costo medio
+    al día (la config se relee en cada pasada, #163). La primera llamada
+    del proceso lee el crédito usado de OpenRouter: desde ahí se mide."""
+    tope = TOPES_GASTO.get(ctx.name)
+    if tope is None:
+        tope = TopeGasto(_max_usd(args, ctx),
+                         usado=(_creditos_usado
+                                if ctx.budget.provider == "openrouter"
+                                else None))
+        TOPES_GASTO[ctx.name] = tope
+    tope.max_usd = _max_usd(args, ctx)
+    tope.estimado = costo_promedio([e for e in eventos
+                                    if e.get("contexto") == ctx.name])
+    if log is not None:
+        log.write("corrida", "corrida",
+                  "tope de gasto: US${:.2f} de la corrida, gastado US${:.2f}, "
+                  "costo medio {}".format(
+                      tope.max_usd, tope.gastado(),
+                      "US${:.2f}".format(tope.estimado)
+                      if tope.estimado is not None else "sin historial"))
+    return tope
+
+
+def _imprimir_resultados(resultados):
+    for j in resultados:
+        if j.estado == "hecho":
+            estado, detalle = "OK       ", "PR abierto (gate verde)"
+        elif j.estado == "pendiente" and j.motivo:
+            estado, detalle = "FUERA    ", j.motivo
+        else:
+            estado, detalle = "ABANDONADO", j.motivo
+        sys.stdout.write("  {} #{}/{} {}\n".format(estado, j.issue, j.repo,
+                                                    detalle))
 
 
 def _run_loop(args, contexts, log_path):
@@ -1579,7 +1654,11 @@ def _proponer_ctx(args, ctx, log, en_bucle=False):
                             freno=(getattr(args, "freno", "") or None)
                             if en_bucle else None,
                             hasta=_hasta_de(args, ctx, INICIO_CORRIDA,
-                                            noche=True) if en_bucle else None)
+                                            noche=True) if en_bucle else None,
+                            tope_gasto=_tope_gasto(
+                                args, ctx, None,
+                                leer_eventos(log.path) if log is not None
+                                else []))
         prop = Proponer(spec, log, run_cmd=adapters.run)
         peldano_juez = _peldano_juez_para(args, ctx, log, r["name"])
         res = prop.proponer_repo(r["name"], r["slug"], r.get("path", ""),
@@ -1711,7 +1790,9 @@ def maintain_main(args, contexts):
         crudo = collect([ctx])
         crudo["eventos"] = eventos_previos
         spec = DispatchSpec(contexto=ctx.name, max_parallel=args.maximo,
-                            kind=args.kind, model=args.model)
+                            kind=args.kind, model=args.model,
+                            tope_gasto=_tope_gasto(args, ctx, log,
+                                                   eventos_previos))
         costo_de_pi, salida_de_pi = _sesiones_de_pi()
         main_t, jobs, parkeados = _jobs_mantenimiento(
             crudo, eventos_previos, spec, log,

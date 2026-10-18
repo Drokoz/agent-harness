@@ -22,6 +22,7 @@ import concurrent.futures as cf
 import json
 import re
 import shlex
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -692,6 +693,113 @@ def motivo_presupuesto_reloj(minutos, budget_minutos):
     return ""
 
 
+# ------------------------------------------------------------ tope de gasto
+# Sin costo medio en el historial (primer arranque), cada job pagado se
+# estima en esto: conservador, para que una corrida sin crédito medible no
+# despache la tanda entera contra un estimado de cero.
+ESTIMADO_SIN_HISTORIAL = 1.0
+
+
+def motivo_tope_gasto(max_usd, gastado, estimado):
+    """(#165) Por qué un job que cuesta plata NO se despacha, o "" si cabe.
+
+    `max_usd` es el tope de gasto de la corrida (un techo, no un piso),
+    `gastado` lo que la corrida lleva gastado (más lo reservado por los
+    jobs en vuelo) y `estimado` el costo medio de un job
+    (`state.costo_promedio`; None = sin historial, se estima
+    `ESTIMADO_SIN_HISTORIAL`). Con tope
+    0 no sale ningún job pagado; si no, no sale si gastado + estimado
+    supera el tope, ni si el tope ya se alcanzó."""
+    est = ESTIMADO_SIN_HISTORIAL if estimado is None else estimado
+    if not max_usd > 0:
+        return ("tope de gasto US$0.00: la corrida no autoriza gastar plata "
+                "(topes.max_usd / --max-usd)")
+    # Escrito para que un NaN en cualquier lado cierre, no abra.
+    if not (gastado < max_usd and gastado + est <= max_usd):
+        return ("tope de gasto: gastado US${:.2f} + estimado US${:.2f} "
+                "supera el tope de US${:.2f} de la corrida".format(
+                    gastado, est, max_usd))
+    return ""
+
+
+class TopeGasto:
+    """(#165) El tope de gasto de UNA corrida (el proceso): se arma una vez
+    al arrancar y lo comparten todas las tandas y pasadas.
+
+    Lo gastado se mide desde el arranque: el delta de créditos usados de
+    OpenRouter (`usado`, () -> float | None, leído al construir) y, como
+    piso, lo que costaron los jobs pagados ya cerrados (su `costo` medido,
+    o el estimado si no se midió). Los jobs pagados en vuelo reservan su
+    estimado hasta que se cierran: dos en paralelo no caben ambos en el
+    último dólar. Todo bajo lock: `run_job` corre en hilos."""
+
+    def __init__(self, max_usd, usado=None, estimado=None):
+        self.max_usd = float(max_usd)
+        self.estimado = estimado
+        self._usado = usado
+        self._inicio = self._leer()
+        self._cerrado = 0.0       # jobs pagados ya cerrados
+        self._reservas = {}       # id(job) -> estimado reservado
+        self.rechazados = 0       # jobs pagados que no salieron, en la corrida
+        self._lock = threading.Lock()
+
+    def _leer(self):
+        if self._usado is None:
+            return None
+        try:
+            v = self._usado()
+        except (TypeError, ValueError, StopIteration):
+            return None
+        return None if v is None else float(v)
+
+    def _gastado(self):
+        delta = 0.0
+        if self._inicio is not None:
+            ahora = self._leer()
+            if ahora is not None:
+                delta = max(0.0, ahora - self._inicio)
+        return max(delta, self._cerrado) + sum(self._reservas.values())
+
+    def gastado(self):
+        with self._lock:
+            return self._gastado()
+
+    def reservar(self, job):
+        """Antes de despachar un job pagado: "" y queda reservado, o el
+        motivo por el que no sale."""
+        with self._lock:
+            motivo = motivo_tope_gasto(self.max_usd, self._gastado(),
+                                       self.estimado)
+            if motivo:
+                self.rechazados += 1
+            else:
+                self._reservas[id(job)] = (ESTIMADO_SIN_HISTORIAL
+                                           if self.estimado is None
+                                           else self.estimado)
+            return motivo
+
+    def liberar(self, token):
+        """Cierra la reserva del revisor. Con crédito medible se suelta: su
+        costo real ya lo trae el delta. Sin medir, el estimado pasa a gasto
+        cerrado: si no, cada review volvería a caber y el tope dejaría de
+        ser techo."""
+        with self._lock:
+            est = self._reservas.pop(id(token), None)
+            if est is not None and (self._inicio is None
+                                    or self._leer() is None):
+                self._cerrado += est
+
+    def cerrar(self, jobs):
+        """Al final de la tanda: las reservas pasan a gasto cerrado, con el
+        costo medido del job si lo hay."""
+        with self._lock:
+            for j in jobs:
+                est = self._reservas.pop(id(j), None)
+                if est is None:
+                    continue
+                self._cerrado += j.costo if j.costo is not None else est
+
+
 def _json_field(texto, claves):
     """`texto["a"]["b"]...` sin excepción: None si el JSON no coopera."""
     try:
@@ -1102,6 +1210,10 @@ class DispatchSpec:
     freno: Optional[str] = None
     hasta: Optional[datetime] = None
     hasta_gracia_min: float = 30.0
+    # El tope de gasto de la corrida (#165): un `TopeGasto` compartido por
+    # todas las tandas del proceso. None = sin tope cableado (librería,
+    # tests viejos); el CLI siempre lo cablea desde `topes.max_usd`.
+    tope_gasto: Optional["TopeGasto"] = None
 
 
 class Dispatcher:
@@ -1142,6 +1254,9 @@ class Dispatcher:
         # corrida, para no leer los intentos de anoche.
         self._desde = None
         self.credits = credits or (lambda: None)  # () -> usado (float) | None
+        # Jobs pagados que el tope de gasto dejó sin despachar (#165).
+        self._sin_despachar_gasto = 0
+        self._lock_gasto = threading.Lock()
         # Sin inyectar, el reloj real; resuelto en la llamada para que
         # parchear `time.sleep` alcance a esta instancia.
         self.dormir = dormir or time.sleep
@@ -1282,6 +1397,16 @@ class Dispatcher:
                            "terminaron".format(corte, sin_despachar))
         despues = self.credits()
         self._repartir_costo(resultados, antes, despues, desde)
+        tope_gasto = self.spec.tope_gasto
+        if tope_gasto is not None:
+            tope_gasto.cerrar(resultados)
+            if self._sin_despachar_gasto:
+                self.log.write(self._tipo_corrida, ref,
+                               "tope de gasto: gastado US${:.2f} de US${:.2f} "
+                               "de la corrida; {} job(s) pagado(s) sin "
+                               "despachar".format(tope_gasto.gastado(),
+                                                  tope_gasto.max_usd,
+                                                  self._sin_despachar_gasto))
         if antes is not None and despues is not None:
             self.log.write("costo", ref,
                            "creditos antes {} / despues {} / delta ${:.4f}".format(
@@ -1331,6 +1456,12 @@ class Dispatcher:
             # router ya sabe que este peldaño no corre ahora.
             self._log(job, "peldano", ref,
                       "claude no permitido ahora (router): " + motivo)
+            return job
+        motivo = self._permitir_gasto(job)
+        if motivo:
+            # #165: no se crea nada; el job queda "pendiente", sin peldaño.
+            job.motivo = motivo
+            self._log(job, "fuera", ref, motivo)
             return job
         # El peldaño con que arrancó (#81): antes de cualquier otra acción
         # del ticket, para que la salida en vivo muestre la decisión menos
@@ -1398,6 +1529,19 @@ class Dispatcher:
                   "prompt perdido: vuelve a la cola de la misma corrida "
                   "(vuelta {} de {})".format(n + 1, self.spec.prompt_requeues))
         return True
+
+    def _permitir_gasto(self, job):
+        """(#165) "" si el job puede salir, o el motivo del tope de gasto.
+        Sólo aplica a los jobs que cuestan plata (no `RUNNERS_SIN_CREDITOS`)
+        y con un tope cableado."""
+        tope = self.spec.tope_gasto
+        if tope is None or (job.kind or self.spec.kind) in RUNNERS_SIN_CREDITOS:
+            return ""
+        motivo = tope.reservar(job)
+        if motivo:
+            with self._lock_gasto:
+                self._sin_despachar_gasto += 1
+        return motivo
 
     def _permitir_claude(self, job):
         """(permitido, motivo). Sólo se consulta si el peldaño de este job
@@ -2005,11 +2149,27 @@ class Dispatcher:
         clasifica `fallida`) y hasta un error inesperado —un bug del
         revisor— no tumba un job que ya terminó bien: la review queda
         `fallida` y el PR igual aparece en el resumen."""
+        revisor = self._revisor()
+        tope = self.spec.tope_gasto
+        token = None
+        if (tope is not None and getattr(revisor, "kind", "pi")
+                not in RUNNERS_SIN_CREDITOS):
+            # #165: el revisor por defecto es pi y gasta plata, aunque el
+            # job haya sido de Claude: pasa por el tope como cualquier job.
+            token = object()
+            motivo = tope.reservar(token)
+            if motivo:
+                self._log(job, "review", ref,
+                          "PR #{}: review omitida: {}".format(num, motivo))
+                return
         try:
-            revision = self._revisor().revisar_pr(job.slug, num)
+            revision = revisor.revisar_pr(job.slug, num)
         except Exception as e:
             revision = Revision("fallida",
                                 motivo="error del revisor: {}".format(e))
+        finally:
+            if token is not None:
+                tope.liberar(token)
         self._log(job, "review", ref, cuerpo_revision(num, revision))
 
     def _pr_mide_el_head(self, job, ref, num):

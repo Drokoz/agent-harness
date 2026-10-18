@@ -436,7 +436,7 @@ class TestRunSueltoDeDiaConHastaEnConfig(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.d = Path(self.tmp.name)
         conf = json.loads(test_bucle.LaFronteraSeRecalcula.CONFIG)
-        conf["contexts"]["h"]["topes"] = {"hasta": "07:00"}
+        conf["contexts"]["h"]["topes"] = {"hasta": "07:00", "max_usd": 50}  # #165: autoriza gasto
         # Sin créditos que medir: la tanda no se recorta por presupuesto.
         conf["contexts"]["h"]["budget"] = {"polarity": "remaining",
                                            "provider": "none"}
