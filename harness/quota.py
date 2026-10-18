@@ -310,6 +310,14 @@ def semana_inicio(dt, tz=SEMANA_TZ):
     return ref.astimezone(tz)
 
 
+def semana_reset(dt, tz=SEMANA_TZ):
+    """El próximo reset de la semana de la cuota después de `dt`: el inicio
+    de su semana más 7 días, sumados en UTC (en hora local, las semanas de
+    cambio de horario darían 1 h de error). Expresado en `tz`."""
+    inicio = semana_inicio(dt).astimezone(timezone.utc)
+    return (inicio + timedelta(days=7)).astimezone(tz)
+
+
 def pico_5h(puntos, ventana=VENTANA_5H):
     """El máximo total dentro de CUALQUIER ventana de `ventana` sobre
     `puntos` [(datetime, tokens)]. Devuelve (total, inicio, inicio+ventana)

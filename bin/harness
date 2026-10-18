@@ -212,7 +212,7 @@ from harness.render import linea_evento, render  # noqa: E402
 from harness.quota import (agregar, as_dict as quota_as_dict, cuota_por_ventana,  # noqa: E402
                            fuentes_desde_spec, leer_fuentes, puntos_de_ticket,
                            render_quota, resumen_evento, semana_de,
-                           semana_inicio)
+                           semana_reset)
 from harness.snapshot import as_dict, snapshot  # noqa: E402
 from harness import usage as usage_mod  # noqa: E402
 from harness.usage import (Cuota, EstadoCuota, UsageIlegible,  # noqa: E402
@@ -582,7 +582,7 @@ def _estimar_cuota(args, ctx):
     harness_sem, resto_sem = semana_de(agg, ahora)
     pct = round((harness_sem + resto_sem) / ctx.quota.tope_semanal * 100, 1)
     return EstadoCuota(fuente="estimacion", semana_pct=pct,
-                       semana_reset=semana_inicio(ahora) + timedelta(days=7))
+                       semana_reset=semana_reset(ahora))
 
 
 def _cuota_de(args, ctx, log):
