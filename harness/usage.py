@@ -43,6 +43,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -661,21 +662,50 @@ def aplicar_cuota(candidatos, cuota, ahora, dormir, anotar, freno=None,
 
 
 class Cuota:
-    """La cuota de la corrida: `/usage` primero, la estimación de `harness
-    quota` si no se puede leer (y se dice). Cada `estado()` consulta de
-    nuevo: es lo que permite consultar al inicio y entre tickets.
+    """La cuota de la corrida: la cuota real (statusline o `/usage`)
+    primero, la estimación de `harness quota` si no se puede leer (y se
+    dice). Se consulta al inicio de cada tanda con Claude y antes de cada
+    ticket de Claude.
+
+    Caché corto (`ttl`, 2 min) con lock: los tickets de Claude que arrancan
+    en paralelo comparten UNA captura en vez de abrir un pane cada uno
+    (revisión de #159); el caché se invalida al pasar cualquier reset.
 
     `leer_usage() -> Usage` (lanza `UsageIlegible`), `estimar() ->
     EstadoCuota | None`, `ahora() -> datetime`, `anotar(str)` (el log)."""
 
-    def __init__(self, leer_usage, estimar, politica, ahora, anotar):
+    def __init__(self, leer_usage, estimar, politica, ahora, anotar,
+                 ttl=timedelta(minutes=2)):
         self.leer_usage = leer_usage
         self.estimar = estimar
         self.politica = politica
         self.ahora = ahora
         self.anotar = anotar
+        self.ttl = ttl
+        self._lock = threading.Lock()
+        self._cache = None  # (EstadoCuota, cuándo)
+
+    def _cache_vigente(self, ahora):
+        if self._cache is None:
+            return None
+        e, cuando = self._cache
+        if ahora - cuando >= self.ttl:
+            return None
+        for reset in (e.sesion_reset, e.semana_reset):
+            if reset is not None and reset <= ahora:
+                return None
+        return e
 
     def estado(self):
+        with self._lock:
+            ahora = self.ahora()
+            e = self._cache_vigente(ahora)
+            if e is None:
+                e = self._consultar()
+                self._cache = (e, ahora)
+            return e
+
+    def _consultar(self):
         try:
             u = self.leer_usage()
         except UsageIlegible as e:
