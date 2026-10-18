@@ -842,8 +842,18 @@ class TestCli(unittest.TestCase):
     def test_con_statusline_fresca_no_abre_pane(self):
         ruta = self.d / "state" / "harness" / "rate_limits.json"
         ahora = datetime.now(SCL)
+        # El archivo se escribe contra el reloj REAL, así que su reset tiene
+        # que estar en el futuro para que la freshness no lo descarte:
+        # los timestamps fijos de STDIN_STATUSLINE (2026) envejecen y un
+        # reset pasado rechaza el archivo aunque sea fresco. El test no
+        # aserta sobre el reset, sólo sobre la frescura y el pct.
+        entrada = dict(STDIN_STATUSLINE)
+        entrada["rate_limits"] = dict(STDIN_STATUSLINE["rate_limits"])
+        entrada["rate_limits"]["five_hour"] = dict(
+            STDIN_STATUSLINE["rate_limits"]["five_hour"])
+        entrada["rate_limits"]["five_hour"]["resets_at"] = 1830282600  # 2027
         self.assertTrue(usage.escribir_rate_limits(
-            dict(STDIN_STATUSLINE), ruta, ahora - timedelta(minutes=2)))
+            entrada, ruta, ahora - timedelta(minutes=2)))
 
         def no_capturar(*a, **k):
             raise AssertionError("con la statusline fresca no se abre pane")
