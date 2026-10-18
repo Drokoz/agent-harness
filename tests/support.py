@@ -18,6 +18,14 @@ if str(ROOT) not in sys.path:
 # Después de tocar sys.path: si no, `harness` todavía no es importable.
 from harness.adapters import normalize_issues  # noqa: E402
 from harness.config import parse_config  # noqa: E402
+from harness import dispatch as _dispatch  # noqa: E402
+
+# Un job de Claude marca su worktree como confiable en `~/.claude.json`
+# (`dispatch.confiar_en`). Desde #174 la corrida es Claude por defecto y
+# más tests despachan peldaños de Claude: ninguno escribe la config real
+# del usuario. Los tests que la miran siguen parcheando su propia ruta.
+import tempfile as _tempfile  # noqa: E402
+_dispatch.CLAUDE_JSON = Path(_tempfile.mkdtemp(prefix="harness-tests-")) / "claude.json"
 
 
 def fixture(name):

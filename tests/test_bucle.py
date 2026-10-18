@@ -1348,8 +1348,12 @@ class LosTopesVienenDeLaConfig(unittest.TestCase):
                 self.d.joinpath("config.json").write_text(
                     self._cfg(topes={"max_pasadas": 3}))
                 self.log_path.write_text("")
+                # `--kind pi` (#174): la escalera completa tiene 4 peldaños,
+                # así que el ticket da trabajo las 3 pasadas del tope; la
+                # escalera Claude (2) lo parkearía antes y el test no
+                # mediría el tope.
                 args = self.cli.build_parser().parse_args([
-                    "run", "--context", "h", "--loop",
+                    "run", "--context", "h", "--loop", "--kind", "pi",
                     "--log", str(self.log_path),
                     "--freno", str(self.freno), "--sin-proponer", *flag])
                 mundo = Mundo(prs=[])

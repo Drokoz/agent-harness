@@ -249,8 +249,8 @@ class LaConfig(unittest.TestCase):
 class LaLineaPeldanoDiceElPorQue(unittest.TestCase):
     def test_el_motivo_va_en_la_linea_peldano(self):
         p = SONNET
-        j = job(kind=p["kind"], model=p["model"], extra_args=p["extra_args"],
-                motivo_peldano="corrida claude (--kind): escalera solo Claude")
+        j = job(kind=p["kind"], model=p["model"], extra_args=p["extra_args"])
+        j.motivo_peldano = "corrida claude (--kind): escalera solo Claude"
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(dispatch_mod, "CLAUDE_JSON",
                                Path(tmp) / "claude.json"):

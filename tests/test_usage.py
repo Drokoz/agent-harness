@@ -974,8 +974,12 @@ class TestRunConCuota(unittest.TestCase):
                 "budget": {"polarity": "remaining", "provider": "none"},
                 "run": {"kind": "local"}}}}))
         (self.d / "repos" / "agent-harness").mkdir(parents=True)
+        # `--kind pi` (#174): con la escalera completa, los dos abandonos
+        # sembrados llevan a #7 al peldaño 3 (claude sonnet), que es lo que
+        # estos tests necesitan para consultar la cuota.
         args = self.cli.build_parser().parse_args(
-            ["run", "--context", "h", "--log", str(self.log_path), "-q"])
+            ["run", "--context", "h", "--log", str(self.log_path), "-q",
+             "--kind", "pi"])
         with mock.patch.object(self.cli, "OFFLINE", False), \
              mock.patch.object(self.cli, "collect", return_value=self._raw()), \
              mock.patch.object(self.cli.adapters, "run", mundo.cmd), \

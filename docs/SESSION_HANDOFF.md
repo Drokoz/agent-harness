@@ -153,8 +153,11 @@ harness status --context harness      # ver la frontera y su estado
 harness run --context harness --max 2 # despachar; la escalera elige runner y modelo
 ```
 
-`--kind` y `--model` son **sólo un fallback**: desde #38 la escalera fija el peldaño por
-ticket, y un ticket sin historia arranca siempre en pi + Qwen.
+`--kind` elige la escalera de la corrida (#174): `claude` (el default, o `escalera` en
+la config del contexto) es solo sonnet → opus y ningún job va a pi; `pi` es la escalera
+completa. Un ticket `runner:cheap` va a pi solo con `--permitir-pi`, y un repo con
+`repos.runner_min: {"<repo>": "claude"}` nunca (#177). La línea `peldano` del log dice
+el runner elegido y por qué.
 
 **Gotcha vigente:** `harness run` toma **toda** la frontera. Para acotar una tanda hoy hay
 que quitarle `ready-for-agent` a los que no entran y devolvérselo después — y verificar

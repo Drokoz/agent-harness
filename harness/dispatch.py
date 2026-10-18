@@ -482,21 +482,114 @@ ESCALERA = (
 )
 
 
-def peldano_de(escalados):
+# La escalera de una corrida de Claude (#174): solo los peldaños Claude,
+# sonnet → opus. La noche del 2026-10-18 `--kind claude` despachó los 49
+# jobs a pi porque el peldaño 1 de `ESCALERA` ganaba siempre a la corrida.
+ESCALERA_CLAUDE = tuple(p for p in ESCALERA if p["kind"] == "claude")
+
+# Los runners con que puede arrancar una corrida (`--kind`, `escalera` del
+# contexto). Claude es el default: va por suscripción; pi/Qwen gasta
+# OpenRouter y es opt-in.
+RUNNERS_CORRIDA = ("claude", "pi")
+RUNNER_POR_DEFECTO = "claude"
+# La etiqueta con que un ticket pide el runner barato (#174).
+ETIQUETA_BARATA = "runner:cheap"
+
+
+@dataclass(frozen=True)
+class Corrida:
+    """Con qué runner arranca la corrida y qué le deja hacer a pi (#174).
+
+    `kind`: "claude" (escalera solo Claude) o "pi" (la escalera completa).
+    `fuente`: de dónde salió `kind` ("--kind", "config escalera", "por
+    defecto"), para el motivo del log. `permitir_pi`: `--permitir-pi`; en
+    una corrida Claude, un ticket `runner:cheap` sube a la escalera
+    completa solo con esto. `runner_min`: {repo: "claude"} de la config
+    (#177); un repo con mínimo Claude nunca recibe un peldaño pi."""
+
+    kind: str = RUNNER_POR_DEFECTO
+    fuente: str = "por defecto"
+    permitir_pi: bool = False
+    runner_min: Optional[dict] = None
+
+
+def peldano_de(escalados, escalera=ESCALERA):
     """El peldaño que le toca a un ticket con `escalados` abandonos que ya
     consumieron peldaño (`state.intentos_que_escalan`, que excluye los
-    `infra` por #37): un dict de `ESCALERA`, o None si la escalera está
+    `infra` por #37): un dict de `escalera`, o None si la escalera está
     agotada -- parkear, no despachar de nuevo.
 
     Puro y sin memoria: `escalados` sale de releer el log cada vez
     (`state.intentos_que_escalan`), así que el peldaño sobrevive reiniciar
     el dispatcher (#38).
+
+    Para armar un job se pasa por `elegir_peldano`, que decide la escalera
+    según la corrida (#174); esto queda como la búsqueda sobre una escalera.
     """
     if escalados < 0:
         escalados = 0
-    if escalados >= len(ESCALERA):
+    if escalados >= len(escalera):
         return None
-    return ESCALERA[escalados]
+    return escalera[escalados]
+
+
+def elegir_peldano(eventos, corrida, repo, numero, etiquetas=(), pr=False):
+    """El peldaño de un job y por qué (#174, #177): `(peldano, motivo)`,
+    con `peldano` None si su escalera está agotada (parkear).
+
+    La única puerta por la que pasan los sitios que arman jobs (el
+    implementador de `run`, el de cada pasada de `run --loop` y el
+    mantenedor). Las reglas, en orden:
+
+    1. `runner_min: claude` del repo (#177): escalera solo Claude, pase lo
+       que pase con la corrida y la etiqueta.
+    2. Corrida `pi`: la escalera completa de siempre (pi → pi high →
+       sonnet → opus).
+    3. Corrida `claude` con ticket `runner:cheap` Y `--permitir-pi`: la
+       escalera completa.
+    4. Si no, escalera solo Claude (sonnet → opus); la etiqueta sin el
+       permiso se ignora y se dice.
+
+    En la escalera completa el peldaño sale de todos los abandonos que
+    escalan (como antes de #174). En la escalera Claude se descuentan los
+    abandonos de pi: un ticket que Qwen tumbó en una corrida vieja empieza
+    en sonnet, no parkeado sin que Claude lo haya intentado.
+    """
+    etiquetas = set(etiquetas or ())
+    minimo = (corrida.runner_min or {}).get(repo, "")
+    origen = "corrida {} ({})".format(corrida.kind, corrida.fuente)
+    if minimo == "claude":
+        completa = False
+        porque = "runner_min del repo {}: claude".format(repo)
+        if ETIQUETA_BARATA in etiquetas:
+            porque += " (etiqueta {} ignorada)".format(ETIQUETA_BARATA)
+    elif corrida.kind == "pi":
+        completa = True
+        porque = "{}: escalera completa".format(
+            "--kind pi" if corrida.fuente == "--kind" else origen)
+    elif ETIQUETA_BARATA in etiquetas and corrida.permitir_pi:
+        completa = True
+        porque = "{} + etiqueta {} + --permitir-pi: escalera completa".format(
+            origen, ETIQUETA_BARATA)
+    elif ETIQUETA_BARATA in etiquetas:
+        completa = False
+        porque = ("{}: etiqueta {} ignorada (la corrida no tiene "
+                  "--permitir-pi)".format(origen, ETIQUETA_BARATA))
+    else:
+        completa = False
+        porque = origen
+    contar = state.intentos_pr_que_escalan if pr else state.intentos_que_escalan
+    if completa:
+        escalera = ESCALERA
+        escalados = contar(eventos, repo, numero)
+    else:
+        escalera = ESCALERA_CLAUDE
+        escalados = contar(eventos, repo, numero, excluir_runner="pi")
+        porque += ": escalera solo Claude"
+    peldano = peldano_de(escalados, escalera)
+    if peldano is None:
+        porque += " agotada ({} abandono(s) que escalan)".format(escalados)
+    return peldano, "por qué: " + porque
 
 
 def peldano_numero(kind, model, extra_args):
@@ -1138,6 +1231,9 @@ class Job:
     kind: str = ""
     model: str = ""
     extra_args: Tuple[str, ...] = ()          # --thinking/--effort del peldaño
+    # Por qué este peldaño (#174): lo que `elegir_peldano` decidió (flag,
+    # etiqueta, escalera, runner_min del repo); va a la línea `peldano`.
+    motivo_peldano: str = ""
     # Las skills de la sesión mínima (#42): la base del implementador más
     # las que el ticket declara (`skills_de` sobre el body del issue).
     skills: Tuple[str, ...] = SKILLS_IMPLEMENTADOR
@@ -1466,10 +1562,14 @@ class Dispatcher:
         # El peldaño con que arrancó (#81): antes de cualquier otra acción
         # del ticket, para que la salida en vivo muestre la decisión menos
         # obvia del despacho.
-        self._log(job, "peldano", ref,
-                  peldano_etiqueta(job.kind or self.spec.kind,
+        # El runner elegido y por qué (#174), en la misma línea.
+        etiqueta = peldano_etiqueta(job.kind or self.spec.kind,
                                     job.model or self.spec.model,
-                                    job.extra_args))
+                                    job.extra_args)
+        motivo_peldano = getattr(job, "motivo_peldano", "")
+        if motivo_peldano:
+            etiqueta += " · " + motivo_peldano
+        self._log(job, "peldano", ref, etiqueta)
         try:
             if not self._baseline(job, ref):
                 pass  # ya se abandono con su motivo

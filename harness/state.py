@@ -291,7 +291,29 @@ def costo_promedio(eventos):
     return sum(gastos) / len(gastos) if gastos else None
 
 
-def intentos_que_escalan(eventos, repo, issue):
+def _escalan(eventos, clave, excluir_runner=None):
+    """Los abandonos que consumen peldaño para la clave de log `clave`
+    ("repo#N" o "repo#prN"): uno por corrida (`run_id`), salvo `infra`.
+
+    `excluir_runner` (#174) descuenta los intentos cuyo agente corrió en
+    ese runner (la línea `agente` de la misma corrida): la escalera solo
+    Claude no gasta peldaños en los abandonos de pi de una corrida vieja.
+    Un abandono sin línea `agente` (runner desconocido) SÍ cuenta: el
+    default conservador es parkear antes, no reintentar sin fin."""
+    clase_por_run = {}
+    for e in eventos:
+        if e.get("ticket") != clave or e.get("tipo") != "abandono":
+            continue
+        run = e.get("run_id") or _SIN_RUN
+        clase_por_run[run] = e.get("clase") or "modelo"
+    runners = _runners(eventos) if excluir_runner else {}
+    return sum(1 for run, clase in clase_por_run.items()
+               if clase != "infra"
+               and (excluir_runner is None
+                    or runners.get((run, clave)) != excluir_runner))
+
+
+def intentos_que_escalan(eventos, repo, issue, excluir_runner=None):
     """Cuántos intentos de este ticket consumen un peldaño de la escalera
     de reintentos (#38): los que terminan en abandono, salvo los
     clasificados `infra` -- esos se reintentan en el acto (#37) y no
@@ -301,14 +323,10 @@ def intentos_que_escalan(eventos, repo, issue):
     La clase de una línea sin `clase` (escrita entre #35 y #37) se
     lee como `modelo`: el default conservador es el que gasta, no el
     que reintenta gratis.
+
+    `excluir_runner`: ver `_escalan` (#174).
     """
-    clase_por_run = {}
-    for e in eventos:
-        if not _es_de(e, repo, issue) or e.get("tipo") != "abandono":
-            continue
-        run = e.get("run_id") or _SIN_RUN
-        clase_por_run[run] = e.get("clase") or "modelo"
-    return sum(1 for clase in clase_por_run.values() if clase != "infra")
+    return _escalan(eventos, _ticket_clave(repo, issue), excluir_runner)
 
 
 def motivos_de_abandono(eventos, repo, issue):
@@ -341,18 +359,11 @@ def intentos_pr(eventos, repo, pr):
     return len(runs)
 
 
-def intentos_pr_que_escalan(eventos, repo, pr):
+def intentos_pr_que_escalan(eventos, repo, pr, excluir_runner=None):
     """Cuántos intentos de mantenimiento consumen peldaño de la escalera
     (#56): la misma regla que `intentos_que_escalan` (los abandonos,
     salvo los `infra`), con la clave del PR."""
-    clave = clave_mantenimiento(repo, pr)
-    clase_por_run = {}
-    for e in eventos:
-        if e.get("ticket") != clave or e.get("tipo") != "abandono":
-            continue
-        run = e.get("run_id") or _SIN_RUN
-        clase_por_run[run] = e.get("clase") or "modelo"
-    return sum(1 for clase in clase_por_run.values() if clase != "infra")
+    return _escalan(eventos, clave_mantenimiento(repo, pr), excluir_runner)
 
 
 def motivos_de_abandono_pr(eventos, repo, pr):
