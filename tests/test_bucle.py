@@ -1284,6 +1284,11 @@ class LosTopesVienenDeLaConfig(unittest.TestCase):
                                       NS(topes=NS(max_usd=config))),
                     esperado)
 
+    def test_max_usd_nan_del_cli_es_error(self):
+        args = self.cli.build_parser().parse_args(["run", "--max-usd", "nan"])
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            self.assertEqual(self.cli._validar_max_usd(args), 2)
+
     def test_max_usd_parsea_del_cli(self):
         args = self.cli.build_parser().parse_args(
             ["run", "--max-usd", "2.5"])

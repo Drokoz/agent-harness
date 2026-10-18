@@ -2468,13 +2468,14 @@ class TestTopeDeGasto(unittest.TestCase):
     default) no sale ningún job pagado; los de Claude (suscripción) no
     gastan plata y no se tocan."""
 
-    def _despachar(self, m, jobs, tope, **kw):
+    def _despachar(self, m, jobs, tope, revisor=None, **kw):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(dispatch, "CLAUDE_JSON",
                                    Path(tmp) / "claude.json"):
                 log = log_en(tmp)
                 d = Dispatcher(spec(tope_gasto=tope, **kw), log, m.cmd,
-                               credits=m.credits, dormir=m.dormir)
+                               credits=m.credits, dormir=m.dormir,
+                               revisor=revisor)
                 res = d.dispatch(jobs)
                 lineas = [json.loads(l)
                           for l in log.path.read_text().splitlines()]
@@ -2561,6 +2562,53 @@ class TestTopeDeGasto(unittest.TestCase):
         tope (tests viejos, librería) se comporta como antes."""
         res, _ = despachar(Mundo(), [job_de_peldano(0)])
         self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+
+    def test_tope_cero_no_corre_el_revisor_de_pi(self):
+        """El revisor por defecto (#46) es pi/qwen: gasta plata aunque el
+        job sea de Claude. Con tope 0 no corre, y queda dicho."""
+        m = Mundo(prs=[{"number": 32, "headRefName": "ticket/8"}])
+        res, lineas = self._despachar(m, [job_de_peldano(2, issue=8)],
+                                      dispatch.TopeGasto(0.0))
+        self.assertEqual(res[0].estado, "hecho", res[0].motivo)
+        self.assertEqual([c for c in m.llamadas if c[0][0] == "pi"], [])
+        reviews = [l["cuerpo"] for l in lineas if l["tipo"] == "review"]
+        self.assertEqual(len(reviews), 1, lineas)
+        self.assertIn("review omitida", reviews[0])
+        self.assertIn("tope de gasto", reviews[0])
+
+    def test_revisor_de_claude_no_pasa_por_el_tope(self):
+        class Revisor:
+            kind = "claude"
+
+            def __init__(self):
+                self.vistos = []
+
+            def revisar_pr(self, slug, num):
+                from harness.review import Revision
+                self.vistos.append(num)
+                return Revision("ok")
+        rev = Revisor()
+        m = Mundo(prs=[{"number": 32, "headRefName": "ticket/8"}])
+        res, lineas = self._despachar(m, [job_de_peldano(2, issue=8)],
+                                      dispatch.TopeGasto(0.0), revisor=rev)
+        self.assertEqual(rev.vistos, [32])
+
+    def test_sin_historial_se_reserva_un_dolar_por_job(self):
+        """Sin costo medio (primer arranque) y sin crédito medible, cada
+        job pagado reserva US$1.00: con tope 2.5 salen dos, no la tanda
+        entera."""
+        tope = dispatch.TopeGasto(2.5)
+        for _ in range(2):
+            self.assertEqual(tope.reservar(object()), "")
+        self.assertIn("tope de gasto", tope.reservar(object()))
+        self.assertAlmostEqual(tope.gastado(), 2.0)
+
+    def test_nan_cierra(self):
+        f = dispatch.motivo_tope_gasto
+        nan = float("nan")
+        self.assertIn("tope de gasto", f(nan, 0.0, 0.1))
+        self.assertIn("tope de gasto", f(5.0, nan, 0.1))
+        self.assertIn("tope de gasto", f(5.0, 0.0, nan))
 
     def test_motivo_puro(self):
         f = dispatch.motivo_tope_gasto
