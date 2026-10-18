@@ -16,7 +16,8 @@ La forma de `raw` (ver `harness.adapters.collect`):
 
     {
       "offline": bool,
-      "agents": [ {...} ] | None,          # None = no hay sesión de herdr
+      "agents": [ {...} ] | None,          # None = sin lista (ver `herdr`)
+      "herdr": bool,                        # en herdr: agents None = ilegible (#178)
       "routing": {                          # #126: disco local, siempre presente
         "declaracion": {"provider": str, "compat": {...}} | None,
         "models": {...} | None,             # ~/.pi/agent/models.json crudo
@@ -75,6 +76,10 @@ from typing import Dict, List, Optional
 from harness import routing as routing_mod
 from harness.state import agente_vivo, despachado, estado_frontier, rama_de
 
+# Los agentes vivos no se pudieron leer (#178): `agente_vivo` no se puede
+# contestar, y el estado de la frontera lo recibe como None (desconocido).
+ILEGIBLE = object()
+
 SCHEMA_VERSION = 3
 
 AGENT_LABEL = "ready-for-agent"
@@ -119,7 +124,8 @@ class Agent:
 
 @dataclass
 class Agents:
-    """`state`: offline | outside (no estamos en herdr) | empty | ok."""
+    """`state`: offline | outside (no estamos en herdr) | ilegible (en herdr,
+    pero `herdr agent list` no se pudo leer, #178) | empty | ok."""
 
     state: str
     items: List[Agent] = field(default_factory=list)
@@ -258,11 +264,12 @@ def _budget(raw, offline):
     )
 
 
-def _agents(raw, offline):
+def _agents(raw, offline, herdr=False):
     if offline:
         return Agents(state="offline")
     if raw is None:
-        return Agents(state="outside")
+        # En herdr y sin lista: no se pudo leer, no "no hay nadie" (#178).
+        return Agents(state="ilegible" if herdr else "outside")
     if not raw:
         return Agents(state="empty")
     # Primero lo que necesita a un humano (blocked), después lo que está corriendo.
@@ -337,7 +344,7 @@ def _issues(raw, prs, prs_merged, eventos, agentes, repo):
         issue.estado = estado_frontier(
             labels,
             despachado(eventos, repo, i["number"]),
-            agente_vivo(agentes, repo, i["number"]),
+            None if agentes is ILEGIBLE else agente_vivo(agentes, repo, i["number"]),
             rama in abiertas,
             rama in merged)
         frontier.append(issue)
@@ -412,9 +419,14 @@ def snapshot(raw):
     offline = bool(raw.get("offline"))
     eventos = raw.get("eventos")
     agentes = raw.get("agents")
+    herdr = bool(raw.get("herdr"))
+    if not offline and herdr and agentes is None:
+        # Ilegible (#178): sin saber quién vive, nadie se da por muerto —
+        # el vivo de cada ticket es None y `estado_frontier` no lo libera.
+        agentes = ILEGIBLE
     return Snapshot(
         offline=offline,
-        agents=_agents(agentes, offline),
+        agents=_agents(raw.get("agents"), offline, herdr),
         routing=_routing(raw.get("routing")),
         contexts=[_context(c, offline, eventos, agentes)
                   for c in raw.get("contexts", [])],

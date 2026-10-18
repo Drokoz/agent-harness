@@ -459,7 +459,9 @@ def main(argv=None):
     # familia de #91 (fallar en silencio es peor que fallar).
     ilegibles = any(r.tracker_ilegible
                     for c in snap.contexts for r in c.repos)
-    code = 1 if ilegibles else 0
+    # Lo mismo para los agentes de herdr (#178): una lista que no se pudo
+    # leer no es "ninguno trabajando".
+    code = 1 if ilegibles or snap.agents.state == "ilegible" else 0
     if args.command == "report" or args.como_json:
         # El reporte consume el MISMO dict que emite --json: es el contrato que el
         # spec fijó entre el núcleo y cualquier frontend. Si mañana la web se escribe
@@ -903,6 +905,20 @@ def _imprimir_mantenimiento(resultados):
                                                       detalle))
 
 
+def _avisar_agentes_ilegibles(snap, ctx, log):
+    """`herdr agent list` no contestó (#178): no se sabe quién vive, así que
+    los tickets despachados se quedan despachados (`estado_frontier` no los
+    libera). Se dice y se anota: una pasada sin despachos por esto no es
+    "nada que hacer"."""
+    if snap.agents.state != "ilegible":
+        return
+    log.write("corrida", "corrida",
+              "agentes ilegibles: herdr agent list no contestó: los tickets "
+              "despachados no se re-despachan")
+    sys.stdout.write('harness: "{}": agentes ilegibles (herdr agent list no '
+                     'contestó)\n'.format(ctx.name))
+
+
 def run_main(args, contexts, solo=None):
     """`harness run`: la frontera desbloqueada, en worktrees y panes aislados,
     con tope de paralelismo, todo anotado en el log JSONL de eventos.
@@ -943,6 +959,7 @@ def run_main(args, contexts, solo=None):
         # repo falló, sin tapar a los demás: si el resto tampoco tiene
         # trabajo, no se despacha una tanda vacía — se corta con el motivo
         # y sale distinto de cero, como el freno viejo de #91 no salía 0.
+        _avisar_agentes_ilegibles(snap, ctx, log)
         ilegibles = [r for r in snap.contexts[0].repos if r.tracker_ilegible]
         for r in ilegibles:
             log.write("corrida", "corrida",
@@ -1132,6 +1149,7 @@ def _una_pasada(args, ctx, log):
     # los demás: los legibles sí se despachan), y la pasada trae `corte`:
     # el bucle no gasta vueltas vacías contra un tracker que no va a
     # responder — corta en la primera.
+    _avisar_agentes_ilegibles(snap, ctx, log)
     ilegibles = [r for r in snap.contexts[0].repos if r.tracker_ilegible]
     for r in ilegibles:
         log.write("corrida", "corrida",

@@ -109,11 +109,12 @@ class TestHerdr(unittest.TestCase):
                 mock.patch.object(adapters, "run", fake_run({"herdr": (True, crudo)})):
             self.assertEqual(adapters.herdr_agents(), [{"agent": "claude"}])
 
-    def test_herdr_caido_es_lista_vacia(self):
-        """Distinto de None: estamos en una sesión, sólo que no contestó."""
+    def test_herdr_caido_es_none(self):
+        """Ilegible, no vacía (#178): estamos en una sesión y no contestó.
+        El "fuera de herdr" lo distingue `collect` con la clave `herdr`."""
         with mock.patch.dict("os.environ", {"HERDR_ENV": "1"}), \
                 mock.patch.object(adapters, "run", fake_run({})):
-            self.assertEqual(adapters.herdr_agents(), [])
+            self.assertIsNone(adapters.herdr_agents())
 
 
 class TestOpenRouter(unittest.TestCase):
@@ -444,7 +445,8 @@ class TestCollect(unittest.TestCase):
             crudo = adapters.collect(default_config().contexts, offline=True)
         self.assertTrue(crudo["offline"])
         self.assertIsNone(crudo["agents"])
-        self.assertEqual(sorted(crudo), ["agents", "contexts", "offline", "routing"])
+        self.assertEqual(sorted(crudo), ["agents", "contexts", "herdr", "offline",
+                                        "routing"])
         self.assertEqual([c["name"] for c in crudo["contexts"]], ["personal"])
         self.assertIsNone(crudo["contexts"][0]["budget"]["credits"])
 
