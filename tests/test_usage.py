@@ -842,8 +842,14 @@ class TestCli(unittest.TestCase):
     def test_con_statusline_fresca_no_abre_pane(self):
         ruta = self.d / "state" / "harness" / "rate_limits.json"
         ahora = datetime.now(SCL)
-        self.assertTrue(usage.escribir_rate_limits(
-            dict(STDIN_STATUSLINE), ruta, ahora - timedelta(minutes=2)))
+        # Los `resets_at` de la fixture son un momento capturado (2026-10-18):
+        # cuando el 5h resetea de verdad, un dato "fresco" cae en
+        # "el reset ya pasó" y este test muere. Con los resets en el futuro
+        # lo que se prueba es lo que se quiere probar: fresco → sin pane.
+        sl = json.loads(json.dumps(STDIN_STATUSLINE))
+        for bucket in sl["rate_limits"].values():
+            bucket["resets_at"] = int(ahora.timestamp()) + 6 * 3600
+        self.assertTrue(usage.escribir_rate_limits(sl, ruta, ahora - timedelta(minutes=2)))
 
         def no_capturar(*a, **k):
             raise AssertionError("con la statusline fresca no se abre pane")
