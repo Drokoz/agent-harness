@@ -2473,23 +2473,33 @@ class TestLogIntentosEnElPrompt(unittest.TestCase):
                          "la intención no se duplica en la bitácora")
 
     def test_bitacora_no_entra_a_los_commits_del_pr(self):
-        """La bitácora vive fuera del commit: con `attempt-log.md`
-        ignorado, ni aparece como cambio sin commitear ni entra al
-        `git add -A` del dispatcher -- así que no entra a la rama ni al
-        PR."""
+        """La bitácora vive fuera del commit: sin ningún `.gitignore` en
+        el repo, el dispatcher la excluye por el exclude del gitdir del
+        worktree, y ni aparece en `git status` ni entra al `git add -A`
+        del WIP -- así que no entra a la rama ni al PR."""
         with tempfile.TemporaryDirectory() as tmp:
             wt = Path(tmp) / "koku-ticket-7"
             wt.mkdir()
-            (wt / ".gitignore").write_text("attempt-log.md\n")
-            (wt / "attempt-log.md").write_text(
-                "## Intento 1\n- motivo: gate rojo\n")
             subprocess.run(["git", "init", "-b", "main"], cwd=wt, check=True,
                            capture_output=True, text=True)
+            (wt / "attempt-log.md").write_text(
+                "## Intento 1\n- motivo: gate rojo\n")
+
+            def run_real(args, cwd=None, timeout=30):
+                p = subprocess.run([str(a) for a in args], cwd=cwd,
+                                   capture_output=True, text=True)
+                return (p.returncode == 0, p.stdout + p.stderr)
+
+            d = Dispatcher(spec(), log_en(tempfile.mkdtemp()), run_real,
+                           dormir=lambda s: None)
+            j = job(path=str(wt), issue=7)
+            j.worktree = str(wt)
+            d._excluir_del_git(j)
             out = subprocess.run(["git", "-C", str(wt), "status",
                                   "--porcelain"], check=True,
                                  capture_output=True, text=True).stdout
-            self.assertEqual(out.strip(), "?? .gitignore",
-                             "attempt-log.md ignorado: no entra al PR")
+            self.assertEqual(out.strip(), "",
+                             "attempt-log.md excluido: no entra al PR")
             # El WIP del dispatcher hace `git add -A`: la bitácora queda
             # afuera del índice igual.
             subprocess.run(["git", "-C", str(wt), "add", "-A"], check=True,
@@ -2497,8 +2507,7 @@ class TestLogIntentosEnElPrompt(unittest.TestCase):
             lst = subprocess.run(["git", "-C", str(wt), "ls-files"],
                                  check=True, capture_output=True,
                                  text=True).stdout
-            self.assertNotIn("attempt-log.md", lst)
-            self.assertIn(".gitignore", lst)
+            self.assertEqual(lst.strip(), "")
 
     def test_un_intento_fallido_escribe_la_bitacora(self):
         """Gate rojo: el dispatcher deja la bitácora (con la cola del

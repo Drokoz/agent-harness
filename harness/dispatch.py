@@ -1501,6 +1501,29 @@ class Dispatcher:
         try:
             (Path(job.worktree) / "attempt-log.md").write_bytes(
                 destino_persistent.read_bytes())
+            self._excluir_del_git(job)
+        except OSError:
+            pass
+
+    def _excluir_del_git(self, job):
+        """(#156) `attempt-log.md` fuera del commit en CUALQUIER repo: una
+        línea en el exclude del gitdir del worktree, sin tocar el
+        `.gitignore` versionado (no ensucia el árbol). Así `git status`
+        del agente la ve limpia y `git add -A` (el WIP de un abandono)
+        no la lleva a la rama ni al PR."""
+        ok, out = self.run_cmd(["git", "-C", job.worktree, "rev-parse",
+                                "--git-dir"])
+        gitdir = out.strip() if ok and out.strip() else ""
+        if not gitdir:
+            return
+        if not gitdir.startswith("/"):
+            gitdir = str(Path(job.worktree) / gitdir)
+        exc = Path(gitdir) / "info" / "exclude"
+        try:
+            exc.parent.mkdir(parents=True, exist_ok=True)
+            lineas = exc.read_text().splitlines() if exc.is_file() else []
+            if "attempt-log.md" not in lineas:
+                exc.write_text("\n".join(lineas + ["attempt-log.md"]) + "\n")
         except OSError:
             pass
 
