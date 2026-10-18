@@ -47,9 +47,11 @@ PI_MINIMA = ["--no-skills",
 # cada ticket refresca la cuota real gratis mientras trabaja.
 STATUSLINE = shlex.quote(str(ROOT / "scripts" / "statusline-harness"))
 SETTINGS_CLAUDE = {"autoMode": {"skipAutoPermissionPrompt": True},
-                   "statusLine": {"type": "command", "command": STATUSLINE}}
+                   "statusLine": {"type": "command", "command": STATUSLINE},
+                   "permissions": {"deny": dispatch.DENY_CLAUDE}}
 CLAUDE_MINIMA = ["--strict-mcp-config",
                  "--setting-sources", "project",
+                 "--disable-slash-commands",
                  "--permission-mode", "auto",
                  "--settings", json.dumps(SETTINGS_CLAUDE,
                                           separators=(",", ":"))]
@@ -2096,6 +2098,36 @@ class TestSesionMinima(unittest.TestCase):
         self.assertNotIn("--mcp-config", args)
         self.assertEqual(
             json.loads(args[args.index("--settings") + 1]), SETTINGS_CLAUDE)
+
+    def test_claude_apaga_las_skills_del_proyecto_y_bundled(self):
+        """#167: el equivalente forzado de `--no-skills` de pi. Claude no
+        tiene flag por skill, pero `--disable-slash-commands` apaga el Skill
+        tool y las slash-commands: ni las del proyecto (`.claude/skills/`)
+        ni las bundled llegan a la sesión (verificado en vivo: sin el flag,
+        `slash_commands` trae `implement` y `tdd`; con él, la lista no tiene
+        skills del proyecto y el Skill tool deja de responder)."""
+        args = args_sesion_minima("claude", ("implement", "tdd"), modelo="sonnet")
+        self.assertIn("--disable-slash-commands", args)
+
+    def test_claude_lleva_el_tope_de_escritura_en_la_herramienta(self):
+        """#167 (regla 6 de la auditoría #152): lo que no puede pasar en una
+        sesión del harness está en la herramienta, no en el prompt. El
+        guard de pi vive en una extensión que no opera en Claude, así que
+        su equivalente es el `permissions.deny` que `--settings` fuerza en
+        cada sesión: `gh pr merge` y force-push se rechazan en la misma
+        herramienta que en pi (las mismas líneas duras de reglas.ts)."""
+        args = args_sesion_minima("claude", ("implement", "tdd"), modelo="sonnet")
+        deny = json.loads(args[args.index("--settings") + 1])[
+            "permissions"]["deny"]
+        for prohibido in ("Bash(gh pr merge:*)",
+                          "Bash(git merge:*)",
+                          "Bash(git push --force:*)",
+                          "Bash(git push --force-with-lease:*)",
+                          "Bash(git push -f:*)",
+                          "Bash(gh repo delete:*)"):
+            self.assertIn(prohibido, deny)
+        # `git push` normal no se niega: sin él el agente no puede abrir el PR.
+        self.assertNotIn("Bash(git push:*)", deny)
 
     def test_ninguna_sesion_lleva_resume_ni_continue(self):
         for kind in ("pi", "claude", "codex"):

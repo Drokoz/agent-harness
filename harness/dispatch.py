@@ -317,10 +317,31 @@ def skills_de(cuerpo):
 # trabaja. La statusline personal del usuario no se pisa: con
 # `--setting-sources project` sus settings no entran a estas sesiones.
 STATUSLINE_HARNESS = Path(__file__).resolve().parent.parent / "scripts" / "statusline-harness"
+
+# El equivalente Claude de la regla 6 de la auditoría #152 (#167): el tope de
+# escritura vive en la herramienta, no en el prompt. Claude no tiene un
+# `--tools read,grep,find,ls` ni el harness-guard (que es una extensión de pi),
+# así que la restricción se fuerza con `permissions.deny` de los settings:
+# las mismas líneas duras del guard de pi (reglas.ts), las que no tiene
+# excepciones — merge de ningún tipo, force-push, borrado del repo. Entra en
+# el `--settings` inline que `args_sesion_minima` arma para cada sesión, así
+# que se fuerza aunque el repo no traiga un `.claude/settings.json` propio.
+# El `.claude/settings.json` del repo lleva el mismo `deny` como red a nivel
+# de proyecto (cubre también las sesiones de Claude del humano).
+DENY_CLAUDE = [
+    "Bash(gh pr merge:*)",
+    "Bash(gh repo delete:*)",
+    "Bash(git merge:*)",
+    "Bash(git push --force:*)",
+    "Bash(git push --force-with-lease:*)",
+    "Bash(git push -f:*)",
+]
+
 SETTINGS_CLAUDE = json.dumps(
     {"autoMode": {"skipAutoPermissionPrompt": True},
      "statusLine": {"type": "command",
-                    "command": shlex.quote(str(STATUSLINE_HARNESS))}},
+                    "command": shlex.quote(str(STATUSLINE_HARNESS))},
+     "permissions": {"deny": DENY_CLAUDE}},
     separators=(",", ":"))
 
 
@@ -340,9 +361,13 @@ def args_sesion_minima(kind, skills, modelo="", extra_args=()):
     MCP; `--setting-sources project` = sin los settings de usuario
     (plugins, hooks, contexto de autoMode); `--permission-mode auto` más
     el opt-in de auto que los settings de usuario traían, para que la
-    sesión no quede tapada en un diálogo. Claude no tiene flag por skill:
-    las skills del proyecto (`.claude/skills`) se cargan igual, y se
-    documenta.
+    sesión no quede tapada en un diálogo. `--disable-slash-commands` (#167)
+    apaga el Skill tool y las slash-commands: las skills del proyecto
+    (`.claude/skills`) y las bundled dejan de estar disponibles, igual que
+    `--no-skills` en pi. El tope de escritura (no merge, no force-push)
+    no está en el prompt: está en el `permissions.deny` de
+    `.claude/settings.json`, que `--setting-sources project` carga y
+    fuerza en la herramienta (regla 6 de la auditoría #152).
 
     Kinds sin sesión mínima definida (codex, gemini, ...): modelo y
     extra_args, como antes de #42.
@@ -358,6 +383,7 @@ def args_sesion_minima(kind, skills, modelo="", extra_args=()):
     if kind == "claude":
         args = ["--strict-mcp-config",
                 "--setting-sources", "project",
+                "--disable-slash-commands",
                 "--permission-mode", "auto",
                 "--settings", SETTINGS_CLAUDE]
         if modelo:
